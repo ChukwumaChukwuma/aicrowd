@@ -46,6 +46,22 @@ layer 32, so `|α| ≈ 4.4` and most rectifiers are almost always on or off.
 | any reconstruction from exact κ₁..κ₆ | **8.2×** on noise-free targets | **dead** | `11` |
 | analytic κ₃ via star diagrams | 84–88% of true κ₃ at O(n³) | **works** | `13` |
 | κ₃ Edgeworth correction, end to end | 6.82e-5 → **3.23e-5** (2.11×) | **shipped** | `12` |
+| MLMC over rank-truncated networks | 0.94× vs a 20× bar | **dead** | `22`, `23` |
+
+### Why multilevel Monte Carlo is dead (`docs/mlmc.md`)
+
+Two independent obstructions, either fatal, both measured. **Cost:** flopscope
+charges a factored layer `4nr` against `2n²` dense, so `c(r) = 2r/n` and the
+level-0 discount alone caps the gain at `n/(2r₀) = 128/r₀` — a 20× bar needs
+`r₀ ≤ 6`, and `r = 128` already costs exactly what the dense layer does.
+**Coupling:** a
+norm-preserving relative weight perturbation `d` gives a clean quadratic law
+`Var(f − f̃)/V = 393 d²` over two decades, so the top level needs `d ≤ 2.4e-3`,
+i.e. `r = 251` of 256 at 1.96× the dense cost. The best coupling measured
+anywhere is `ρ = 0.875` at `r = 224` (1.75× dense); at every rank that saves
+FLOPs the best is `ρ = 0.229`, against a necessary `ρ ≥ 0.975`.
+Same wall as the input-anchored control variates in `floor_theorem.md`, from a
+third direction.
 
 ### Why the cumulant route is dead
 

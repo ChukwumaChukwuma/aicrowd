@@ -684,3 +684,103 @@ def blend_kernel(weights, ctx=None, n_samples: int = 4600, seed: int = 0,
     a = cov_prop_edgeworth(weights, kmax=kmax, umax=umax, damp=damp, g=g)
     m = mc_kernel(weights, n_samples=n_samples, seed=seed)
     return a + (m - a) * wmc
+
+
+KERNELS["mc"] = mc_kernel
+KERNELS["blend"] = blend_kernel
+
+
+# --------------------------------------------------------------------------
+# Multilevel Monte Carlo over rank-truncated weight matrices.
+#
+# MEASURED AND KILLED -- see scripts/22*, docs/mlmc.md and the ledger row
+# ``mlmc_rank_levels``.  Kept because the kill is a result: the best ladder over
+# four surrogate families and seven ranks is 0.94x plain Monte Carlo at matched
+# compute, against a pre-registered 20x bar, and the MLMC allocator's own
+# optimum is to put ONE sample on level 0 and degenerate back to plain MC.  This
+# is the code path that measured it; passing a single dense level reproduces
+# plain MC bitwise, so the ablation runs through identical code.
+#
+# NOT WIRED INTO THE SUBMISSION.  ``submission/estimator.py`` is untouched.
+# --------------------------------------------------------------------------
+
+
+def _lowrank_factors(weights, r):
+    """``W ~= A @ B`` with ``A`` (n, r) and ``B`` (r, n), from the top-r SVD.
+
+    flopscope bills ``linalg.svd(..., k=r)`` at ``min(4 m n r, economy)`` --
+    a sanctioned randomized-SVD discount, 6.5x under the economy price at
+    r = n and proportional to r below it -- while returning an exact economy
+    SVD sliced to r.
+    """
+    out = []
+    for w in weights:
+        u, s, vt = fnp.linalg.svd(w, full_matrices=False, k=r)
+        out.append((u, s[:, None] * vt))
+    return out
+
+
+def _fwd_layer(h, w, fac):
+    """One ReLU layer, dense (``fac is None``) or factored."""
+    if fac is None:
+        return fnp.maximum(h @ w, 0.0)
+    a, b = fac
+    return fnp.maximum((h @ a) @ b, 0.0)
+
+
+def mlmc_kernel(weights, ctx=None, levels=((32, 3000), (256, 500)),
+                seed: int = 0):
+    """Multilevel Monte Carlo across rank-truncated copies of the network.
+
+    ``levels`` is ``((r_0, N_0), (r_1, N_1), ...)`` with strictly increasing
+    ranks whose last entry is the full width, so the telescoping identity
+
+        E[f_full] = E[f_{r_0}] + sum_k E[f_{r_k} - f_{r_{k-1}}]
+
+    is exact and the estimator is unbiased for any allocation.  Level ``k > 0``
+    drives BOTH networks from the same input draw, which is the coupling the
+    whole scheme depends on.
+
+    Cost per sample: a factored layer is ``4 n r`` against ``2 n^2`` dense, so
+    a level is cheaper than the full network only for ``r < n/2`` -- the
+    structural ceiling that kills the method here.
+
+    ``levels=((width, N),)`` is plain Monte Carlo through this identical code
+    path; that is the ablation, and it is bitwise equal to
+    :func:`mc_kernel` at the same ``N`` and ``seed``.
+    """
+    n = weights[0].shape[0]
+    depth = len(weights)
+    ranks = [int(r) for r, _ in levels]
+    counts = [int(c) for _, c in levels]
+
+    fac = {r: (_lowrank_factors(weights, r) if r < n else None)
+           for r in set(ranks)}
+
+    acc = None
+    for k, (r, nk) in enumerate(zip(ranks, counts)):
+        if nk <= 0:
+            continue
+        # Seeded off ``seed`` (which the submission path sets from ``mlp.seed``
+        # per the whestbench contract); one independent stream per level.
+        rng = fnp.random.default_rng(seed + 1_000_003 * k)
+        x = rng.standard_normal((nk, n), dtype=fnp.float32)
+        fhi = fac[r]
+        flo = fac[ranks[k - 1]] if k else None
+        hi = x
+        lo = x if k else None
+        rows = []
+        for li in range(depth):
+            hi = _fwd_layer(hi, weights[li], None if fhi is None else fhi[li])
+            if k:
+                lo = _fwd_layer(lo, weights[li],
+                                None if flo is None else flo[li])
+                rows.append(fnp.mean(hi - lo, axis=0))
+            else:
+                rows.append(fnp.mean(hi, axis=0))
+        term = fnp.stack(rows, axis=0)
+        acc = term if acc is None else acc + term
+    return acc
+
+
+KERNELS["mlmc"] = mlmc_kernel
