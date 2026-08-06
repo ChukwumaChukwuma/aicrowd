@@ -492,34 +492,98 @@ def orders(layers=(1, 7, 15, 23, 31), emax=None, n=256):
 # ===========================================================================
 # COST: FLOP model of the factorised fast path
 # ===========================================================================
-def cost(n=256, K=6):
-    """matmul (2n^3) counts of the recommended factorised implementation."""
-    mm = 2 * n ** 3
+def cost(n=256, K3=4, K4=3, k_lowrank=0, verbose=True):
+    """FLOP model of the recommended factorised implementation.
+
+    One matmul unit = n^2 (2n-1), the flopscope cost of an (n,n)@(n,n) product
+    (whestfloor/contract.py:forward_pass_flops uses the same convention).
+
+    EDGE-KERNEL FOLDING.  A diagram edge whose multiplicity does not feed any
+    other vertex's degree can have its whole multiplicity sum folded into an
+    elementwise kernel before the matmul:
+
+        sum_e (1/e!) sum_{i!=k} u^i_e rhohat_ik^e v^k_e W_ij^b W_kj^b'
+          =  cs[ W^{ob} o ( Xi W^{ob'} ) ],   Xi_ik = sum_e rhohat_ik^e u^i_e v^k_e / e!
+
+    Xi costs O(K n^2) and the matmul is ONE, independent of K.  Every 2-block
+    diagram, and every leaf-coincidence correction whose merged leaf is the only
+    thing the multiplicity feeds, is of that form.  This is what lets the
+    2-block sums -- the largest contributors, and the ones needing the highest
+    order because rhohat is not small at depth -- run at K = 16 for free.
+    """
+    mm = n * n * (2 * n - 1)
     rows = [
-        ("Sigma = W^T C W", 2, "exact, always needed"),
-        ("M_e = Rhat^e diag(a_e) W", K, "tree leaves, size-1 blocks; shared by r=3 and r=4"),
-        ("P_e = Rhat^e diag(c_e) W^2", K, "tree leaves, size-2 blocks (r=4 only)"),
-        ("Y_D = Rhat^D diag(eta_D) W^2", K, "injectivity correction, 2 merged size-1 leaves"),
-        ("Z_T = Rhat^T diag(theta_T) W^3", K, "injectivity correction, 3 merged leaves (r=4)"),
-        ("U_q -> Rhat^q U_q (4-vertex path)", K, "r=4 path chain, one per middle multiplicity"),
-        ("Chat^2 W^2  and  Chat W", 2, "Ursell terms"),
-        ("Cov(x) Mehler series", 0, "O(K n^2), not a matmul"),
+        ("Sigma' = W^T C W", 2, "exact"),
+        ("mixed cumulants (W^oa)^T diag(k) W^ob", 3, "(2,1),(3,1),(2,2) for the cov correction"),
+        ("(2,1) / (3,1) / (2,2) bundles", 3, "edge-kernel folded: 1 each, any K_2"),
+        ("(1,1,1) + (1,1,1,1) leaf coincidences", 2, "folded Y, Z kernels"),
+        ("M_e = Rhat^e diag(a_e) W", K3 - 1, "3-vertex path leaves; reused by r=4 stars"),
+        ("P_e = Rhat^e diag(c_e) W^o2", max(K4 - 1, 0), "(2,1,1) paths centred on a 1-block"),
+        ("Ubar_q -> Rhat^q Ubar_q", max(K4 - 2, 0), "4-vertex path chain"),
+        ("V_D, Z_T coincidence corrections", 2, "r=4 star / path injectivity"),
+        ("Chat^o2 W^o2, Chat W", 2, "Ursell terms"),
     ]
-    tot = 0
-    print(f"n={n}  K={K}   one matmul unit = 2n^3 = {mm:.3e} FLOPs")
-    print(f"    {'primitive':<40s} {'#':>3s} {'FLOPs':>11s}")
-    for nm, c, note in rows:
-        tot += c
-        print(f"    {nm:<40s} {c:3d} {c*mm:11.3e}   {note}")
-    n2 = 60 * K * n * n
-    print(f"    {'elementwise / column sums (~60 K n^2)':<40s} {'':>3s} {n2:11.3e}")
-    print(f"    TOTAL per layer  {tot} matmuls + O(K n^2) = {tot*mm + n2:.3e} FLOPs")
-    print(f"    32 layers: {32*(tot*mm+n2):.3e} FLOPs   (free-compute ceiling 2.72e10)")
-    print(f"    one non-factorising 3-cycle, all j, exact: 2 n^4 = {2*n**4:.2e} FLOPs "
-          f"= {2*n**4/mm:.0f} matmul units")
-    print(f"    same 3-cycle via rank-k truncation of Rhat: ~2 k^2 n^2 + 2 k^3 n ; "
-          f"k=32 -> {2*32**2*n*n + 2*32**3*n:.2e} FLOPs = "
-          f"{(2*32**2*n*n+2*32**3*n)/mm:.1f} matmul units")
+    tot = sum(c for _, c, _ in rows)
+    ew = 80 * 16 * n * n           # ~80 elementwise n^2 passes at K_2 = 16
+    if verbose:
+        print(f"n={n}  K_3={K3} K_4={K4}   1 matmul unit = n^2(2n-1) = {mm:.4e} FLOPs")
+        print(f"    {'primitive':<42s} {'#':>3s} {'FLOPs':>11s}   note")
+        for nm, c, note in rows:
+            print(f"    {nm:<42s} {c:3d} {c*mm:11.3e}   {note}")
+        print(f"    {'elementwise kernels / column sums':<42s} {'':>3s} {ew:11.3e}")
+        print(f"    per layer: {tot} matmuls + O(K n^2) = {tot*mm + ew:.3e} FLOPs")
+        print(f"    32 layers: {32*(tot*mm+ew):.3e} FLOPs "
+              f"(free-compute ceiling 2.72e10, i.e. {812} matmul units total)")
+        print()
+        print(f"    NOT included -- the pieces that do not fit:")
+        print(f"      one 3-cycle, exact, all j:        2 n^4 = {2*n**4:.2e} "
+              f"= {2*n**4/mm:.0f} matmul units")
+        for k in (16, 32, 64):
+            c = 2 * k * k * n * n + 2 * k ** 3 * n
+            print(f"      same 3-cycle, rank-{k:<3d} Rhat:        {c:.2e} "
+                  f"= {c/mm:5.1f} matmul units")
+        print(f"      exact 3-tensor transport (3 mode products): 6 n^4 = "
+              f"{6*n**4:.2e} = {6*n**4/mm:.0f} matmul units per layer")
+        for k in (8, 16, 32):
+            c = 2 * k * n * n
+            print(f"      rank-{k:<3d} Tucker transport of kappa^(3): {c:.2e} = "
+                  f"{c/mm:5.2f} matmul units per layer")
+    return tot, tot * mm + ew
+
+
+def factorise(n=48, seed=11, K=10):
+    """Pin the two closed forms quoted in docs/cumulant_expansion.md sec 5.2/10.1
+    against the generic diagram engine, to machine precision."""
+    m, s, R, W = make_case(n, seed)
+    ctx = build_ctx(m, s, R, W, K)
+    a, c, E = ctx["beta"][1], ctx["beta"][2], ctx["Ehat"]
+    W2 = W * W
+    # (i) the leading connected 3-point star, p = q = 1
+    dgs = [d for d in catalogue(3, {2: 1, 3: 2}, 0) if d.sizes == (1, 1, 1) and sum(d.e) == 2]
+    eng = sum(eval_diagram(d, ctx, True, 0) for d in dgs)
+    M1 = E[1] @ (a[1][:, None] * W)
+    A2 = a[2][:, None] * W
+    Y2 = E[2] @ ((a[1] * a[1])[:, None] * W2)
+    closed = 3 * ((A2 * M1 * M1).sum(0) - (A2 * Y2).sum(0))
+    d1 = float(np.abs(eng - closed).max())
+    print(f"  [{'ok ' if d1 < 1e-14 else 'FAIL'}] star(p=q=1) = 3 cs[A2 o M1 o M1] - 3 cs[A2 o Y2]"
+          f"   err {d1:.2e}")
+    print(f"       factor 3 = the three labelled centres; the Y2 (leaf-coincidence) piece is "
+          f"{100*np.abs(3*(A2*Y2).sum(0)).max()/np.abs(eng).max():.0f}% of this diagram")
+    if d1 >= 1e-14:
+        FAIL.append("star closed form")
+    # (ii) edge-kernel folding of the (2,1) bundle: K matmuls -> 1
+    dgs = [d for d in catalogue(3, {2: K, 3: 0}, 0) if d.sizes == (2, 1)]
+    eng2 = sum(eval_diagram(d, ctx, True, 0) for d in dgs)
+    Xi = np.zeros((n, n))
+    for e in range(1, K + 1):
+        Xi += (E[e] / math.factorial(e)) * np.outer(c[e], a[e])
+    folded = 3 * (W2 * (Xi @ W)).sum(0)
+    d2 = float(np.abs(eng2 - folded).max())
+    print(f"  [{'ok ' if d2 < 1e-14 else 'FAIL'}] (2,1) bundle, K={K} orders, folded into ONE "
+          f"matmul   err {d2:.2e}")
+    if d2 >= 1e-14:
+        FAIL.append("edge-kernel folding")
 
 
 if __name__ == "__main__":
@@ -530,6 +594,8 @@ if __name__ == "__main__":
         orders()
     elif what == "cost":
         cost()
+    elif what == "factorise":
+        factorise()
     else:
         verify(); orders(); cost()
     print("\nFAILURES:", FAIL if FAIL else "none")
