@@ -55,14 +55,27 @@ def layer_means(
     *,
     chunk: int = FAST_CHUNK,
     want_var: bool = True,
+    want_cov: bool = False,
+    cov_stride: int = 16,
     all_layers: bool = True,
     dtype=np.float32,
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """Streamed per-layer means, matching whestbench's arithmetic.
+):
+    """Return ``(means, var)``, or ``(means, var, cov)`` when ``want_cov``.
+
+    The 2-tuple default keeps every existing caller working; only code that
+    asks for the covariance has to unpack three values.
+    """
+    _ = """Streamed per-layer means, matching whestbench's arithmetic.
 
     float32 inputs, float32 matmuls, ReLU after every layer, float64
     accumulation of the final layer.  Samples are folded in and dropped, so
     peak memory is two chunk buffers.
+
+    ``want_cov=True`` also returns the FULL final-layer activation covariance,
+    accumulated from every ``cov_stride``-th chunk.  It is needed for an honest
+    standard error on the unbiased MSE estimator (the reference noise is
+    correlated across neurons), and only modest relative precision is required
+    of it, so subsampling chunks keeps the cost negligible.
 
     ``all_layers=False`` accumulates only the final layer — 15% faster and all
     the score depends on.  The returned array is then ``(1, width)``.
@@ -80,6 +93,9 @@ def layer_means(
     sums = np.zeros((nrows, width), dtype=np.float64)
     final_sum = np.zeros(width, dtype=np.float64)
     sq = np.zeros(width, dtype=np.float64) if want_var else None
+    gram = np.zeros((width, width), dtype=np.float64) if want_cov else None
+    cov_rows = 0
+    chunk_idx = 0
 
     a = np.empty((chunk, width), dtype=dtype)
     b = np.empty((chunk, width), dtype=dtype)
@@ -103,9 +119,18 @@ def layer_means(
         final_sum += src.sum(axis=0, dtype=np.float64)
         if sq is not None:
             sq += np.einsum("ij,ij->j", src, src, dtype=np.float64)
+        if gram is not None and (chunk_idx % cov_stride == 0):
+            sf = src.astype(np.float64)
+            gram += sf.T @ sf
+            cov_rows += nb
+        chunk_idx += 1
         done += nb
 
     sums[-1] = final_sum
     means = sums / done
     var = (sq / done - means[-1] ** 2) if sq is not None else None
-    return means, var
+    cov = None
+    if gram is not None and cov_rows > 0:
+        mu_c = means[-1]
+        cov = gram / cov_rows - np.outer(mu_c, mu_c)
+    return (means, var, cov) if want_cov else (means, var)

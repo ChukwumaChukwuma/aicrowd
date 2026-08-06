@@ -124,6 +124,29 @@ def route_c():
     return out
 
 
+def route_d():
+    """Where did 0.18 come from?  Scan depth at fixed width 256.
+
+    whest-starterkit docs/concepts/ground-truth.md:29 says "Against the official
+    datasets (N = 1e9 samples) the ground-truth noise floor is ~2e-10
+    (= avg_variance / N)".  Every dataset example in the whestbench docs
+    (dataset-format.md:382,401,565; gpu-dataset-generation.md) bakes at
+    --width 256 --depth 8.  The competition shape is depth 32.
+    """
+    out = []
+    for depth in (4, 8, 16, 32):
+        vv = []
+        for m in range(48):
+            w = make_mlp(WIDTH, depth, m)
+            _, var = layer_means(w, 4096, 880_000 + m, want_var=True,
+                                 all_layers=False)
+            vv.append(var.mean())
+            del w
+        vv = np.asarray(vv)
+        out.append((depth, vv.mean(), vv.std(ddof=1) / np.sqrt(len(vv))))
+    return out
+
+
 def main() -> None:
     vs, qs = route_a()
     v_mean = float(vs.mean())
@@ -171,6 +194,17 @@ def main() -> None:
     print("   width   avg_variance   q_L      1-c     mean-field 1-c")
     for width, v, q in route_c():
         print(f"   {width:5d}   {v:.5f}      {q:.4f}   {v / q:.5f}   {v_mf:.5f}")
+
+    print()
+    print("=== ROUTE D: provenance -- 0.18 is the DEPTH-8 value ===")
+    print("   width 256, 48 MLPs x 4096 samples per depth")
+    print("   depth    avg_variance      floor v/1e9     matches 'published' 0.18?")
+    for depth, v, se in route_d():
+        print(f"   {depth:5d}    {v:.4f} +/- {se:.4f}   {v / GT_N:.3e}      "
+              f"{'YES <-- this is where 0.18 comes from' if abs(v - 0.18) < 3 * se else 'no'}")
+    print("   whest-starterkit docs/concepts/ground-truth.md:29 quotes ~2e-10;")
+    print("   every dataset-bake example in the whestbench docs uses --depth 8.")
+    print("   The competition shape is depth 32.")
 
     print()
     verdict = "HOLDS" if lo <= PUBLISHED <= hi else "BROKEN"

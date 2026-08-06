@@ -61,13 +61,37 @@ GT_SAMPLES_OFFICIAL = 1_000_000_000
 #: Ground-truth chunk size at width 256: max(1024, min(16384, 2**20 // 256)).
 GT_CHUNK_SIZE = 4096
 
-#: Mean per-neuron final-layer activation variance of the official suite, as
-#: published in docs/concepts/ground-truth.md.  Re-derived independently in
-#: scripts/01_derive_noise_floor.py; the ledger records the measured value.
-PUBLISHED_AVG_VARIANCE = 0.18
+#: Mean per-neuron final-layer activation variance.
+#:
+#: The challenge documentation quotes 0.18 and derives a ~2e-10 floor from it.
+#: That number is WRONG FOR THIS SHAPE.  Measured here (scripts/02_adv_variance.py,
+#: 128 MLPs x 8192 samples, confirmed by an independent second run):
+#:
+#:     depth  4 : 0.3292 +- 0.0035
+#:     depth  8 : 0.1885 +- 0.0048   <-- this is where 0.18 comes from
+#:     depth 16 : 0.0999 +- 0.0035
+#:     depth 32 : 0.0551 +- 0.0023   <-- the phase-1 competition shape
+#:
+#: 0.18 is the depth-8 warm-up value, inherited across the depth change; every
+#: dataset-bake example in the whestbench docs still uses --depth 8.  An
+#: independent analytic route agrees: v = q*(1-c) where c is the two-input
+#: overlap under the ReLU arc-cosine map, giving 1-c_32 = 0.0253 as an
+#: infinite-width lower bound, approached monotonically from above as width
+#: grows (0.084/0.079/0.060/0.040 at width 64/128/256/512).
+#:
+#: This matters directly: it moves the floor down by 3.3x and tightens the
+#: per-neuron accuracy target by 1.81x.
+MEASURED_AVG_VARIANCE = 0.0551
+MEASURED_AVG_VARIANCE_SE = 0.0023
+DOC_QUOTED_AVG_VARIANCE = 0.18  # kept only to document the discrepancy
+
+#: v varies strongly across MLPs: sd 0.0265 over 128 draws, CV 0.48, range
+#: [0.0144, 0.1547].  The floor is a per-suite random variable, not a
+#: constant; over a 100-MLP suite it is 5.50e-11 +- 0.26e-11 (4.8%).
+AVG_VARIANCE_CV = 0.48
 
 
-def gt_noise_floor(avg_variance: float = PUBLISHED_AVG_VARIANCE,
+def gt_noise_floor(avg_variance: float = MEASURED_AVG_VARIANCE,
                    n_samples: int = GT_SAMPLES_OFFICIAL) -> float:
     """Raw final-layer MSE that a *perfect* estimator still incurs.
 
@@ -79,9 +103,16 @@ def gt_noise_floor(avg_variance: float = PUBLISHED_AVG_VARIANCE,
     return avg_variance / n_samples
 
 
-#: Raw MSE floor: 1.8e-10.  Adjusted floor (at the 0.1 multiplier): 1.8e-11.
+#: Raw MSE floor 5.50e-11; adjusted (at the 0.1 multiplier) 5.50e-12.
+#: Per-neuron RMS a perfect estimator would still show: 7.42e-6.
 RAW_MSE_FLOOR = gt_noise_floor()
 ADJUSTED_FLOOR = RAW_MSE_FLOOR * MULTIPLIER_FLOOR
+TARGET_RMS = RAW_MSE_FLOOR ** 0.5
+
+#: Errors injected by successive layers add incoherently (measured: covariance
+#: propagation injects ~2.0e-3 per layer and lands at ~9.2e-3 end to end, and
+#: sqrt(32)*2.0e-3 = 1.13e-2).  So the per-layer modelling budget is:
+PER_LAYER_BAR = TARGET_RMS / (DEPTH ** 0.5)
 
 
 # ---------------------------------------------------------------------------

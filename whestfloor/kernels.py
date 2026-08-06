@@ -104,7 +104,7 @@ def cov_prop_gain(weights, ctx=None):
     return fnp.stack(rows, axis=0)
 
 
-def cov_prop_mehler(weights, ctx=None, kmax: int = 8):
+def cov_prop_mehler(weights, ctx=None, kmax: int = 4):
     """Full covariance propagation with the **exact** post-ReLU covariance.
 
     Replaces the gain rule ``C_ij ≈ Φ_i Φ_j Σ_ij`` — which is only the k=1 term

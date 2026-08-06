@@ -47,8 +47,11 @@ import flopscope as flops
 import flopscope.numpy as fnp
 from whestbench import BaseEstimator
 
-#: Order at which Mehler's series is truncated.
-KMAX = 8
+#: Order at which Mehler's series is truncated.  Measured to saturate at 4:
+#: k=2 gives 6.334e-5, k=4 gives 6.3156e-5, k=8/16 give 6.3153e-5 (scripts/12).
+#: Higher k only adds residual wall time, and at k=24 that pushes C/B to 0.103,
+#: crossing the 0.1 multiplier floor and making the score WORSE.
+KMAX = 4
 
 #: Floor applied to pre-activation variances before taking a square root.
 VAR_FLOOR = 1e-12

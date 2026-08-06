@@ -4,7 +4,11 @@ Design notes that matter:
 
 * **Weights are never stored.**  An MLP is fully determined by ``(width, depth,
   seed)`` through :func:`make_mlp`, which reproduces
-  ``whestbench.generation.sample_mlp`` bit-for-bit.  A suite on disk therefore
+  ``whestbench.generation.sample_mlp`` bit-for-bit *for a given RNG* (verified
+  in scripts/02_adv_rng.py).  Note it does NOT reproduce the official
+  datasets' MLPs for the same integer, because those seed via
+  ``SeedSequence(input_seed).spawn(3)[0]``; the suites here are valid draws
+  from the same distribution, not the same networks.  A suite on disk
   holds only seeds and ground-truth means — 64 KB per MLP instead of 8.4 MB —
   and every artifact is regenerable from a committed script.
 * **Ground truth is computed in two independent halves.**  With halves ``a``
@@ -44,7 +48,13 @@ class Suite:
     n_per_half: int
     gt_seed_a: list[int]
     gt_seed_b: list[int]
-    final_var: np.ndarray  # (n_mlps, width) float64
+    final_var: np.ndarray  # (n_mlps, width) float64 - diagonal only
+    #: (n_mlps, width, width) float32 full final-layer activation covariance.
+    #: Needed for an honest standard error on ``unbiased_true_mse``: the
+    #: reference noise is correlated across neurons (they share the input), and
+    #: a diagonal-only variance understates the SE by ~4.7x at this shape.
+    #: Optional because suites baked before that was understood lack it.
+    final_cov: np.ndarray | None = None
 
     @property
     def n_mlps(self) -> int:
@@ -77,6 +87,8 @@ class Suite:
             gt_seed_a=np.asarray(self.gt_seed_a, dtype=np.int64),
             gt_seed_b=np.asarray(self.gt_seed_b, dtype=np.int64),
             final_var=self.final_var,
+            **({} if self.final_cov is None
+               else {"final_cov": self.final_cov}),
         )
 
     @staticmethod
@@ -93,6 +105,7 @@ class Suite:
             gt_seed_a=[int(v) for v in z["gt_seed_a"]],
             gt_seed_b=[int(v) for v in z["gt_seed_b"]],
             final_var=z["final_var"],
+            final_cov=(z["final_cov"] if "final_cov" in z.files else None),
         )
 
 
@@ -107,16 +120,18 @@ def build_suite(
     progress: bool = False,
 ) -> Suite:
     """Generate a suite, streaming each MLP's samples and dropping them."""
-    a_all, b_all, var_all, sa, sb = [], [], [], [], []
+    a_all, b_all, var_all, cov_all, sa, sb = [], [], [], [], [], []
     for k, ms in enumerate(mlp_seeds):
         w = make_mlp(width, depth, ms)
         seed_a = gt_seed_base + 2 * k
         seed_b = gt_seed_base + 2 * k + 1
-        ma, va = mc_layer_means(w, n_per_half, seed_a, want_var=True)
+        ma, va, ca = mc_layer_means(w, n_per_half, seed_a, want_var=True,
+                                    want_cov=True)
         mb, _ = mc_layer_means(w, n_per_half, seed_b, want_var=False)
         a_all.append(ma)
         b_all.append(mb)
         var_all.append(va)
+        cov_all.append(ca)
         sa.append(seed_a)
         sb.append(seed_b)
         del w
@@ -133,4 +148,6 @@ def build_suite(
         gt_seed_a=sa,
         gt_seed_b=sb,
         final_var=np.asarray(var_all),
+        final_cov=(np.asarray(cov_all, dtype=np.float32)
+                   if all(c is not None for c in cov_all) else None),
     )

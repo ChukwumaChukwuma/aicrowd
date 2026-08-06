@@ -121,7 +121,7 @@ def generator_check() -> None:
     print()
     print("=== 2d: numpy float32 standard-normal generator ===")
     rng = np.random.default_rng(31337)
-    n_total = 200_000_000
+    n_total = int(os.environ.get("ADV_GEN_N", 200_000_000))
     s = 0.0
     s2 = 0.0
     amax = 0.0
@@ -141,15 +141,30 @@ def generator_check() -> None:
     print(f"  E[x^2] = {m2:.8f}   (MC SE = {np.sqrt(2 / done):.2e}), "
           f"deviation {m2 - 1:+.2e}")
     print(f"  max |x| = {amax:.4f}")
-    print("  ULP argument: every draw is a float32, so each value carries a")
-    print("  relative rounding of <= 2^-24 = 5.96e-08; the ziggurat strip table is")
-    print("  also stored in float32.  Hence |E[x^2]/1 - 1| <~ 2*2^-24 = 1.2e-07.")
+    print()
+    print("  The empirical bound above is WEAK (it only excludes |E[x^2]-1| > ~3 SE).")
+    print("  Resolving 1e-5 by brute force needs ~2e10 draws.  The argument that")
+    print("  actually bounds it, from numpy's random_standard_normal_f")
+    print("  (numpy/random/src/distributions/distributions.c:179-211):")
+    print("    r = next_uint32(); idx = r & 0xff; rabs = (r >> 9) & 0x7fffff")
+    print("    x = rabs * wi_float[idx]                 <- 23-bit grid, 99.3% path")
+    print("  So U = rabs/2^23 is DISCRETE uniform on {0, 1/M, ..., (M-1)/M},")
+    print("  M = 2^23.  E[U^2] = 1/3 - 1/(2M) + 1/(6M^2) against 1/3 exactly:")
+    m = 2 ** 23
+    rel = (1.0 / (2 * m) - 1.0 / (6 * m * m)) / (1.0 / 3.0)
+    print(f"    relative second-moment deficit = 3/(2*2^23) = {rel:.3e}")
+    print("  plus <= 2^-24 = 5.96e-08 from float32 rounding of wi_float[] and of")
+    print("  the product.  Total |E[x^2] - 1| <~ 3e-07 relative.")
     print("  A relative error delta in E[x^2] moves the layer-32 mean by about")
-    print("  0.5*delta*mean ~ 0.35*delta, i.e. <~ 4.2e-08 -- 180x below the")
-    print(f"  tightest target RMS ({TARGET_RMS_MEASURED:.2e}).")
+    print("  0.5*delta*mean; with mean ~ 1.0 that is <= 1.5e-07 --")
+    print(f"  {TARGET_RMS_MEASURED / 1.5e-7:.0f}x below the tightest target RMS "
+          f"({TARGET_RMS_MEASURED:.2e}).")
 
 
 def main() -> None:
+    if "--generator-only" in sys.argv:
+        generator_check()
+        return
     print(f"CRN float32-vs-float64 study: {N_MLPS} MLPs x {N_SAMPLES:,} samples "
           f"(width {WIDTH}, depth {DEPTH})")
     all_means = []
