@@ -800,6 +800,226 @@ def sparse_mc_kernel(weights, ctx=None, tau: float | None = 2.5,
 KERNELS["sparse_mc"] = sparse_mc_kernel
 
 
+# --------------------------------------------------------------------------
+# Randomised quasi-Monte Carlo: a randomly-shifted rank-1 lattice in the 256
+# input coordinates, mapped to Gaussians by inverse CDF.  See docs/rqmc.md.
+#
+# What it can and cannot buy is settled before any of this runs, by the ANOVA
+# measurement in scripts/27_rqmc.py --mode anova.  A rank-1 lattice with
+# gcd(z_j, N) = 1 has EXACT N-point equidistribution in every one-dimensional
+# projection, so the shift-averaged squared error of any first-order ANOVA
+# term is 1/(6N^2) against Monte Carlo's 1/N -- a ~N/6 = 1400x annihilation,
+# for any generating vector.  Everything above first order is what the
+# generating vector is searched for, and it is the smaller half.
+#
+# Measured on 12 official MLPs: the first-order share of Var(relu(z^32_j)) is
+# 28.4%, so the ceiling from first order alone is 1/(1-0.284) = 1.40x, and the
+# mean ANOVA dimension is 11.3 -- most of the variance is in interactions no
+# 256-dimensional point set improves.  That prediction is what the probe
+# then confirms.
+# --------------------------------------------------------------------------
+
+#: Number of lattice points.  Prime, so the fast CBC search is available and
+#: every ``z_j`` is automatically coprime to N.
+RQMC_N = 8501
+
+#: Generating vector for ``RQMC_N`` x 256, built offline by
+#: ``scripts/27_rqmc.py --mode lattice``: full component-by-component search
+#: against the exact order-2 (pairwise) worst-case-error criterion
+#: ``sum_{j<k} (1/N) sum_i B_2(i z_j/N) B_2(i z_k/N)``, done in O(d N log N) by
+#: FFT.  It beats a random generating vector by 12x on that criterion and 144x
+#: on the worst single pair.  This is a property of the point set, not of the
+#: data -- nothing here is fitted to any MLP.
+#:
+#: The criterion depends on N, so this vector is optimal only at ``RQMC_N``.
+#: Used at another N it keeps the exact one-dimensional grids (the first-order
+#: annihilation) as long as every ``z_j`` stays coprime to that N, but the
+#: pair quality degrades; ``scripts/27_rqmc.py`` re-runs the search per N.
+RQMC_Z = (
+    1, 4988, 2283, 4765, 5919, 3162, 7715, 7111, 2181, 3496, 2452, 2402,
+    5366, 5402, 7656, 2563, 426, 3713, 210, 1408, 2008, 2103, 2888, 2146,
+    6209, 7922, 6205, 5802, 6237, 362, 7165, 1727, 5417, 419, 6273, 6430,
+    1426, 144, 4533, 6041, 7273, 353, 6503, 5008, 5618, 7828, 5795, 4133,
+    7379, 115, 6762, 2346, 3837, 1138, 4579, 1227, 2135, 3163, 3876, 3129,
+    221, 3717, 4451, 6582, 906, 3863, 1188, 5088, 6245, 2953, 8062, 2536,
+    154, 7657, 960, 227, 7906, 8401, 3252, 1595, 2823, 2956, 1609, 5235,
+    506, 948, 7557, 5494, 8414, 4841, 858, 4668, 2040, 1647, 8403, 5142,
+    1833, 2067, 8458, 2284, 4129, 8456, 363, 879, 3936, 3351, 4296, 5793,
+    6744, 5305, 6672, 1256, 418, 8170, 7612, 6498, 7549, 5255, 5810, 4758,
+    3732, 5947, 3824, 6539, 3425, 4475, 7441, 4848, 4466, 6790, 5427, 2054,
+    5442, 1388, 8348, 4828, 5643, 723, 6984, 7635, 4450, 8129, 4152, 5495,
+    6403, 5044, 2423, 962, 4949, 220, 8040, 2442, 5480, 1251, 1520, 2986,
+    468, 7573, 3402, 2223, 7993, 655, 5353, 1843, 5336, 6947, 5455, 5731,
+    2995, 1211, 4088, 3371, 5812, 6593, 5094, 2989, 8147, 6149, 5541, 3072,
+    2821, 6683, 6746, 7261, 7973, 6538, 3026, 1964, 5021, 753, 8162, 125,
+    3613, 658, 1349, 996, 5433, 1492, 5758, 2655, 5767, 3746, 3447, 112,
+    3124, 3843, 2261, 3239, 7745, 5841, 7265, 797, 122, 2902, 7700, 2123,
+    597, 3388, 6040, 7421, 4115, 5819, 4955, 276, 2676, 1376, 730, 8300,
+    4497, 5472, 2836, 4119, 593, 717, 4365, 3644, 5166, 1571, 2101, 2992,
+    2927, 5200, 1531, 7033, 8022, 4812, 3988, 4504, 3041, 2666, 1991, 5535,
+    1570, 4619, 4429, 82,
+)
+
+#: float32 has 24 bits of mantissa, so a uniform can round to exactly 0.0 or
+#: 1.0 and send ``norm.ppf`` to +-inf.  Clamp inside the representable range.
+_U_EPS = 6.0e-8
+
+
+def lattice_base(n_points: int = RQMC_N, z=RQMC_Z):
+    """``(n_points, d)`` float32 base points ``frac(i * z_j / N)``.
+
+    Data-independent, so the submission builds it once in ``setup`` where it
+    is free.  Billed it would cost 8 FLOPs/element = 1.7e7 = 0.05% of one
+    scored pass, so nothing here depends on setup being free.
+    """
+    i = fnp.arange(n_points, dtype=fnp.float64)
+    zz = fnp.asarray([float(v) for v in z])
+    p = fnp.outer(i, zz)
+    # exact modulo: i*z <= 8500*8500 = 7.2e7, far inside float64's integers
+    p = p - fnp.floor(p * (1.0 / n_points)) * float(n_points)
+    return (p * (1.0 / n_points)).astype(fnp.float32)
+
+
+def lattice_normals(base, rng):
+    """Cranley-Patterson randomisation of ``base`` mapped to N(0,1).
+
+    ``u_i = frac(base_i + Delta)`` with ``Delta ~ U[0,1)^d`` drawn from ``rng``
+    (which descends from ``mlp.seed``).  For EVERY fixed ``i``, ``u_i`` is
+    exactly uniform on the cube, so the estimator is exactly unbiased at every
+    N -- which is what keeps ``docs/floor_theorem.md`` applicable.  Only the
+    correlations between points are structured.
+
+    Billed cost, measured: 173 FLOPs/element, of which ``norm.ppf`` is 166.
+    Against 16 for ``standard_normal`` that is +157/element = 3.4e8 over the
+    draw, **1.0% of a scored pass** -- ten times the 0.1% the planning note
+    assumed, and still negligible.
+    """
+    d = base.shape[1]
+    shift = rng.random(d, dtype=fnp.float32)
+    u = base + shift
+    u = u - fnp.floor(u)
+    u = fnp.minimum(fnp.maximum(u, _U_EPS), 1.0 - _U_EPS)
+    # norm.ppf promotes float32 -> float64 to match scipy, and float64 is
+    # billed at 2x; cast straight back so the 32 layers downstream stay f32.
+    return flops.stats.norm.ppf(u).astype(fnp.float32)
+
+
+def _sparse_mc_rqmc(weights, tau, n_samples, n_pilot, seed, base, order):
+    """``_sparse_mc`` with the scored draw replaced by a shifted lattice.
+
+    Structurally identical to :func:`_sparse_mc` -- same pilot, same mask, same
+    frozen constants, same sliced matmuls -- so ``base=None`` reproduces it and
+    is the exact ablation.
+
+    ``order`` permutes which input coordinate is fed by which lattice
+    dimension, cheapest possible: the permutation is applied to the ROWS of
+    ``W^1`` (65,536 elements, once) rather than to the sample matrix
+    (2.2e6 elements, and a gather is billed at 4/element).
+    """
+    n = weights[0].shape[0]
+    depth = len(weights)
+    rng = fnp.random.default_rng(seed)
+
+    x = rng.standard_normal((n_pilot, n), dtype=fnp.float32)
+    alpha, mean_h = [], []
+    for w in weights:
+        z = x @ w
+        m = fnp.mean(z, axis=0)
+        v = fnp.maximum(fnp.mean(z * z, axis=0) - m * m, 1e-12)
+        alpha.append(m / fnp.sqrt(v))
+        x = fnp.maximum(z, 0.0)
+        mean_h.append(fnp.mean(x, axis=0))
+
+    subs, biases = [], []
+    keep_prev = None
+    for l, w in enumerate(weights):
+        keep = None if (tau is None or l == depth - 1) else (alpha[l] > -tau)
+        wr = w if keep_prev is None else w[keep_prev, :]
+        subs.append(wr if keep is None else wr[:, keep])
+        if keep_prev is None:
+            biases.append(None)
+        else:
+            dead_mu = mean_h[l - 1] * (1.0 - keep_prev.astype(fnp.float32))
+            wd = w if keep is None else w[:, keep]
+            biases.append(dead_mu @ wd)
+        keep_prev = keep
+
+    if base is None:
+        x = rng.standard_normal((n_samples, n), dtype=fnp.float32)
+    elif isinstance(base, str):
+        # Antithetic pairs.  Not RQMC, and not shipped -- it is here because
+        # the SAME chaos measurement that bounds RQMC also bounds this one:
+        # antithetic annihilates the ODD chaos and halves the number of
+        # independent draws, so it wins exactly when the odd share exceeds
+        # 1/2, i.e. when corr(f(x), f(-x)) < 0.
+        # (`isinstance`, never `base == "anti"`: comparing a flopscope array
+        # against a string raises UnsupportedDtypeError, which inside
+        # `predict` would fire the dense fallback silently.)
+        g = rng.standard_normal((n_samples // 2, n), dtype=fnp.float32)
+        x = fnp.concatenate([g, -g], axis=0)
+    else:
+        if order:
+            # By Stein's lemma Cov(f, x_j) = E[df/dx_j], so the mean-Jacobian
+            # ordering the theory asks for is the ordering by input influence;
+            # ||W^1 row_j||^2 is its only predict-time-affordable proxy.
+            w1 = weights[0]
+            imp = fnp.sum(w1 * w1, axis=1)
+            perm = fnp.argsort(-imp)
+            subs[0] = subs[0][perm, :]
+        x = lattice_normals(base, rng)
+
+    for l in range(depth):
+        z = x @ subs[l]
+        if biases[l] is not None:
+            z = z + biases[l]
+        x = fnp.maximum(z, 0.0)
+    return fnp.stack(mean_h[:-1] + [fnp.mean(x, axis=0)], axis=0)
+
+
+_LATTICE_CACHE: dict = {}
+
+
+def rqmc_sparse_kernel(weights, ctx=None, tau: float | None = 2.5,
+                       n_samples: int = RQMC_N, n_pilot: int = 150,
+                       seed: int = 0, rqmc: bool = True, order: bool = False,
+                       safe: bool = True, base=None):
+    """Sparse Monte Carlo driven by a randomly-shifted rank-1 lattice.
+
+    ``rqmc=False`` is the exact ablation: the identical code path with a
+    pseudorandom draw.  ``base`` may be supplied by the caller to model the
+    submission, which builds the lattice once in ``setup``; if it is omitted
+    the point set is built and cached here (and billed on the first call).
+    """
+    width = weights[0].shape[0]
+    if rqmc == "anti":
+        base = "anti"
+    elif rqmc and base is None:
+        if width > len(RQMC_Z):
+            base = None          # no vector for this shape: stay pseudorandom
+        else:
+            key = (n_samples, width)
+            if key not in _LATTICE_CACHE:
+                # CBC builds the vector one dimension at a time, so the first
+                # `width` components ARE the vector the same search would have
+                # produced for `width` dimensions.  Truncation is free.
+                _LATTICE_CACHE[key] = lattice_base(n_samples,
+                                                   RQMC_Z[:width])
+            base = _LATTICE_CACHE[key]
+    if base is not None and not isinstance(base, str) and (
+            base.shape[0] != n_samples or base.shape[1] != width):
+        base = None              # shape mismatch is a bug, not a fallback
+    try:
+        return _sparse_mc_rqmc(weights, tau, n_samples, n_pilot, seed,
+                               base if rqmc else None, order)
+    except Exception:  # noqa: BLE001 - a raise on one MLP costs ~850x the score
+        if not safe:
+            raise
+        return _dense_rows(weights, SPARSE_FALLBACK_SAMPLES, seed)
+
+
+KERNELS["rqmc_sparse"] = rqmc_sparse_kernel
+
+
 def blend_kernel(weights, ctx=None, n_samples: int = 4600, seed: int = 0,
                  wmc: float = 0.70, kmax: int = 4, g: float = 0.999825,
                  damp: float = 0.75, umax: int = 1):

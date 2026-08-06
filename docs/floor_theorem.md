@@ -79,12 +79,36 @@ at l=1 that is 2.1e9 and the naive estimator is far worse than plain MC. The
 identity is exact but ill-conditioned, and is only worth using over the last
 few layers, where the amplification is small and the variance gap survives.
 
-**2. Input-anchored control variates cannot work, and neither can input-space RQMC.**
-Only ~6% of Var(z^32_j) is explained by the best linear function of the input
-(forum-reported rho = 0.25 at depth 32, consistent with our own measurement that
-the fluctuation has participation ratio 2.2 but is *not* linear in x). So the
-integrand has high effective dimension in input coordinates. Any surrogate
-correlated ~0.9998+ with the pathwise output must therefore be *another network*,
-not a functional of the input — which is what makes multilevel Monte Carlo over
-rank-truncated weights the natural candidate: Var(f_full - f_r) is controllable
-by r, and level r costs n/(2r) less per sample.
+**2. Input-anchored control variates are bounded at 1.33x -- but the effective
+dimension is LOW, and an earlier version of this section got that wrong.**
+
+CORRECTION. This section previously claimed "only ~6% of Var(z^32_j) is
+explained by the best linear function of the input", and concluded from it that
+the integrand has *high* effective dimension so input-space RQMC cannot work.
+The 6% was wrong. It was inferred from a forum-reported `rho = 0.25`, which is
+the correlation of a particular *Gaussian-affine surrogate chain*, not of the
+L2-optimal linear functional. Measured directly (12 official MLPs, 163,840
+samples, `scripts/27_anova.py`), by three mutually validating estimators
+(Hermite split-half projection, Jansen one-coordinate resample, and
+pick-and-freeze on Bernoulli(p) coordinate subsets recovering the whole order-
+generating function):
+
+    linear (Hermite k=1) share of Var    24.6%      (not 6%)
+    first-order ANOVA share f_1          27.6% +- 1.6%   (range 20.3-37.5%)
+    mean ANOVA dimension d_M             11.5 +- 0.9     (out of 256)
+
+Two consequences, in opposite directions:
+
+* The *conclusion* about control variates survives, with a corrected constant:
+  a perfect linear control variate caps at `1/(1 - 0.246) = 1.33x`, nowhere near
+  the 154,000x required. Input-anchored control variates remain dead.
+* The *conclusion* about RQMC does not survive. A mean ANOVA dimension of 11.5
+  out of 256 is LOW, which is precisely the regime where randomised QMC
+  outperforms plain Monte Carlo. The dismissal was based on a wrong input
+  number, and the reasoning step it fed ("low linear R^2 implies high
+  superposition dimension") is roughly sound here but was applied to a figure
+  that was 4x too small in R^2.
+
+The remaining 72.4% of the variance sits in interactions of order >= 2, which
+bounds how much RQMC can buy: the first-order part can be integrated at a much
+faster rate, the remainder converges at the Monte Carlo rate.
