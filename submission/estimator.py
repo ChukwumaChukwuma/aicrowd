@@ -8,6 +8,20 @@ research kernel in ``whestfloor/kernels.py`` and the code below produce
 bitwise-identical predictions and identical FLOP counts, so what is measured
 is what is shipped.
 
+Why this is a blend
+-------------------
+The grader reports a constant ``sampling_mse = 6.4695e-7`` on every
+submission.  Because ``mse x C/B`` is flat in N for a sampler, that IS plain
+Monte Carlo's adjusted plateau -- and it is better than the bundled
+covariance-propagation baseline by ~10x, and better than every purely
+analytic estimator in this repository.  Measuring analytic improvements
+against covariance propagation was measuring against the wrong reference.
+
+So this ships a convex blend.  MC is unbiased with variance v/N; the analytic
+estimator is biased with almost no variance.  They are independent error
+sources, so the combination beats both, and the analytic part is cheap enough
+that most of the budget still buys samples.
+
 Algorithm
 ---------
 Full-covariance moment propagation with the exact post-ReLU covariance and a
@@ -79,6 +93,15 @@ import flopscope as flops
 import flopscope.numpy as fnp
 from whestbench import BaseEstimator
 
+#: Monte-Carlo samples.  Chosen so effective compute stays under the 0.1
+#: multiplier floor WITH headroom: FLOPs alone are 0.065 of budget and are
+#: machine-independent, but residual wall time is billed at 1e11 FLOPs/s and
+#: the grader runs participant code on one core, so the margin is deliberate.
+N_SAMPLES = 3600
+
+#: Weight on the Monte-Carlo arm.  Calibrated.
+W_MC = 0.70
+
 #: Order at which Mehler's series is truncated.  Measured to saturate at 4:
 #: k=2 gives 6.334e-5, k=4 gives 6.3156e-5, k=8/16 give 6.3153e-5 (scripts/12).
 #: Higher k only adds residual wall time, and at k=24 that pushes C/B to 0.103,
@@ -121,6 +144,20 @@ class Estimator(BaseEstimator):
 
     def predict(self, mlp, budget: int):  # noqa: ANN001 - whestbench MLP
         _ = budget
+        analytic = self._analytic(mlp)
+        # Seeded from mlp.seed per the whestbench contract: the grader supplies
+        # the same seed to every submission, and self-seeded randomness risks
+        # prize disqualification.
+        rng = fnp.random.default_rng(mlp.seed)
+        x = rng.standard_normal((N_SAMPLES, mlp.width), dtype=fnp.float32)
+        rows = []
+        for w in mlp.weights:
+            x = fnp.maximum(x @ w, 0.0)
+            rows.append(fnp.mean(x, axis=0))
+        mc = fnp.stack(rows, axis=0)
+        return analytic + (mc - analytic) * W_MC
+
+    def _analytic(self, mlp):
         n = mlp.width
         mu = fnp.zeros(n, dtype=fnp.float32)
         cov = flops.as_symmetric(fnp.eye(n, dtype=fnp.float32), symmetry=(0, 1))

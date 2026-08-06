@@ -62,8 +62,9 @@ def test_submission_matches_research_kernel():
         a = np.asarray(est.predict(_MLP(W), int(1e12)))
 
     with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c2:
-        b = np.asarray(kernels.cov_prop_edgeworth(
-            W, kmax=sub.KMAX, umax=sub.UMAX, damp=sub.DAMP, g=sub.SHRINK))
+        b = np.asarray(kernels.blend_kernel(
+            W, n_samples=sub.N_SAMPLES, seed=7, wmc=sub.W_MC,
+            kmax=sub.KMAX, g=sub.SHRINK, damp=sub.DAMP, umax=sub.UMAX))
 
     assert a.shape == b.shape == (6, 64)
     assert np.array_equal(a, b), (
