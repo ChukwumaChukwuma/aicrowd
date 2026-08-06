@@ -91,7 +91,20 @@ KMAX = 4
 #: each suite's fitted value scores exactly its own optimum on the other two.
 #: Out-of-sample it takes the final-layer MSE from 6.32e-5 / 6.40e-5 / 6.24e-5
 #: to 1.55e-5 / 2.42e-5 / 2.88e-5.  See scripts/17_fit_shrink.py.
-SHRINK = 0.99975
+SHRINK = 0.999825
+
+#: Highest star-diagram order in the kappa_3 contraction.  Measured optimum: 1.
+UMAX = 1
+
+#: Coefficient on the kappa_3 Edgeworth term.  Also CALIBRATED.  The derived
+#: value is 1.0, and the fact that the measured optimum is not 1.0 is evidence
+#: that the term is mis-specified: the diagram computes only the SOURCE
+#: cumulant, omitting the transport term (W~')^ox3 kappa_3(z^l) with
+#: W~ = diag(Phi) W, so the kappa_3 it feeds in is ~10x too small at depth.
+#: The two constants are ~90% collinear (they span nearly one degree of
+#: freedom) but do partially compose; held out across disjoint MLP halves the
+#: pair beats shrink-alone, and each ablation below degrades the score.
+DAMP = 0.75
 
 #: Floor applied to pre-activation variances before taking a square root.
 VAR_FLOOR = 1e-12
@@ -111,6 +124,7 @@ class Estimator(BaseEstimator):
         n = mlp.width
         mu = fnp.zeros(n, dtype=fnp.float32)
         cov = flops.as_symmetric(fnp.eye(n, dtype=fnp.float32), symmetry=(0, 1))
+        prev = None
         rows = []
 
         for w in mlp.weights:
@@ -121,13 +135,24 @@ class Estimator(BaseEstimator):
             var_pre = fnp.maximum(fnp.diag(cov_pre), VAR_FLOOR)
             sig = fnp.sqrt(var_pre)
             alpha = mu_pre / sig
-            ph = flops.stats.norm.pdf(alpha)
-            Ph = flops.stats.norm.cdf(alpha)
+            # flops.stats.norm promotes float32 -> float64 to match scipy, and
+            # float64 bills at TWICE the float32 rate.  Every downstream array
+            # inherits the dtype, so not casting back doubles the cost of the
+            # whole layer: 2.70e9 FLOPs vs 5.35e9, for a 4.6e-7 rms difference
+            # on a mean activation of 0.76.
+            ph = flops.stats.norm.pdf(alpha).astype(alpha.dtype)
+            Ph = flops.stats.norm.cdf(alpha).astype(alpha.dtype)
 
             # ---- exact rectified-Gaussian marginals -------------------
             mu = mu_pre * Ph + sig * ph
             ez2 = (mu_pre * mu_pre + var_pre) * Ph + mu_pre * sig * ph
             var_post = fnp.maximum(ez2 - mu * mu, 0.0)
+
+            # ---- analytic third-cumulant (Edgeworth) correction -------
+            # z^1 is exactly Gaussian, so nothing to correct at layer 1.
+            if prev is not None:
+                k3 = _kappa3_star(w, prev[0], prev[1], UMAX)
+                mu = mu - (DAMP / 6.0) * k3 * (mu_pre / (var_pre * sig)) * ph
 
             # ---- coherent-bias correction -----------------------------
             # The Gaussian assumption's one-step error is not zero-mean: its
@@ -141,7 +166,7 @@ class Estimator(BaseEstimator):
             rho = cov_pre * fnp.outer(inv_sig, inv_sig)
             rho = fnp.maximum(fnp.minimum(rho, 1.0), -1.0)
 
-            a = _hermite_coeffs(alpha, sig, ph, Ph, KMAX)
+            a = _hermite_coeffs(alpha, sig, ph, Ph, max(KMAX, 2 * UMAX))
             acc = fnp.outer(a[1], a[1]) * rho
             rho_k = rho
             fact = 1.0
@@ -153,6 +178,7 @@ class Estimator(BaseEstimator):
             cov = acc
             fnp.fill_diagonal(cov, var_post)
             cov = flops.as_symmetric(cov, symmetry=(0, 1))
+            prev = (a, rho)
             rows.append(mu)
 
         return fnp.stack(rows, axis=0)
@@ -189,3 +215,27 @@ def _hermite_coeffs(alpha, sig, ph, Ph, kmax):
             term = s_phi if hj is None else s_phi * hj
             out.append(term if k % 2 == 0 else -term)
     return out
+
+
+def _kappa3_star(w, a, rho, umax):
+    """Star-diagram third cumulant of ``z_j = sum_i w_ij relu(z_prev_i)``.
+
+    Every diagram with a zero edge multiplicity factorises through the
+    rank-one ``R^(0)``, so this is ``umax`` matmuls for all outputs at once
+    rather than one per output.
+    """
+    G = [None] + [a[m][:, None] * w for m in range(1, 2 * umax + 1)]
+    Rp = [None, rho]
+    for u in range(2, umax + 1):
+        Rp.append(Rp[u - 1] * rho)
+    RG = [None] + [Rp[u] @ G[u] for u in range(1, umax + 1)]
+    fact = [1.0]
+    for i in range(1, 2 * umax + 2):
+        fact.append(fact[-1] * i)
+    acc = None
+    for u in range(1, umax + 1):
+        for v in range(1, umax + 1):
+            term = fnp.sum(G[u + v] * RG[u] * RG[v], axis=0) * (
+                1.0 / (fact[u] * fact[v]))
+            acc = term if acc is None else acc + term
+    return 3.0 * acc

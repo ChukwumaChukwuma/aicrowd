@@ -196,7 +196,7 @@ def _kappa3_star(w, a, rho, umax):
 
 
 def cov_prop_edgeworth(weights, ctx=None, kmax: int = 4, umax: int = 2,
-                       damp: float = 1.0, g: float = 1.0):
+                       damp: float = 1.0, g: float = 1.0, f32: bool = True):
     """Mehler covariance propagation plus an analytic third-cumulant correction.
 
     The Gaussian assumption is the entire error of covariance propagation
@@ -221,7 +221,7 @@ def cov_prop_edgeworth(weights, ctx=None, kmax: int = 4, umax: int = 2,
         cov_pre = fnp.einsum("ij,ia,jb->ab", cov, w, w)
         var_pre = fnp.maximum(fnp.diag(cov_pre), 1e-12)
         sig = fnp.sqrt(var_pre)
-        mu, var_post, alpha, ph, Ph = _relu_gauss(mu_pre, var_pre, sig)
+        mu, var_post, alpha, ph, Ph = _relu_gauss(mu_pre, var_pre, sig, f32)
 
         if prev is not None:
             k3 = _kappa3_star(w, prev[0], prev[1], umax)
@@ -421,7 +421,8 @@ def cov_prop_edge3(weights, ctx=None, kmax: int = 4, K2: int = 6, T3: int = 3,
 KERNELS["cov_prop_edge3"] = cov_prop_edge3
 
 
-def cov_prop_shrink(weights, ctx=None, kmax: int = 4, g: float = 1.0):
+def cov_prop_shrink(weights, ctx=None, kmax: int = 4, g: float = 1.0,
+                    f32: bool = True):
     """Mehler covariance propagation with a per-layer multiplicative shrink.
 
     Motivation, and it is mechanical rather than empirical.  ``scripts/04``
@@ -445,7 +446,7 @@ def cov_prop_shrink(weights, ctx=None, kmax: int = 4, g: float = 1.0):
         cov_pre = fnp.einsum("ij,ia,jb->ab", cov, w, w)
         var_pre = fnp.maximum(fnp.diag(cov_pre), 1e-12)
         sig = fnp.sqrt(var_pre)
-        mu, var_post, alpha, ph, Ph = _relu_gauss(mu_pre, var_pre, sig)
+        mu, var_post, alpha, ph, Ph = _relu_gauss(mu_pre, var_pre, sig, f32)
         if g != 1.0:
             # mu is a mean of a ReLU: clip to its feasible range.
             mu = fnp.maximum(mu * g, 0.0)
