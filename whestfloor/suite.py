@@ -55,6 +55,13 @@ class Suite:
     #: a diagonal-only variance understates the SE by ~4.7x at this shape.
     #: Optional because suites baked before that was understood lack it.
     final_cov: np.ndarray | None = None
+    #: How ``mlp_seeds`` turn into weight matrices.  ``"local"`` (the default,
+    #: and what every locally baked suite uses) means ``default_rng(seed)`` via
+    #: :func:`whestfloor.mc.make_mlp`.  ``"official"`` means whestbench seed
+    #: protocol 3.0, ``default_rng(SeedSequence(seed).spawn(3)[0])`` — the two
+    #: give completely different networks, so a suite carrying official ground
+    #: truth must say so or it will be scored against the wrong MLPs.
+    seed_protocol: str = "local"
 
     @property
     def n_mlps(self) -> int:
@@ -70,6 +77,11 @@ class Suite:
         return 2 * self.n_per_half
 
     def weights(self, i: int) -> list[np.ndarray]:
+        if self.seed_protocol == "official":
+            from .official_seeds import make_official_mlp  # noqa: PLC0415
+            return make_official_mlp(self.width, self.depth, self.mlp_seeds[i])
+        if self.seed_protocol != "local":
+            raise ValueError(f"unknown seed_protocol {self.seed_protocol!r}")
         return make_mlp(self.width, self.depth, self.mlp_seeds[i])
 
     def save(self, path: str | os.PathLike[str]) -> None:
@@ -87,6 +99,7 @@ class Suite:
             gt_seed_a=np.asarray(self.gt_seed_a, dtype=np.int64),
             gt_seed_b=np.asarray(self.gt_seed_b, dtype=np.int64),
             final_var=self.final_var,
+            seed_protocol=self.seed_protocol,
             **({} if self.final_cov is None
                else {"final_cov": self.final_cov}),
         )
@@ -106,6 +119,10 @@ class Suite:
             gt_seed_b=[int(v) for v in z["gt_seed_b"]],
             final_var=z["final_var"],
             final_cov=(z["final_cov"] if "final_cov" in z.files else None),
+            # Suites baked before the official dataset landed carry no
+            # protocol key; they are all local.
+            seed_protocol=(str(z["seed_protocol"])
+                           if "seed_protocol" in z.files else "local"),
         )
 
 
