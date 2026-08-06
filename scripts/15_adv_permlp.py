@@ -46,11 +46,74 @@ def collect_T(kernel, suite):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--suite", required=True)
+    ap.add_argument("--suite", required=True, nargs="+")
     ap.add_argument("--damp-extra", type=float, default=2.25,
                     help="also evaluate edgeworth at this damp")
     args = ap.parse_args()
 
+    if len(args.suite) > 1:
+        pooled = {"gain": [], "edge": [], "meh": []}
+        per_suite = []
+        for path in args.suite:
+            g, m, e = one_suite(path, args.damp_extra)
+            pooled["gain"].append(g)
+            pooled["meh"].append(m)
+            pooled["edge"].append(e)
+            per_suite.append((Path(path).stem, g.mean() / e.mean()))
+        G = np.concatenate(pooled["gain"])
+        M = np.concatenate(pooled["meh"])
+        E = np.concatenate(pooled["edge"])
+        print("=" * 74)
+        print(f"POOLED over {len(args.suite)} independent suites, "
+              f"{G.size} MLPs")
+        print("=" * 74)
+        for nm, r in per_suite:
+            print(f"  {nm:12s} {r:.3f}x")
+        rng = np.random.default_rng(0)
+        bs = []
+        for _ in range(20000):
+            idx = rng.integers(0, G.size, G.size)
+            bs.append(G[idx].mean() / E[idx].mean())
+        bs = np.array(bs)
+        print(f"  pooled ratio-of-means vs cov_prop_gain: "
+              f"{G.mean() / E.mean():.3f}x   "
+              f"bootstrap 95% CI [{np.percentile(bs, 2.5):.3f}, "
+              f"{np.percentile(bs, 97.5):.3f}]  sd {bs.std():.3f}")
+        bs2 = []
+        for _ in range(20000):
+            idx = rng.integers(0, G.size, G.size)
+            bs2.append(M[idx].mean() / E[idx].mean())
+        bs2 = np.array(bs2)
+        print(f"  pooled ratio-of-means vs mehler_k4:     "
+              f"{M.mean() / E.mean():.3f}x   "
+              f"bootstrap 95% CI [{np.percentile(bs2, 2.5):.3f}, "
+              f"{np.percentile(bs2, 97.5):.3f}]")
+        print(f"  P(a fresh 8-MLP suite reproduces >= 2.11x) ~ "
+              f"{np.mean(np.array([G[rng.integers(0, G.size, 8)].mean() / E[rng.integers(0, G.size, 8)].mean() for _ in range(4000)]) >= 2.11):.3f}"
+              " (bootstrap, resampling 8 MLPs)")
+        print(f"  claim under attack: 2.110x   -> "
+              f"{'INSIDE' if np.percentile(bs, 2.5) <= 2.11 <= np.percentile(bs, 97.5) else 'OUTSIDE'}"
+              " the pooled 95% CI")
+        return 0
+
+    return one_suite_report(args.suite[0], args.damp_extra)
+
+
+def one_suite(path, damp_extra):
+    s = Suite.load(path)
+    g = collect_T(kernels.cov_prop_gain, s)[0]
+    m = collect_T(functools.partial(kernels.cov_prop_mehler, kmax=4), s)[0]
+    e = collect_T(functools.partial(kernels.cov_prop_edgeworth, kmax=4,
+                                    umax=1, damp=1.0), s)[0]
+    return g, m, e
+
+
+def one_suite_report(suite_path, damp_extra) -> int:
+    class _A:
+        pass
+    args = _A()
+    args.suite = suite_path
+    args.damp_extra = damp_extra
     s = Suite.load(args.suite)
     ks = {
         "cov_prop_gain": kernels.cov_prop_gain,

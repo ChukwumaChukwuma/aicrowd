@@ -241,7 +241,7 @@ def brute_mc(W, m, cov, pieces, n_samples: int, seed: int, *,
              chunk: int = 16384, check_every: int = 64):
     """Monte-Carlo ``E[relu(S_j)]`` for ``z ~ N(m, cov)``, two ways.
 
-    Returns ``(mean_Y, mean_D, bias_fast, n)`` where
+    Returns ``(mean_Y, mean_D, bias_fast, n, raw_moments)`` where
 
     * ``mean_Y`` is the plain estimate of ``E[relu(S_j)]`` (high variance);
     * ``mean_D = E[Y - X]`` with ``X = E_eta[relu(P(u) + eta)]`` the chaos-2
@@ -250,7 +250,10 @@ def brute_mc(W, m, cov, pieces, n_samples: int, seed: int, *,
       prediction, ``mean_D`` **is** the chaos-2 error, measured directly and
       with ~25x less variance than ``mean_Y``;
     * ``bias_fast`` is ``E[X_fast - X_exact]``, measured on a subsample, so the
-      fast-erf approximation is corrected rather than trusted.
+      fast-erf approximation is corrected rather than trusted;
+    * ``raw_moments`` is ``(4, n)`` raw moments of ``S - E[S]``, from which
+      :func:`cumulants_from_central` gives the exact kappa_2..kappa_4 needed
+      for the oracle-Edgeworth reference rows.
     """
     W64 = np.asarray(W, dtype=np.float64)
     n = W64.shape[0]
@@ -269,6 +272,7 @@ def brute_mc(W, m, cov, pieces, n_samples: int, seed: int, *,
     acc_y = np.zeros(n)
     acc_d = np.zeros(n)
     acc_b = np.zeros(n)
+    mom = np.zeros((4, n))
     n_b = 0
     done = 0
     ci = 0
@@ -278,30 +282,49 @@ def brute_mc(W, m, cov, pieces, n_samples: int, seed: int, *,
         z = t @ L.T + mf
         tt = (z - mf) / sf
         y = np.maximum(z, np.float32(0.0)) @ Wf
+        sc = (y - cf).astype(np.float64)               # S - E[S], for cumulants
         np.maximum(y, np.float32(0.0), out=y)          # Y = relu(S)
         p = cf + tt @ G1f + (tt * tt - np.float32(1.0)) @ G2h
         x = _relu_mean_fast(p, sef)
         acc_y += y.sum(axis=0, dtype=np.float64)
         acc_d += (y - x).sum(axis=0, dtype=np.float64)
+        mom[0] += sc.sum(axis=0)
+        s2 = sc * sc
+        mom[1] += s2.sum(axis=0)
+        mom[2] += (s2 * sc).sum(axis=0)
+        mom[3] += (s2 * s2).sum(axis=0)
         if ci % check_every == 0:
             xe = _relu_mean_exact(p.astype(np.float64), sef.astype(np.float64))
             acc_b += (x - xe).sum(axis=0, dtype=np.float64)
             n_b += nb
         ci += 1
         done += nb
-    return acc_y / done, acc_d / done, acc_b / max(n_b, 1), done
+    return acc_y / done, acc_d / done, acc_b / max(n_b, 1), done, mom / done
 
 
-def layer_state(W, upto: int, n_samples: int, seed: int, chunk: int = 2048):
+def cumulants_from_central(mom):
+    """``(k1_shift, k2, k3, k4)`` from raw moments of ``S - c`` (shape ``(4, n)``)."""
+    m1, m2, m3, m4 = mom
+    k2 = m2 - m1 * m1
+    k3 = m3 - 3 * m1 * m2 + 2 * m1**3
+    k4 = m4 - 4 * m1 * m3 - 3 * m2 * m2 + 12 * m1 * m1 * m2 - 6 * m1**4
+    return m1, k2, k3, k4
+
+
+def layer_state(W, upto: int, n_samples: int, seed: int, chunk: int = 2048,
+                want_next: bool = False):
     """Measured ``(m, cov)`` of ``z`` at layer ``upto`` (0-based) of a real MLP.
 
     Same construction as ``scripts/13_validate_kappa3.py``: the correlation the
-    network actually produces, not a synthetic one.
+    network actually produces, not a synthetic one.  With ``want_next`` also
+    returns the network's TRUE ``E[relu(z^{upto+1})]``, which separates the
+    "z is not Gaussian" error from the "S is not Gaussian" error.
     """
     n = W[0].shape[0]
     rng = np.random.default_rng(seed)
     s1 = np.zeros(n)
     g = np.zeros((n, n))
+    nx = np.zeros(n)
     done = 0
     while done < n_samples:
         nb = min(chunk, n_samples - done)
@@ -312,8 +335,13 @@ def layer_state(W, upto: int, n_samples: int, seed: int, chunk: int = 2048):
                 zf = z.astype(np.float64)
                 s1 += zf.sum(axis=0)
                 g += zf.T @ zf
+                if want_next:
+                    nxt = np.maximum(z, np.float32(0.0)) @ (
+                        W[li + 1] if li + 1 < len(W) else W[0])
+                    nx += np.maximum(nxt, np.float32(0.0)).sum(axis=0, dtype=np.float64)
                 break
             x = np.maximum(z, np.float32(0.0))
         done += nb
     m = s1 / done
-    return m, g / done - np.outer(m, m)
+    cov = g / done - np.outer(m, m)
+    return (m, cov, nx / done) if want_next else (m, cov)

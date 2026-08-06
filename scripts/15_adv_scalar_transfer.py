@@ -99,6 +99,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--suite-a", required=True)
     ap.add_argument("--suite-b", required=True)
+    ap.add_argument("--shrink-grid", type=str,
+                    default="1.0,0.9999,0.99985,0.9998,0.99977,0.99974,"
+                            "0.9997,0.9996")
+    ap.add_argument("--only-shrink", action="store_true")
     args = ap.parse_args()
 
     S = {"A": Suite.load(args.suite_a), "B": Suite.load(args.suite_b)}
@@ -117,6 +121,13 @@ def main() -> int:
         P[("gain", k)] = collect(gain, s)
         P[("mehler", k)] = collect(meh, s)
         P[("edge", k)] = collect(edg, s)
+    tedgA = T_of(P[("edge", "A")], S["A"])
+    tedgB = T_of(P[("edge", "B")], S["B"])
+    if args.only_shrink:
+        print(f"edgeworth reference: A {tedgA:.4e}   B {tedgB:.4e}\n")
+        shrink_table(S, [float(x) for x in args.shrink_grid.split(",")],
+                     tedgA, tedgB)
+        return 0
 
     # ---- fitted output scale, cross-validated -------------------------
     print("Output scale c fitted on one suite, SCORED ON THE OTHER "
@@ -160,9 +171,14 @@ def main() -> int:
           f"A: {tmehA_x / tedgA_x:.3f}x   B: {tmehB_x / tedgB_x:.3f}x")
     print()
 
+    shrink_table(S, [float(x) for x in args.shrink_grid.split(",")],
+                 tedgA, tedgB)
+    return 0
+
+
+def shrink_table(S, grid, tedgA, tedgB):
     # ---- per-layer shrink, cross-validated ----------------------------
     print("Per-layer mean shrink g (one number, applied at every layer):")
-    grid = [1.0, 0.999, 0.998, 0.9975, 0.997, 0.9965, 0.996, 0.995, 0.994]
     tab = {}
     for k, s in S.items():
         row = []
@@ -170,9 +186,9 @@ def main() -> int:
             row.append(T_of(collect(functools.partial(mehler_shrink, kmax=4,
                                                       g=g), s), s))
         tab[k] = np.array(row)
-    print("   g      T(A)         T(B)")
+    print("     g        T(A)         T(B)")
     for i, g in enumerate(grid):
-        print(f"  {g:.4f}  {tab['A'][i]:.4e}   {tab['B'][i]:.4e}")
+        print(f"  {g:.6f}  {tab['A'][i]:.4e}   {tab['B'][i]:.4e}")
     gA = grid[int(np.argmin(tab["A"]))]
     gB = grid[int(np.argmin(tab["B"]))]
     print(f"  argmin on A: g={gA}   argmin on B: g={gB}")
@@ -180,7 +196,6 @@ def main() -> int:
           f"{tab['B'][grid.index(gA)]:.4e}  vs edgeworth on B {tedgB:.4e}")
     print(f"  OUT-OF-SAMPLE: g fitted on B ({gB}) scored on A -> "
           f"{tab['A'][grid.index(gB)]:.4e}  vs edgeworth on A {tedgA:.4e}")
-    return 0
 
 
 if __name__ == "__main__":

@@ -50,6 +50,18 @@ def build_kernels(kmax_list):
     # ablation: identical code path, correction switched off
     ks["edgeworth_u2_ablated"] = functools.partial(
         kernels.cov_prop_edgeworth, kmax=4, umax=2, damp=0.0)
+    # complete tree catalogue for kappa_3 (scripts/16), and through kappa_4
+    ks["edge3"] = functools.partial(
+        kernels.cov_prop_edge3, kmax=4, K2=4, T3=3)
+    ks["edge3_ablated"] = functools.partial(
+        kernels.cov_prop_edge3, kmax=4, K2=4, T3=3, damp=0.0)
+    ks["edge4"] = functools.partial(
+        kernels.cov_prop_edgeworth4, kmax=4, K2=4, T3=3, T4=3)
+    ks["edge4_g1sq"] = functools.partial(
+        kernels.cov_prop_edgeworth4, kmax=4, K2=4, T3=3, T4=3, g1sq=True)
+    ks["edge4_ablated"] = functools.partial(
+        kernels.cov_prop_edgeworth4, kmax=4, K2=4, T3=3, T4=3,
+        damp=0.0, damp4=0.0)
     return ks
 
 

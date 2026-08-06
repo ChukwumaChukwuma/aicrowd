@@ -10,8 +10,8 @@ is what is shipped.
 
 Algorithm
 ---------
-Full-covariance moment propagation with the **exact** post-ReLU covariance,
-plus an analytic third-cumulant correction to the rectified mean.
+Full-covariance moment propagation with the exact post-ReLU covariance and a
+calibrated per-layer coherent-bias correction.
 
 The pre-activation of every layer is modelled as jointly Gaussian; the linear
 map is then exact,
@@ -85,8 +85,13 @@ from whestbench import BaseEstimator
 #: crossing the 0.1 multiplier floor and making the score WORSE.
 KMAX = 4
 
-#: Highest star-diagram order in the kappa_3 contraction.  Measured optimum: 1.
-UMAX = 1
+#: Per-layer multiplicative shrink.  A CALIBRATED constant, not a derived one.
+#: Fitted independently on three disjoint suites (24 MLPs, disjoint MLP seeds
+#: and disjoint ground-truth seeds); the argmin is 0.99975 on all three, and
+#: each suite's fitted value scores exactly its own optimum on the other two.
+#: Out-of-sample it takes the final-layer MSE from 6.32e-5 / 6.40e-5 / 6.24e-5
+#: to 1.55e-5 / 2.42e-5 / 2.88e-5.  See scripts/17_fit_shrink.py.
+SHRINK = 0.99975
 
 #: Floor applied to pre-activation variances before taking a square root.
 VAR_FLOOR = 1e-12
@@ -106,7 +111,6 @@ class Estimator(BaseEstimator):
         n = mlp.width
         mu = fnp.zeros(n, dtype=fnp.float32)
         cov = flops.as_symmetric(fnp.eye(n, dtype=fnp.float32), symmetry=(0, 1))
-        prev = None
         rows = []
 
         for w in mlp.weights:
@@ -125,19 +129,19 @@ class Estimator(BaseEstimator):
             ez2 = (mu_pre * mu_pre + var_pre) * Ph + mu_pre * sig * ph
             var_post = fnp.maximum(ez2 - mu * mu, 0.0)
 
-            # ---- analytic third-cumulant (Edgeworth) correction -------
-            # z^1 is exactly Gaussian, so there is nothing to correct at the
-            # first layer and `prev` is still None there.
-            if prev is not None:
-                k3 = _kappa3_star(w, prev[0], prev[1], UMAX)
-                mu = mu - (1.0 / 6.0) * k3 * (mu_pre / (var_pre * sig)) * ph
+            # ---- coherent-bias correction -----------------------------
+            # The Gaussian assumption's one-step error is not zero-mean: its
+            # mean over neurons is positive at EVERY layer. One constant per
+            # layer removes the compounding part of it. mu is a mean of a
+            # ReLU, so it is clipped to its feasible range.
+            mu = fnp.maximum(mu * SHRINK, 0.0)
 
             # ---- exact post-ReLU covariance via Mehler ----------------
             inv_sig = 1.0 / sig
             rho = cov_pre * fnp.outer(inv_sig, inv_sig)
             rho = fnp.maximum(fnp.minimum(rho, 1.0), -1.0)
 
-            a = _hermite_coeffs(alpha, sig, ph, Ph, max(KMAX, 2 * UMAX))
+            a = _hermite_coeffs(alpha, sig, ph, Ph, KMAX)
             acc = fnp.outer(a[1], a[1]) * rho
             rho_k = rho
             fact = 1.0
@@ -149,7 +153,6 @@ class Estimator(BaseEstimator):
             cov = acc
             fnp.fill_diagonal(cov, var_post)
             cov = flops.as_symmetric(cov, symmetry=(0, 1))
-            prev = (a, rho)
             rows.append(mu)
 
         return fnp.stack(rows, axis=0)
@@ -170,37 +173,19 @@ def _hermite_coeffs(alpha, sig, ph, Ph, kmax):
             j = k - 2
             if j == 0:
                 hj = None                       # He_0 == 1
+                h_prev, h = None, None
             elif j == 1:
-                h_prev, h = None, alpha         # He_1 == alpha
-                hj = h
+                hj = alpha                      # He_1
+                h_prev, h = None, hj            # He_0 == 1 stays implicit
             else:
                 base = alpha * h
-                hj = base if h_prev is None else base - float(j - 1) * h_prev
+                # `None` stands for the CONSTANT He_0 = 1, so it must still
+                # contribute (j-1)*1 to the recurrence. Treating it as an
+                # absent term drops the -1 in He_2 and corrupts every a_k
+                # from k = 4 up -- including a_4, which KMAX = 4 uses.
+                hj = (base - float(j - 1) if h_prev is None
+                      else base - float(j - 1) * h_prev)
                 h_prev, h = h, hj
             term = s_phi if hj is None else s_phi * hj
             out.append(term if k % 2 == 0 else -term)
     return out
-
-
-def _kappa3_star(w, a, rho, umax):
-    """Star-diagram third cumulant of ``z_j = sum_i w_ij relu(z_prev_i)``.
-
-    ``a`` are the previous layer's ReLU Hermite coefficients and ``rho`` its
-    pre-activation correlation matrix.  Costs ``umax`` matmuls of n^3 for all
-    outputs at once.
-    """
-    G = [None] + [a[m][:, None] * w for m in range(1, 2 * umax + 1)]
-    Rp = [None, rho]
-    for u in range(2, umax + 1):
-        Rp.append(Rp[u - 1] * rho)
-    RG = [None] + [Rp[u] @ G[u] for u in range(1, umax + 1)]
-    fact = [1.0]
-    for i in range(1, 2 * umax + 2):
-        fact.append(fact[-1] * i)
-    acc = None
-    for u in range(1, umax + 1):
-        for v in range(1, umax + 1):
-            term = fnp.sum(G[u + v] * RG[u] * RG[v], axis=0) * (
-                1.0 / (fact[u] * fact[v]))
-            acc = term if acc is None else acc + term
-    return 3.0 * acc
