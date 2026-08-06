@@ -1,0 +1,19 @@
+# Generated artifacts are never committed — every one of them is regenerable
+# bit-for-bit from a committed script (see scripts/).
+_artifacts/
+*.npz
+*.tar.gz
+
+# Local environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Scratch
+_scratch/
+nohup.out
