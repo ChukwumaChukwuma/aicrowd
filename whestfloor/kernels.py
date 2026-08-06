@@ -196,7 +196,7 @@ def _kappa3_star(w, a, rho, umax):
 
 
 def cov_prop_edgeworth(weights, ctx=None, kmax: int = 4, umax: int = 2,
-                       damp: float = 1.0):
+                       damp: float = 1.0, g: float = 1.0):
     """Mehler covariance propagation plus an analytic third-cumulant correction.
 
     The Gaussian assumption is the entire error of covariance propagation
@@ -226,6 +226,10 @@ def cov_prop_edgeworth(weights, ctx=None, kmax: int = 4, umax: int = 2,
         if prev is not None:
             k3 = _kappa3_star(w, prev[0], prev[1], umax)
             mu = mu - (damp / 6.0) * k3 * (mu_pre / (var_pre * sig)) * ph
+        if g != 1.0:
+            # composes the coherent-bias shrink of cov_prop_shrink with the
+            # per-neuron skew correction; they are different mechanisms.
+            mu = fnp.maximum(mu * g, 0.0)
 
         inv_sig = 1.0 / sig
         rho = cov_pre * fnp.outer(inv_sig, inv_sig)
