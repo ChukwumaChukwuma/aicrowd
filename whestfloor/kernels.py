@@ -114,7 +114,7 @@ def cov_prop_gain(weights, ctx=None):
         mu, var_post, _, _, Ph = _relu_gauss(mu_pre, var_pre, sig)
         cov = fnp.multiply(fnp.outer(Ph, Ph), cov_pre)
         fnp.fill_diagonal(cov, var_post)
-        cov = flops.as_symmetric(cov, symmetry=(0, 1))
+        cov = flops.symmetrize(cov, symmetry=(0, 1))
         rows.append(mu)
     return fnp.stack(rows, axis=0)
 
@@ -157,7 +157,7 @@ def cov_prop_mehler(weights, ctx=None, kmax: int = 4):
 
         cov = acc
         fnp.fill_diagonal(cov, var_post)
-        cov = flops.as_symmetric(cov, symmetry=(0, 1))
+        cov = flops.symmetrize(cov, symmetry=(0, 1))
         rows.append(mu)
     return fnp.stack(rows, axis=0)
 
@@ -246,7 +246,7 @@ def cov_prop_edgeworth(weights, ctx=None, kmax: int = 4, umax: int = 2,
 
         cov = acc
         fnp.fill_diagonal(cov, var_post)
-        cov = flops.as_symmetric(cov, symmetry=(0, 1))
+        cov = flops.symmetrize(cov, symmetry=(0, 1))
         prev = (a, rho)
         rows.append(mu)
     return fnp.stack(rows, axis=0)
@@ -412,7 +412,7 @@ def cov_prop_edge3(weights, ctx=None, kmax: int = 4, K2: int = 6, T3: int = 3,
             acc = t if acc is None else acc + t
         cov = acc
         fnp.fill_diagonal(cov, var_post)
-        cov = flops.as_symmetric(cov, symmetry=(0, 1))
+        cov = flops.symmetrize(cov, symmetry=(0, 1))
         prev = (a, c, k3x, E)
         rows.append(mu)
     return fnp.stack(rows, axis=0)
@@ -463,7 +463,7 @@ def cov_prop_shrink(weights, ctx=None, kmax: int = 4, g: float = 1.0,
             acc = acc + fnp.outer(a[k], a[k]) * (rho_k * (1.0 / fact))
         cov = acc
         fnp.fill_diagonal(cov, var_post)
-        cov = flops.as_symmetric(cov, symmetry=(0, 1))
+        cov = flops.symmetrize(cov, symmetry=(0, 1))
         rows.append(mu)
     return fnp.stack(rows, axis=0)
 
@@ -643,7 +643,7 @@ def cov_prop_edgeworth4(weights, ctx=None, kmax: int = 4, K2: int = 6,
                 Chat = t if Chat is None else Chat + t
         cov = acc
         fnp.fill_diagonal(cov, var_post)
-        cov = flops.as_symmetric(cov, symmetry=(0, 1))
+        cov = flops.symmetrize(cov, symmetry=(0, 1))
         prev = (a, c, g, k3x, k4x, E, Chat)
         rows.append(mu)
     return fnp.stack(rows, axis=0)
@@ -672,7 +672,7 @@ def mc_kernel(weights, ctx=None, n_samples: int = 5800, seed: int = 0):
     return fnp.stack(rows, axis=0)
 
 
-def blend_kernel(weights, ctx=None, n_samples: int = 3600, seed: int = 0,
+def blend_kernel(weights, ctx=None, n_samples: int = 4600, seed: int = 0,
                  wmc: float = 0.70, kmax: int = 4, g: float = 0.999825,
                  damp: float = 0.75, umax: int = 1):
     """Convex blend of Monte Carlo with the analytic estimator.
