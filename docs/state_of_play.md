@@ -20,8 +20,18 @@ dataset-bake example in the whestbench docs still passes `--depth 8`). An
 independent analytic route via the ReLU arc-cosine overlap map agrees. `v` also
 has CV 0.48 across MLPs, so the floor is a per-suite random variable.
 
-Free compute is `C ≤ 2.72e10` (the multiplier clamps at 0.1 below that); the
-shipped estimator spends `C/B = 0.050`, so accuracy is the only lever left.
+Free compute is `C ≤ 2.72e10` (the multiplier clamps at 0.1 below that). The
+shipped estimator sits at `F/B = 0.0915` — `F` is machine-independent, `C`
+is not, and the grader runs participant code on one physical core, so the
+margin that matters is quoted in `F`.
+
+**The shipped estimator is now plain sampling with the always-off neurons
+pruned out of every matmul** (`docs/sparse_sign_stable.md`): adjusted
+**5.87e-7**, the first estimator here below the grader's own plain-MC constant
+`sampling_mse = 6.4695e-7`. The whole analytic programme below is retained as
+research, not as ship: blending it back in *worsens* the score, because its
+2.7e9 FLOPs push `C/B` from 0.100 to 0.124 and the 1.24x multiplier penalty
+exceeds what it buys.
 
 ## Where the error is
 
@@ -34,7 +44,17 @@ Errors add incoherently across layers (√32 × 2.0e-3 = 1.13e-2 ≈ the measure
 Gaussian scheme.
 
 At depth the network is nearly input-independent: `mean(m²)/mean(z²) → 0.95` by
-layer 32, so `|α| ≈ 4.4` and most rectifiers are almost always on or off.
+layer 32, so most rectifiers are almost always on or off.
+
+**Corrected by direct measurement** (`scripts/25 --mode alpha`, 4 official MLPs
+× 200k samples): `rms|α|` at layer 32 is **3.44, not 4.4**, and it is exactly 0
+at layer 1 (`E[z¹] = E[x] W¹ = 0` — the mean is *generated* by rectification and
+accumulates with depth). `α` is close to Gaussian across neurons, so the
+fraction with small `|α|` falls only linearly near zero. Consequently **987 of
+8192 neurons flip sign per sample (12.05%)**, not the ~5% the "nearly decided"
+picture suggests, and a scheme that must *evaluate* every neuron that might
+flip has to touch 71.4% of them at `|α| < 3`. That single fact is what bounds
+every sparse-correction scheme — see `docs/sparse_sign_stable.md`.
 
 ## Mechanisms tried
 
@@ -47,6 +67,25 @@ layer 32, so `|α| ≈ 4.4` and most rectifiers are almost always on or off.
 | analytic κ₃ via star diagrams | 84–88% of true κ₃ at O(n³) | **works** | `13` |
 | κ₃ Edgeworth correction, end to end | 6.82e-5 → **3.23e-5** (2.11×) | **shipped** | `12` |
 | MLMC over rank-truncated networks | 0.94× vs a 20× bar | **dead** | `22`, `23` |
+| sign-stable **modal fusion** + kink correction | 4.95× MORE expensive than dense | **dead** | `25` |
+| sign-stable **Rao-Blackwell** on decided neurons | 1.001× at τ=2 | **dead** | `25` |
+| sign-stable **dead-neuron pruning** | 1.51×/sample → **1.44× on score** | **shipped** | `25`, `26` |
+
+### Why sign-stable sparsity mostly does not work (`docs/sparse_sign_stable.md`)
+
+The 4× per-sample cost bar **failed at 1.51×**, and 4× is the mechanism's
+*ceiling*: pruning costs `(|ON|/n)²` and `ON` must contain every neuron with
+positive mean, ~50% by construction, so 4× is reachable only at `τ = 0` where
+the sign error is 4.5e-2 — 7,700× the whole score. Two richer versions are dead
+outright. The modal-fusion identity `z³² = xA + Σ εˡ Rˡ` is exact but `E[x] = 0`,
+so `A` predicts *nothing* and the two arms cancel 15.3× (`Var 1.968` and `1.921`
+summing to `0.128`), leaving the correction arm with **31× more variance than
+plain MC**; billed, it costs 4.95× more per sample plus 51% of the free budget
+in setup. And the decided neurons carry **0.10% of the estimator variance at
+τ = 2**, so there is no Rao-Blackwellisation to collect. What survives is the
+dumbest version — drop the rows and columns of neurons that never fire — worth
+**1.44× on the score, replicated across four independent seeds**, which shipped
+anyway despite the failed cost bar.
 
 ### Why multilevel Monte Carlo is dead (`docs/mlmc.md`)
 
@@ -123,6 +162,21 @@ family.
    unbounded and load free at grade time; the Edgeworth *form* with learned
    coefficients could absorb the truncation error. Label noise averages out
    over many (MLP, neuron) pairs, so moderate-N ground truth suffices.
+
+## Where this leaves the board
+
+| | adjusted | × floor |
+|---|---|---|
+| proven noise floor (`docs/floor_theorem.md`) | 4.949e-12 | 1.0 |
+| leaderboard #1 (dpskv5) | 3.63e-10 | 73.3 |
+| the sign-stable family as a competitor ships it | 1.60e-7 | 32,300 |
+| **this repo, now** | **5.87e-7** | **118,600** |
+| grader's plain-MC constant `sampling_mse` | 6.4695e-7 | 130,700 |
+| this repo, previous ship (analytic blend) | 7.7791e-7 | 157,200 |
+
+The entire remaining headroom in the benchmark is 73.3× and we are 1,616× behind
+the leader, so the gap is not a modelling gap — it is that nothing here yet
+beats sampling by more than a constant factor.
 
 ## Reproducing
 

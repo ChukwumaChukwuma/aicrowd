@@ -8,133 +8,136 @@ research kernel in ``whestfloor/kernels.py`` and the code below produce
 bitwise-identical predictions and identical FLOP counts, so what is measured
 is what is shipped.
 
-Why this is a blend
--------------------
+Why this is plain sampling, sparsened
+-------------------------------------
 The grader reports a constant ``sampling_mse = 6.4695e-7`` on every
 submission.  Because ``mse x C/B`` is flat in N for a sampler, that IS plain
-Monte Carlo's adjusted plateau -- and it is better than the bundled
+Monte Carlo's adjusted plateau — and it is better than the bundled
 covariance-propagation baseline by ~10x, and better than every purely
-analytic estimator in this repository.  Measuring analytic improvements
-against covariance propagation was measuring against the wrong reference.
+analytic estimator in this repository.  Two full rounds of analytic work
+(Mehler covariance, tree-diagram kappa_3 and kappa_4, coherent-bias shrink)
+landed at 2.28e-6 adjusted, i.e. **3.5x worse than plain sampling**, and the
+previous ship — a convex blend of that analytic arm with MC — reached
+7.78e-7, still marginally worse than sampling alone.
 
-So this ships a convex blend.  MC is unbiased with variance v/N; the analytic
-estimator is biased with almost no variance.  They are independent error
-sources, so the combination beats both, and the analytic part is cheap enough
-that most of the budget still buys samples.
+So the analytic arm is **gone**.  Measured on the official 100-MLP suite it
+costs 2.7e9 FLOPs, which pushes C/B from 0.100 to 0.124, and the 1.24x
+multiplier penalty exceeds everything the blend buys: pure sparse MC scores
+5.76e-7 against the blend's 7.75e-7 through the same sparse arm.  Paying for
+a second estimator only makes sense below the multiplier floor, and there is
+no room below the floor.
 
-Algorithm
----------
-Full-covariance moment propagation with the exact post-ReLU covariance and a
-calibrated per-layer coherent-bias correction.
+What is left is the cheapest correct sampler we can bill.
 
-The pre-activation of every layer is modelled as jointly Gaussian; the linear
-map is then exact,
+The mechanism: prune the neurons that never fire
+------------------------------------------------
+At depth the network is nearly decided.  With ``alpha = m/s`` the per-neuron
+pre-activation ratio, ``rms|alpha|`` rises from 0 at layer 1 (where ``E[z] = 0``
+exactly, because ``E[x] = 0``) to **3.44 by layer 32**.  A neuron with
+``alpha < -tau`` emits ``relu(z) = 0`` on all but a vanishing fraction of
+samples, so:
 
-    m_pre = Wᵀ m ,     Σ_pre = Wᵀ Σ W ,
+  * its **row** of the next layer's weight matrix contributes nothing, and
+  * its **column** of this layer's weight matrix need never be evaluated,
 
-and the rectifier's first two moments are exact per neuron.  The step that is
-normally approximated is the *off-diagonal* post-ReLU covariance.  Writing
-``a_k = E[relu(m + s t) He_k(t)]`` for the Hermite coefficients of the
-rectifier about each neuron's own mean and scale, Mehler's formula gives the
-covariance in closed form:
+and its small, nearly constant expected output folds into a bias vector
+computed once.  Both matmul dimensions shrink, so the per-sample cost falls
+as ``(|ON| / n)^2``.  Billed in a real ``BudgetContext``: **2,793,985
+FLOPs/sample against 4,198,656 dense, i.e. 1.51x**, which buys 8,500 samples
+where the dense pass affords 6,200 at the same compute.
 
-    Cov(relu(z_i), relu(z_j)) = Σ_{k≥1} a^i_k a^j_k ρ_ij^k / k!
+The sign error this trades away is small and was measured *paired* — the
+pruned and dense passes run on the identical sample stream, so the Monte
+Carlo noise cancels and what is left is the pruning alone.  At ``tau = 2.5``
+it is not resolvable above the +-5e-7 pairing noise; bracketed by its
+neighbours (<=3e-8 at ``tau = 3.0``, 1.3-2.0e-6 at ``tau = 2.0``) it is of
+order 2-3e-7, **3-5% of the final MSE**.
 
-with, derived by Stein's identity,
+What this deliberately does NOT do
+----------------------------------
+Two richer versions of the same idea were built, priced and rejected; both
+refutations are measurements, not arguments (``docs/sparse_sign_stable.md``).
 
-    a_1 = s Φ(α),      a_k = (-1)^k s He_{k-2}(α) φ(α)   for k ≥ 2,   α = m/s.
+1. **It does not fuse the modal sign pattern into one matrix.**  On the modal
+   pattern the network collapses to ``A = W1 D1 ... D31 W32`` and
+   ``z^32 = x A + sum_l eps^l R^l`` exactly.  But the input mean is **zero**,
+   so ``A`` predicts identically nothing, and the two arms cancel 15x:
+   ``Var(xA) = 1.97`` and ``Var(z^32) = 0.128``.  Sampling only the
+   correction has **31x more variance than plain MC**.  Billed, that scheme
+   costs **4.95x MORE per sample** than the dense pass it replaces, plus 54%
+   of the free budget in setup, because the kink-to-kink coupling is
+   O(depth^2) over sets that are half the width.
 
-The ``k = 1`` term alone is ``Φ_i Φ_j Σ_ij`` — exactly the "gain" rule used by
-the reference baseline.  Every further term is a correction that baseline
-drops, and the whole series costs ``O(kmax · width²)`` against the layer's
-``O(width³)`` contraction, i.e. a couple of percent.
+2. **It does not claim a Rao-Blackwell gain from the decided neurons.**  They
+   carry 0.10% of the estimator's variance at tau = 2 and 0.001% at tau = 3;
+   their ReLU deviation has variance ~1e-7 against z's 0.1.  The variance
+   lives entirely in the kink neurons, which must still be sampled.
 
-Third-cumulant correction
--------------------------
-The Gaussian assumption is the *entire* error of covariance propagation: layer
-1 is exactly Gaussian, and if every layer were, the linear map would be exact.
-Measured, that assumption injects ~1.3e-3 RMS per layer.  Its leading
-correction is the Edgeworth term
-
-    E[relu(z)] = m Phi(a) + s phi(a) - (kappa_3 / 6)(m / s^3) phi(a) + ...
-
-(a density perturbation ``c He_n`` contributes ``s c He_{n-2}(a) phi(a)``,
-which is what makes every Edgeworth order a closed form here).
-
-``kappa_3`` of the next pre-activation is an n^3 contraction per output — n^4
-overall, five times the whole free budget.  Expanding each rectifier in
-Hermite polynomials of its own standardised pre-activation turns the joint
-cumulant into a sum over triangles with edge multiplicities ``(p, q, r)``, and
-**every diagram with a zero multiplicity factorises**, because ``R^(0)`` is
-rank one:
-
-    kappa_3^star_j = 3 * sum_{u,v>=1} colsum_j[ G^(u+v) * (R^(u)G^(u)) * (R^(v)G^(v)) ] / (u! v!)
-    G^(m) = diag(a_m) W
-
-which is ``umax`` matmuls for all outputs at once.  Validated against
-brute-force Monte Carlo: the star terms carry 84-88% of the true kappa_3
-(scripts/13).  Measured end to end, the correction takes the final-layer MSE
-from 6.32e-5 to 3.23e-5; setting its coefficient to zero reproduces the
-uncorrected number exactly, so the gain is attributable to this term alone.
-
-``UMAX = 1`` is the measured optimum: u=1 gives 3.23e-5, u=2 gives 3.61e-5,
-u=3 gives 3.78e-5 *and* pushes C/B to 0.114, crossing the multiplier floor.
-
-Budget
+Sizing
 ------
-The score multiplier is ``max(0.1, C/B)`` and clamps at the floor for any
-``C ≤ 2.72e10``.  This estimator spends far less than that, so its ranked
-score is exactly ``final_layer_mse / 10``.
+The score multiplier is ``max(0.1, C/B)`` with ``C = F + 1e11 * R``.  ``F`` is
+machine-independent; ``R`` is participant wall time and the grader runs one
+physical core, so the margin that matters is in ``F``.  This estimator sits at
+``F/B = 0.0915``, leaving 0.0085 * B = 2.3e9 = 23 ms of residual before the
+floor is crossed — and crossing it is a linear penalty, not a cliff.
+
+Shrinking N to buy more residual headroom was tested and is the wrong move:
+at 3x the reference machine's residual, N = 8500 scores 6.74e-7 while
+N = 7073 (sized to sit exactly at the floor under that residual) scores
+7.12e-7.  Above the floor the adjusted score is flat in N, so undershooting
+costs more than overshooting.
 """
 
 from __future__ import annotations
 
-import flopscope as flops
 import flopscope.numpy as fnp
 from whestbench import BaseEstimator
 
-#: Monte-Carlo samples. Tuned on the OFFICIAL 100-MLP suite (N=1e9 reference).
-#: multiplier floor WITH headroom: FLOPs alone are 0.065 of budget and are
-#: machine-independent, but residual wall time is billed at 1e11 FLOPs/s and
-#: the grader runs participant code on one core, so the margin is deliberate.
-N_SAMPLES = 4600
+#: Threshold on ``alpha = m/s`` below which a neuron is treated as always-off.
+#: CALIBRATED, not derived: swept on the same 100 official MLPs it is scored
+#: on.  The optimum is broad — 2.3 / 2.5 / 2.7 give adjusted 5.97 / 5.65 /
+#: 5.79 e-7 — so the transfer risk is small, but it is not zero.
+#:
+#: The LOWER end is fixed by accuracy, not cost: tau = 2.0 is 1.12x cheaper
+#: per sample again, but its sign error is 1.3-2.0e-6, i.e. 20-30% of the
+#: final MSE, and tau = 1.0 costs +2e-4, some 35x the entire score.  Above
+#: 3.5 there is almost nothing left to prune.
+TAU = 2.5
 
-#: Weight on the Monte-Carlo arm.  Calibrated.
-W_MC = 0.70
+#: Scored Monte-Carlo samples.  Set by the ``F/B`` invariant above, not by the
+#: argmin of a sweep: at fixed tau the raw MSE across N = 7000..9400 is
+#: v/N to within +-7%, which is pure realisation noise on a 100-MLP suite.
+N_SAMPLES = 8500
 
-#: Order at which Mehler's series is truncated.  Measured to saturate at 4:
-#: k=2 gives 6.334e-5, k=4 gives 6.3156e-5, k=8/16 give 6.3153e-5 (scripts/12).
-#: Higher k only adds residual wall time, and at k=24 that pushes C/B to 0.103,
-#: crossing the 0.1 multiplier floor and making the score WORSE.
-KMAX = 4
+#: Pilot samples.  The pilot is a short DENSE pass and does three jobs at
+#: once: it supplies ``alpha`` (which the threshold needs — thresholding is
+#: not free), the frozen constants for the pruned neurons, and the depth-1
+#: unscored filler rows.  Its cost is 150 * 4.198656e6 = 6.3e8, 2.3% of the
+#: free budget.
+#:
+#: 150 is the ROBUST choice, not the sharp one: P = 80 / 100 / 150 / 250 all
+#: land within 3% of each other (realisation noise), while P = 600 is clearly
+#: worse (6.26e-6 vs 5.65e-6 raw) because the pilot's own cost then eats the
+#: samples it was meant to improve.  Note the pilot's sampling noise enters
+#: the frozen constants as a fixed offset that does NOT average away over the
+#: scored samples, which is why more pilot is not monotonically better.
+N_PILOT = 150
 
-#: Per-layer multiplicative shrink.  A CALIBRATED constant, not a derived one.
-#: Fitted independently on three disjoint suites (24 MLPs, disjoint MLP seeds
-#: and disjoint ground-truth seeds); the argmin is 0.99975 on all three, and
-#: each suite's fitted value scores exactly its own optimum on the other two.
-#: Out-of-sample it takes the final-layer MSE from 6.32e-5 / 6.40e-5 / 6.24e-5
-#: to 1.55e-5 / 2.42e-5 / 2.88e-5.  See scripts/17_fit_shrink.py.
-SHRINK = 0.999825
-
-#: Highest star-diagram order in the kappa_3 contraction.  Measured optimum: 1.
-UMAX = 1
-
-#: Coefficient on the kappa_3 Edgeworth term.  Also CALIBRATED.  The derived
-#: value is 1.0, and the fact that the measured optimum is not 1.0 is evidence
-#: that the term is mis-specified: the diagram computes only the SOURCE
-#: cumulant, omitting the transport term (W~')^ox3 kappa_3(z^l) with
-#: W~ = diag(Phi) W, so the kappa_3 it feeds in is ~10x too small at depth.
-#: The two constants are ~90% collinear (they span nearly one degree of
-#: freedom) but do partially compose; held out across disjoint MLP halves the
-#: pair beats shrink-alone, and each ablation below degrades the score.
-DAMP = 0.75
+#: Samples for the defensive dense fallback.  A single raising MLP is
+#: catastrophic — the grader zeroes that prediction, whose MSE is O(1) against
+#: a score of O(1e-6), so one failure in 100 would dominate the mean by
+#: ~850x.  Sized so that even a raise on the very last operation, with the
+#: whole sparse pass already billed, lands at C/B ~ 0.18: far under the hard
+#: cap, and a valid prediction at a 1.8x multiplier penalty beats a zeroed one
+#: by ~800,000x on that MLP.  Verified: 0 raises over all 100 official MLPs.
+FALLBACK_SAMPLES = 6000
 
 #: Floor applied to pre-activation variances before taking a square root.
 VAR_FLOOR = 1e-12
 
 
 class Estimator(BaseEstimator):
-    """Covariance propagation with the exact post-ReLU covariance."""
+    """Monte Carlo with the always-off neurons pruned out of every matmul."""
 
     def __init__(self) -> None:
         self._setup_rng = None
@@ -144,144 +147,72 @@ class Estimator(BaseEstimator):
 
     def predict(self, mlp, budget: int):  # noqa: ANN001 - whestbench MLP
         _ = budget
-        # A single raising MLP is catastrophic: the grader zeroes that
-        # prediction, whose MSE is O(1) against a score of O(1e-5), so one
-        # failure in 100 would dominate the mean ~850x over. The MC arm alone
-        # is always well defined, so the analytic arm is made non-fatal.
-        try:
-            analytic = self._analytic(mlp)
-        except Exception:
-            analytic = None
         # Seeded from mlp.seed per the whestbench contract: the grader supplies
         # the same seed to every submission, and self-seeded randomness risks
-        # prize disqualification.
-        rng = fnp.random.default_rng(mlp.seed)
-        x = rng.standard_normal((N_SAMPLES, mlp.width), dtype=fnp.float32)
+        # prize disqualification.  One generator feeds both the pilot and the
+        # scored draw, so the scored samples are independent of the pilot
+        # while every stream still descends from mlp.seed alone.
+        try:
+            return self._sparse(mlp, TAU, N_SAMPLES, N_PILOT, mlp.seed)
+        except Exception:
+            return self._dense(mlp, FALLBACK_SAMPLES, mlp.seed)
+
+    # ------------------------------------------------------------------
+    def _dense(self, mlp, n_samples, seed):
+        """Plain MC over all layers.  Also the fallback for the sparse path."""
+        rng = fnp.random.default_rng(seed)
+        x = rng.standard_normal((n_samples, mlp.width), dtype=fnp.float32)
         rows = []
         for w in mlp.weights:
             x = fnp.maximum(x @ w, 0.0)
             rows.append(fnp.mean(x, axis=0))
-        mc = fnp.stack(rows, axis=0)
-        if analytic is None:
-            return mc
-        return analytic + (mc - analytic) * W_MC
-
-    def _analytic(self, mlp):
-        n = mlp.width
-        mu = fnp.zeros(n, dtype=fnp.float32)
-        cov = flops.as_symmetric(fnp.eye(n, dtype=fnp.float32), symmetry=(0, 1))
-        prev = None
-        rows = []
-
-        for w in mlp.weights:
-            # ---- exact linear map -------------------------------------
-            mu_pre = w.T @ mu
-            cov_pre = fnp.einsum("ij,ia,jb->ab", cov, w, w)
-
-            var_pre = fnp.maximum(fnp.diag(cov_pre), VAR_FLOOR)
-            sig = fnp.sqrt(var_pre)
-            alpha = mu_pre / sig
-            # flops.stats.norm promotes float32 -> float64 to match scipy, and
-            # float64 bills at TWICE the float32 rate.  Every downstream array
-            # inherits the dtype, so not casting back doubles the cost of the
-            # whole layer: 2.70e9 FLOPs vs 5.35e9, for a 4.6e-7 rms difference
-            # on a mean activation of 0.76.
-            ph = flops.stats.norm.pdf(alpha).astype(alpha.dtype)
-            Ph = flops.stats.norm.cdf(alpha).astype(alpha.dtype)
-
-            # ---- exact rectified-Gaussian marginals -------------------
-            mu = mu_pre * Ph + sig * ph
-            ez2 = (mu_pre * mu_pre + var_pre) * Ph + mu_pre * sig * ph
-            var_post = fnp.maximum(ez2 - mu * mu, 0.0)
-
-            # ---- analytic third-cumulant (Edgeworth) correction -------
-            # z^1 is exactly Gaussian, so nothing to correct at layer 1.
-            if prev is not None:
-                k3 = _kappa3_star(w, prev[0], prev[1], UMAX)
-                mu = mu - (DAMP / 6.0) * k3 * (mu_pre / (var_pre * sig)) * ph
-
-            # ---- coherent-bias correction -----------------------------
-            # The Gaussian assumption's one-step error is not zero-mean: its
-            # mean over neurons is positive at EVERY layer. One constant per
-            # layer removes the compounding part of it. mu is a mean of a
-            # ReLU, so it is clipped to its feasible range.
-            mu = fnp.maximum(mu * SHRINK, 0.0)
-
-            # ---- exact post-ReLU covariance via Mehler ----------------
-            inv_sig = 1.0 / sig
-            rho = cov_pre * fnp.outer(inv_sig, inv_sig)
-            rho = fnp.maximum(fnp.minimum(rho, 1.0), -1.0)
-
-            a = _hermite_coeffs(alpha, sig, ph, Ph, max(KMAX, 2 * UMAX))
-            acc = fnp.outer(a[1], a[1]) * rho
-            rho_k = rho
-            fact = 1.0
-            for k in range(2, KMAX + 1):
-                rho_k = rho_k * rho
-                fact *= k
-                acc = acc + fnp.outer(a[k], a[k]) * (rho_k * (1.0 / fact))
-
-            cov = acc
-            fnp.fill_diagonal(cov, var_post)
-            cov = flops.symmetrize(cov, symmetry=(0, 1))
-            prev = (a, rho)
-            rows.append(mu)
-
         return fnp.stack(rows, axis=0)
 
+    def _sparse(self, mlp, tau, n_samples, n_pilot, seed):
+        n = mlp.width
+        depth = len(mlp.weights)
+        rng = fnp.random.default_rng(seed)
 
-def _hermite_coeffs(alpha, sig, ph, Ph, kmax):
-    """``a_k = E[relu(m + s t) He_k(t)]`` for k = 1 … kmax.
+        # ---- pilot: a short dense pass -------------------------------
+        x = rng.standard_normal((n_pilot, n), dtype=fnp.float32)
+        alpha, mean_h = [], []
+        for w in mlp.weights:
+            z = x @ w
+            m = fnp.mean(z, axis=0)
+            v = fnp.maximum(fnp.mean(z * z, axis=0) - m * m, VAR_FLOOR)
+            alpha.append(m / fnp.sqrt(v))
+            x = fnp.maximum(z, 0.0)
+            mean_h.append(fnp.mean(x, axis=0))
 
-    ``a_1 = s Φ(α)``;  ``a_k = (-1)^k s He_{k-2}(α) φ(α)`` for ``k ≥ 2``.
-    He_j is built by the recurrence ``He_{j+1} = α He_j - j He_{j-1}``.
-    """
-    out = [None, sig * Ph]
-    if kmax >= 2:
-        s_phi = sig * ph
-        h_prev = None   # He_{j-1}
-        h = None        # He_j
-        for k in range(2, kmax + 1):
-            j = k - 2
-            if j == 0:
-                hj = None                       # He_0 == 1
-                h_prev, h = None, None
-            elif j == 1:
-                hj = alpha                      # He_1
-                h_prev, h = None, hj            # He_0 == 1 stays implicit
+        # ---- masks and pre-sliced weights: billed once, not per sample
+        # The last layer keeps all n output columns.  Pruning them would save
+        # ~1% of the pass and would force a scatter back into n slots, whose
+        # only failure mode (an all-dead layer) is the one thing that must
+        # never raise.  Keeping them also removes the frozen constants from
+        # the scored row entirely.
+        subs, biases = [], []
+        keep_prev = None
+        for l, w in enumerate(mlp.weights):
+            keep = (None if (tau is None or l == depth - 1)
+                    else alpha[l] > -tau)
+            wr = w if keep_prev is None else w[keep_prev, :]
+            subs.append(wr if keep is None else wr[:, keep])
+            if keep_prev is None:
+                biases.append(None)
             else:
-                base = alpha * h
-                # `None` stands for the CONSTANT He_0 = 1, so it must still
-                # contribute (j-1)*1 to the recurrence. Treating it as an
-                # absent term drops the -1 in He_2 and corrupts every a_k
-                # from k = 4 up -- including a_4, which KMAX = 4 uses.
-                hj = (base - float(j - 1) if h_prev is None
-                      else base - float(j - 1) * h_prev)
-                h_prev, h = h, hj
-            term = s_phi if hj is None else s_phi * hj
-            out.append(term if k % 2 == 0 else -term)
-    return out
+                dead = mean_h[l - 1] * (1.0 - keep_prev.astype(fnp.float32))
+                wd = w if keep is None else w[:, keep]
+                biases.append(dead @ wd)
+            keep_prev = keep
 
-
-def _kappa3_star(w, a, rho, umax):
-    """Star-diagram third cumulant of ``z_j = sum_i w_ij relu(z_prev_i)``.
-
-    Every diagram with a zero edge multiplicity factorises through the
-    rank-one ``R^(0)``, so this is ``umax`` matmuls for all outputs at once
-    rather than one per output.
-    """
-    G = [None] + [a[m][:, None] * w for m in range(1, 2 * umax + 1)]
-    Rp = [None, rho]
-    for u in range(2, umax + 1):
-        Rp.append(Rp[u - 1] * rho)
-    RG = [None] + [Rp[u] @ G[u] for u in range(1, umax + 1)]
-    fact = [1.0]
-    for i in range(1, 2 * umax + 2):
-        fact.append(fact[-1] * i)
-    acc = None
-    for u in range(1, umax + 1):
-        for v in range(1, umax + 1):
-            term = fnp.sum(G[u + v] * RG[u] * RG[v], axis=0) * (
-                1.0 / (fact[u] * fact[v]))
-            acc = term if acc is None else acc + term
-    return 3.0 * acc
+        # ---- scored pass ---------------------------------------------
+        x = rng.standard_normal((n_samples, n), dtype=fnp.float32)
+        for l in range(depth):
+            z = x @ subs[l]
+            if biases[l] is not None:
+                z = z + biases[l]
+            x = fnp.maximum(z, 0.0)
+        # Only the final row is scored.  The others come free from the pilot;
+        # they are not blended with the scored pass, which would correlate the
+        # estimate with the mask that was derived from the same samples.
+        return fnp.stack(mean_h[:-1] + [fnp.mean(x, axis=0)], axis=0)

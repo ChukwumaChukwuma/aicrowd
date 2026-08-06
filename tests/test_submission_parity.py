@@ -44,6 +44,68 @@ class _MLP:
         self.seed = 7
 
 
+def test_submission_fallback_matches_research_kernel():
+    """The defensive path must be the same algorithm too.
+
+    `predict` swallows any exception from the sparse path and falls back to a
+    dense pass.  A fallback that silently differed from the research kernel
+    would be an unmeasured estimator running on exactly the MLPs where things
+    went wrong, so it is pinned as tightly as the main path.
+    """
+    import warnings
+
+    warnings.filterwarnings("ignore")
+    import flopscope as flops
+    import flopscope.numpy as fnp
+
+    from whestfloor import kernels
+    from whestfloor.mc import make_mlp
+
+    sub = _load_submission()
+    W = [fnp.asarray(x) for x in make_mlp(64, 6, seed=5)]
+    est = sub.Estimator()
+
+    with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c1:
+        a = np.asarray(est._dense(_MLP(W), sub.FALLBACK_SAMPLES, 7))
+    with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c2:
+        b = np.asarray(kernels._dense_rows(W, kernels.SPARSE_FALLBACK_SAMPLES,
+                                           7))
+
+    assert sub.FALLBACK_SAMPLES == kernels.SPARSE_FALLBACK_SAMPLES
+    assert np.array_equal(a, b)
+    assert c1.flops_used == c2.flops_used
+
+
+def test_sparse_ablation_is_exactly_dense():
+    """`tau=None` must reproduce plain MC bit for bit through the same path.
+
+    That is what makes the reported 1.44x an ablation rather than a
+    comparison between two different programs.
+    """
+    import warnings
+
+    warnings.filterwarnings("ignore")
+    import flopscope as flops
+    import flopscope.numpy as fnp
+
+    from whestfloor import kernels
+    from whestfloor.mc import make_mlp
+
+    W = [fnp.asarray(x) for x in make_mlp(64, 6, seed=11)]
+    with flops.BudgetContext(flop_budget=int(1e12), quiet=True):
+        a = np.asarray(kernels.sparse_mc_kernel(W, tau=None, n_samples=512,
+                                                n_pilot=64, seed=3))
+    with flops.BudgetContext(flop_budget=int(1e12), quiet=True):
+        b = np.asarray(kernels._sparse_mc(W, None, 512, 64, 3))
+    assert np.array_equal(a, b)
+
+    # and the pruned path must actually differ, or the ablation is vacuous
+    with flops.BudgetContext(flop_budget=int(1e12), quiet=True):
+        c = np.asarray(kernels.sparse_mc_kernel(W, tau=2.5, n_samples=512,
+                                                n_pilot=64, seed=3))
+    assert not np.array_equal(a[-1], c[-1])
+
+
 def test_submission_matches_research_kernel():
     import warnings
 
@@ -62,9 +124,9 @@ def test_submission_matches_research_kernel():
         a = np.asarray(est.predict(_MLP(W), int(1e12)))
 
     with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c2:
-        b = np.asarray(kernels.blend_kernel(
-            W, n_samples=sub.N_SAMPLES, seed=7, wmc=sub.W_MC,
-            kmax=sub.KMAX, g=sub.SHRINK, damp=sub.DAMP, umax=sub.UMAX))
+        b = np.asarray(kernels.sparse_mc_kernel(
+            W, tau=sub.TAU, n_samples=sub.N_SAMPLES, n_pilot=sub.N_PILOT,
+            seed=7))
 
     assert a.shape == b.shape == (6, 64)
     assert np.array_equal(a, b), (
