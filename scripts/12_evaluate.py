@@ -44,6 +44,12 @@ def build_kernels(kmax_list):
     }
     for k in kmax_list:
         ks[f"mehler_k{k}"] = functools.partial(kernels.cov_prop_mehler, kmax=k)
+    for u in (1, 2, 3):
+        ks[f"edgeworth_u{u}"] = functools.partial(
+            kernels.cov_prop_edgeworth, kmax=4, umax=u)
+    # ablation: identical code path, correction switched off
+    ks["edgeworth_u2_ablated"] = functools.partial(
+        kernels.cov_prop_edgeworth, kmax=4, umax=2, damp=0.0)
     return ks
 
 

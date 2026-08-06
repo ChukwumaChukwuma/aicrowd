@@ -10,7 +10,8 @@ is what is shipped.
 
 Algorithm
 ---------
-Full-covariance moment propagation with the **exact** post-ReLU covariance.
+Full-covariance moment propagation with the **exact** post-ReLU covariance,
+plus an analytic third-cumulant correction to the rectified mean.
 
 The pre-activation of every layer is modelled as jointly Gaussian; the linear
 map is then exact,
@@ -34,6 +35,37 @@ the reference baseline.  Every further term is a correction that baseline
 drops, and the whole series costs ``O(kmax · width²)`` against the layer's
 ``O(width³)`` contraction, i.e. a couple of percent.
 
+Third-cumulant correction
+-------------------------
+The Gaussian assumption is the *entire* error of covariance propagation: layer
+1 is exactly Gaussian, and if every layer were, the linear map would be exact.
+Measured, that assumption injects ~1.3e-3 RMS per layer.  Its leading
+correction is the Edgeworth term
+
+    E[relu(z)] = m Phi(a) + s phi(a) - (kappa_3 / 6)(m / s^3) phi(a) + ...
+
+(a density perturbation ``c He_n`` contributes ``s c He_{n-2}(a) phi(a)``,
+which is what makes every Edgeworth order a closed form here).
+
+``kappa_3`` of the next pre-activation is an n^3 contraction per output — n^4
+overall, five times the whole free budget.  Expanding each rectifier in
+Hermite polynomials of its own standardised pre-activation turns the joint
+cumulant into a sum over triangles with edge multiplicities ``(p, q, r)``, and
+**every diagram with a zero multiplicity factorises**, because ``R^(0)`` is
+rank one:
+
+    kappa_3^star_j = 3 * sum_{u,v>=1} colsum_j[ G^(u+v) * (R^(u)G^(u)) * (R^(v)G^(v)) ] / (u! v!)
+    G^(m) = diag(a_m) W
+
+which is ``umax`` matmuls for all outputs at once.  Validated against
+brute-force Monte Carlo: the star terms carry 84-88% of the true kappa_3
+(scripts/13).  Measured end to end, the correction takes the final-layer MSE
+from 6.32e-5 to 3.23e-5; setting its coefficient to zero reproduces the
+uncorrected number exactly, so the gain is attributable to this term alone.
+
+``UMAX = 1`` is the measured optimum: u=1 gives 3.23e-5, u=2 gives 3.61e-5,
+u=3 gives 3.78e-5 *and* pushes C/B to 0.114, crossing the multiplier floor.
+
 Budget
 ------
 The score multiplier is ``max(0.1, C/B)`` and clamps at the floor for any
@@ -53,6 +85,9 @@ from whestbench import BaseEstimator
 #: crossing the 0.1 multiplier floor and making the score WORSE.
 KMAX = 4
 
+#: Highest star-diagram order in the kappa_3 contraction.  Measured optimum: 1.
+UMAX = 1
+
 #: Floor applied to pre-activation variances before taking a square root.
 VAR_FLOOR = 1e-12
 
@@ -71,6 +106,7 @@ class Estimator(BaseEstimator):
         n = mlp.width
         mu = fnp.zeros(n, dtype=fnp.float32)
         cov = flops.as_symmetric(fnp.eye(n, dtype=fnp.float32), symmetry=(0, 1))
+        prev = None
         rows = []
 
         for w in mlp.weights:
@@ -89,12 +125,19 @@ class Estimator(BaseEstimator):
             ez2 = (mu_pre * mu_pre + var_pre) * Ph + mu_pre * sig * ph
             var_post = fnp.maximum(ez2 - mu * mu, 0.0)
 
+            # ---- analytic third-cumulant (Edgeworth) correction -------
+            # z^1 is exactly Gaussian, so there is nothing to correct at the
+            # first layer and `prev` is still None there.
+            if prev is not None:
+                k3 = _kappa3_star(w, prev[0], prev[1], UMAX)
+                mu = mu - (1.0 / 6.0) * k3 * (mu_pre / (var_pre * sig)) * ph
+
             # ---- exact post-ReLU covariance via Mehler ----------------
             inv_sig = 1.0 / sig
             rho = cov_pre * fnp.outer(inv_sig, inv_sig)
             rho = fnp.maximum(fnp.minimum(rho, 1.0), -1.0)
 
-            a = _hermite_coeffs(alpha, sig, ph, Ph, KMAX)
+            a = _hermite_coeffs(alpha, sig, ph, Ph, max(KMAX, 2 * UMAX))
             acc = fnp.outer(a[1], a[1]) * rho
             rho_k = rho
             fact = 1.0
@@ -106,6 +149,7 @@ class Estimator(BaseEstimator):
             cov = acc
             fnp.fill_diagonal(cov, var_post)
             cov = flops.as_symmetric(cov, symmetry=(0, 1))
+            prev = (a, rho)
             rows.append(mu)
 
         return fnp.stack(rows, axis=0)
@@ -136,3 +180,27 @@ def _hermite_coeffs(alpha, sig, ph, Ph, kmax):
             term = s_phi if hj is None else s_phi * hj
             out.append(term if k % 2 == 0 else -term)
     return out
+
+
+def _kappa3_star(w, a, rho, umax):
+    """Star-diagram third cumulant of ``z_j = sum_i w_ij relu(z_prev_i)``.
+
+    ``a`` are the previous layer's ReLU Hermite coefficients and ``rho`` its
+    pre-activation correlation matrix.  Costs ``umax`` matmuls of n^3 for all
+    outputs at once.
+    """
+    G = [None] + [a[m][:, None] * w for m in range(1, 2 * umax + 1)]
+    Rp = [None, rho]
+    for u in range(2, umax + 1):
+        Rp.append(Rp[u - 1] * rho)
+    RG = [None] + [Rp[u] @ G[u] for u in range(1, umax + 1)]
+    fact = [1.0]
+    for i in range(1, 2 * umax + 2):
+        fact.append(fact[-1] * i)
+    acc = None
+    for u in range(1, umax + 1):
+        for v in range(1, umax + 1):
+            term = fnp.sum(G[u + v] * RG[u] * RG[v], axis=0) * (
+                1.0 / (fact[u] * fact[v]))
+            acc = term if acc is None else acc + term
+    return 3.0 * acc

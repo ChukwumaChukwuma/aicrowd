@@ -152,3 +152,85 @@ KERNELS = {
     "cov_prop_gain": cov_prop_gain,
     "cov_prop_mehler": cov_prop_mehler,
 }
+
+
+def _kappa3_star(w, a, rho, umax):
+    """Star-diagram third cumulant of ``z^{l}_j = sum_i w_ij relu(z^{l-1}_i)``.
+
+    ``a`` are the previous layer's ReLU Hermite coefficients and ``rho`` its
+    pre-activation correlation.  See :mod:`whestfloor.cumulants` for the
+    derivation; the whole thing is ``umax`` matmuls of n^3 for all j at once,
+    because every diagram with a zero edge multiplicity factorises through the
+    rank-one ``R^(0)``.
+    """
+    G = [None] + [a[m][:, None] * w for m in range(1, 2 * umax + 1)]
+    Rp = [None, rho]
+    for u in range(2, umax + 1):
+        Rp.append(Rp[u - 1] * rho)
+    RG = [None] + [Rp[u] @ G[u] for u in range(1, umax + 1)]
+    fact = [1.0]
+    for i in range(1, 2 * umax + 2):
+        fact.append(fact[-1] * i)
+    acc = None
+    for u in range(1, umax + 1):
+        for v in range(1, umax + 1):
+            term = fnp.sum(G[u + v] * RG[u] * RG[v], axis=0) * (
+                1.0 / (fact[u] * fact[v]))
+            acc = term if acc is None else acc + term
+    return 3.0 * acc
+
+
+def cov_prop_edgeworth(weights, ctx=None, kmax: int = 4, umax: int = 2,
+                       damp: float = 1.0):
+    """Mehler covariance propagation plus an analytic third-cumulant correction.
+
+    The Gaussian assumption is the entire error of covariance propagation
+    (measured: ~1.3e-3 RMS per layer against a 1.3e-6 budget).  Its leading
+    correction is the Edgeworth term in the third cumulant,
+
+        E[relu(z)] = m Phi(a) + s phi(a) - (kappa_3 / 6) (m / s^3) phi(a) + ...
+
+    and ``kappa_3`` is obtained analytically from the previous layer's Hermite
+    coefficients and correlation matrix by the star-diagram contraction, which
+    costs ``umax`` extra n^3 matmuls per layer.  ``damp`` scales the correction
+    (1.0 = full); it exists so the correction's contribution can be ablated
+    without changing any other code path.
+    """
+    n = weights[0].shape[0]
+    mu = fnp.zeros(n, dtype=fnp.float32)
+    cov = flops.as_symmetric(fnp.eye(n, dtype=fnp.float32), symmetry=(0, 1))
+    prev = None
+    rows = []
+    for w in weights:
+        mu_pre = w.T @ mu
+        cov_pre = fnp.einsum("ij,ia,jb->ab", cov, w, w)
+        var_pre = fnp.maximum(fnp.diag(cov_pre), 1e-12)
+        sig = fnp.sqrt(var_pre)
+        mu, var_post, alpha, ph, Ph = _relu_gauss(mu_pre, var_pre, sig)
+
+        if prev is not None:
+            k3 = _kappa3_star(w, prev[0], prev[1], umax)
+            mu = mu - (damp / 6.0) * k3 * (mu_pre / (var_pre * sig)) * ph
+
+        inv_sig = 1.0 / sig
+        rho = cov_pre * fnp.outer(inv_sig, inv_sig)
+        rho = fnp.maximum(fnp.minimum(rho, 1.0), -1.0)
+
+        a = _hermite_coeffs(alpha, sig, ph, Ph, max(kmax, 2 * umax))
+        rho_k = rho
+        acc = fnp.outer(a[1], a[1]) * rho
+        fact = 1.0
+        for k in range(2, kmax + 1):
+            rho_k = rho_k * rho
+            fact *= k
+            acc = acc + fnp.outer(a[k], a[k]) * (rho_k * (1.0 / fact))
+
+        cov = acc
+        fnp.fill_diagonal(cov, var_post)
+        cov = flops.as_symmetric(cov, symmetry=(0, 1))
+        prev = (a, rho)
+        rows.append(mu)
+    return fnp.stack(rows, axis=0)
+
+
+KERNELS["cov_prop_edgeworth"] = cov_prop_edgeworth

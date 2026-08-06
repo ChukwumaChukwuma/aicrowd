@@ -429,34 +429,64 @@ def real_layer_stats(n=256, depth=32, seed=0, kmax=16):
     return out
 
 
-def orders(layers=(1, 7, 15, 31), emax=8, n=256):
+def orders(layers=(1, 7, 15, 23, 31), emax=None, n=256):
+    """Per-diagram magnitudes on the real n=256 network, grouped by cost class."""
+    emax = emax or {2: 14, 3: 6, 4: 4}
     stats = real_layer_stats(n=n)
     for li in layers:
-        m, s, R, W = stats[li]
-        if li + 1 < len(stats):
-            Wn = stats[li + 1][3]
-        else:
-            Wn = W
+        m, s, R, _ = stats[li]
+        Wn = stats[li + 1][3] if li + 1 < len(stats) else stats[li][3]
+        t0 = time.time()
         per, ctx = layer_cumulants(m, s, R, Wn, emax, max_cycles=1)
         k3, k4 = totals(per)
-        sd_next = np.sqrt(np.diag(Wn.T @ ctx["C"] @ Wn))
-        print(f"\n=== layer {li+1} -> {li+2}   |rho|mean={np.abs(R[~np.eye(n,dtype=bool)]).mean():.3f} "
-              f" sigma_next mean={sd_next.mean():.3f}")
-        print(f"    total kappa_3 rms {np.sqrt((k3**2).mean()):.4e}  "
-              f"gamma_3 rms {np.sqrt(((k3/sd_next**3)**2).mean()):.4f}")
-        print(f"    total kappa_4 rms {np.sqrt((k4**2).mean()):.4e}  "
-              f"gamma_4 rms {np.sqrt(((k4/sd_next**4)**2).mean()):.4f}")
-        items = sorted(per.items(), key=lambda kv: -np.sqrt((kv[1] ** 2).mean()))
-        print(f"    {'diagram':<32s} {'rms':>10s} {'frac':>7s}  cycles")
-        tot3 = np.sqrt((k3 ** 2).mean()); tot4 = np.sqrt((k4 ** 2).mean())
-        shown = 0
-        for k, v in items:
-            rms = float(np.sqrt((v ** 2).mean()))
-            den = tot3 if k.startswith("r3") else tot4
-            if rms / den < 2e-3 or shown > 26:
+        sd = np.sqrt(np.diag(Wn.T @ ctx["C"] @ Wn))
+        off = np.abs(R[~np.eye(n, dtype=bool)])
+        print(f"\n=== layer {li+1} -> {li+2}   |rho|mean={off.mean():.3f} "
+              f"rho_rms={np.sqrt((R[~np.eye(n,dtype=bool)]**2).mean()):.3f}  "
+              f"sigma'={sd.mean():.3f}   [{time.time()-t0:.0f}s]")
+        print(f"    kappa_3 rms {np.sqrt((k3**2).mean()):.4e}  gamma_3 rms "
+              f"{np.sqrt(((k3/sd**3)**2).mean()):.4f}")
+        print(f"    kappa_4 rms {np.sqrt((k4**2).mean()):.4e}  gamma_4 rms "
+              f"{np.sqrt(((k4/sd**4)**2).mean()):.4f}")
+        # group by (r, partition type, tree/cycle, order)
+        groups = {}
+        for dg in catalogue(3, emax, 1) + catalogue(4, emax, 1):
+            r = 3 if sum(dg.sizes) == 3 else 4
+            key = f"r{r} {dg.tag}"
+            if key not in per:
                 continue
-            shown += 1
-            print(f"    {k:<32s} {rms:10.3e} {rms/den:7.3f}")
+            cls = "cycle" if dg.cycles > 0 else "tree "
+            g = (r, "+".join(map(str, dg.sizes)), cls, min(dg.order, 9))
+            groups[g] = groups.get(g, 0.0) + per[key]
+        for k, v in per.items():
+            if "ursell" in k:
+                groups[(4, k.split()[1], "tree ", 0)] = v
+        print(f"    {'r':>2s} {'partition':<9s} {'class':<6s} {'order':>5s} "
+              f"{'rms':>10s} {'frac':>7s}  cumulative-drop")
+        rows = sorted(groups.items(), key=lambda kv: (kv[0][0], -np.sqrt((kv[1]**2).mean())))
+        for (r, pt, cls, o), v in rows:
+            rms = float(np.sqrt((v ** 2).mean()))
+            den = float(np.sqrt(((k3 if r == 3 else k4) ** 2).mean()))
+            if rms / den < 3e-3:
+                continue
+            print(f"    {r:2d} {pt:<9s} {cls:<6s} {o:5d} {rms:10.3e} {rms/den:7.3f}")
+        # what truncations cost, relative to the full sum at this layer
+        print("    truncation impact (rms deviation from the full sum above):")
+        for label, em, kw in (
+                ("trees only (drop all cycles)", emax, dict(max_cycles=0)),
+                ("emax 8/4/3                 ", {2: 8, 3: 4, 4: 3}, dict(max_cycles=1)),
+                ("emax 6/3/2                 ", {2: 6, 3: 3, 4: 2}, dict(max_cycles=1)),
+                ("emax 4/2/2                 ", {2: 4, 3: 2, 4: 2}, dict(max_cycles=1)),
+                ("emax 6/3/2 trees only      ", {2: 6, 3: 3, 4: 2}, dict(max_cycles=0)),
+                ("no injectivity correction  ", emax, dict(max_cycles=1, exact_inj=False)),
+                ("coincident blocks only     ", {2: 14, 3: 0, 4: 0}, dict(max_cycles=1)),
+        ):
+            p2, _ = layer_cumulants(m, s, R, Wn, em, **kw)
+            a3, a4 = totals(p2)
+            print(f"      {label} dk3 {np.sqrt(((a3-k3)**2).mean()):.3e} "
+                  f"({np.sqrt(((a3-k3)**2).mean())/np.sqrt((k3**2).mean()):.1%})   "
+                  f"dk4 {np.sqrt(((a4-k4)**2).mean()):.3e} "
+                  f"({np.sqrt(((a4-k4)**2).mean())/np.sqrt((k4**2).mean()):.1%})")
 
 
 # ===========================================================================
