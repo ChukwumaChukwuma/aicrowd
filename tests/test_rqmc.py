@@ -138,3 +138,110 @@ def test_rqmc_ablation_is_exactly_the_shipped_sparse_kernel():
                                           n_pilot=64, seed=3))
     assert np.array_equal(a, b)
     assert c1.flops_used == c2.flops_used
+
+
+# ---------------------------------------------------------------------------
+# The x0_fn hook and the deployable lattice (whestfloor/rqmc.py)
+# ---------------------------------------------------------------------------
+
+
+def test_x0_fn_none_is_bitwise_the_shipped_corrected_kernel():
+    """The hook must be invisible when unused.
+
+    ``corrected_sparse_kernel`` gained an ``x0_fn`` argument so a lattice can
+    replace the scored draw; ``x0_fn=None`` must be the previous program, to
+    the bit and to the FLOP, or every A/B in ``docs/rqmc.md`` is comparing two
+    different estimators rather than one estimator's two draws.
+    """
+    warnings.filterwarnings("ignore")
+    import flopscope as flops
+    import flopscope.numpy as fnp
+
+    from whestfloor import kernels as K
+    from whestfloor.mc import make_mlp
+
+    W = [fnp.asarray(x) for x in make_mlp(64, 6, seed=11)]
+    beta = np.zeros(15, dtype=np.float32)
+    beta[1] = 0.25
+    with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c1:
+        a = np.asarray(K.corrected_sparse_kernel(
+            W, tau=2.5, n_samples=512, n_pilot=64, seed=3, beta=beta))
+    with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c2:
+        b = np.asarray(K.corrected_sparse_kernel(
+            W, tau=2.5, n_samples=512, n_pilot=64, seed=3, beta=beta,
+            x0_fn=None))
+    assert np.array_equal(a, b)
+    assert c1.flops_used == c2.flops_used
+
+
+def test_billed_lattice_stays_float32_downstream():
+    """A8: ``norm.ppf`` promotes to float64 and float64 bills at 2x.
+
+    One promoted array reprices the entire 32-layer chain, which is a 2x loss
+    on the score for a dtype slip.  The draw must come back float32 and the
+    marginal FLOPs per sample must be the iid kernel's plus the draw, not
+    twice the iid kernel's.
+    """
+    warnings.filterwarnings("ignore")
+    import flopscope as flops
+    import flopscope.numpy as fnp
+
+    from whestfloor import kernels as K
+    from whestfloor import rqmc as RQ
+    from whestfloor.mc import make_mlp
+
+    W = [fnp.asarray(x) for x in make_mlp(64, 6, seed=11)]
+    z = RQ.get_z(521, 64, "cbc")
+    with flops.BudgetContext(flop_budget=int(1e12), quiet=True):
+        base = RQ.billed_lattice_base(521, z)
+        x = RQ.billed_lattice_normals(base, fnp.random.default_rng(0))
+    assert str(x.dtype) == "float32", x.dtype
+    assert np.isfinite(np.asarray(x)).all()
+
+    def bill(n, x0):
+        with flops.BudgetContext(flop_budget=int(1e13), quiet=True) as c:
+            K.corrected_sparse_kernel(W, tau=2.5, n_samples=n, n_pilot=64,
+                                      seed=3, beta=None, x0_fn=x0)
+        return int(c.flops_used)
+
+    zs = {n: RQ.get_z(n, 64, "cbc") for n in (521, 1031)}
+    bases = {}
+    with flops.BudgetContext(flop_budget=int(1e13), quiet=True):
+        for n, zz in zs.items():
+            bases[n] = RQ.billed_lattice_base(n, zz)
+    f_i = {n: bill(n, None) for n in (521, 1031)}
+    f_l = {n: bill(n, RQ.lattice_x0_fn(bases[n])) for n in (521, 1031)}
+    per_i = (f_i[1031] - f_i[521]) / 510
+    per_l = (f_l[1031] - f_l[521]) / 510
+    # The whole overhead must be the draw and nothing else: 157 FLOPs per
+    # element, exactly, against ``standard_normal``'s 16.  A float64 chain
+    # would show up as an overhead proportional to the *pass*, not to the
+    # draw, so pinning the per-element figure is the sharp test.  (The ratio
+    # itself is shape-dependent -- 1.20x on this 64x6 toy where the pass is
+    # tiny, 1.015x at the scored 256x32.)
+    assert abs((per_l - per_i) / 64 - 157.0) < 1.0, (per_l - per_i) / 64
+    assert per_l / per_i < 1 + 2.0 * 157.0 * 64 / per_i, (
+        f"lattice bills {per_l / per_i:.3f}x the iid marginal -- more than "
+        "the draw can account for, so the float64 promotion escaped the cast")
+
+
+def test_cranley_patterson_marginal_is_exactly_uniform():
+    """``frac(k g + U) ~ U[0,1)^d`` — the unbiasedness mechanism, numerically.
+
+    For a FIXED lattice index the shifted point is a measure-preserving
+    rotation of ``U``, so its marginal is uniform for every ``N``.  Checked on
+    the empirical CDF of one fixed row over many shifts.
+    """
+    from whestfloor import rqmc as RQ
+
+    N, d = 1021, 8
+    z = RQ.get_z(N, 256, "cbc")[:d]
+    rows = []
+    rng = np.random.default_rng(4)
+    fixed = RQ.lattice_rows(613, 614, N, z)     # one arbitrary fixed point
+    for _ in range(6000):
+        u = fixed + rng.random(d)
+        rows.append((u - np.floor(u))[0])
+    a = np.sort(np.array(rows).ravel())
+    ks = np.abs(a - (np.arange(1, a.size + 1) / a.size)).max()
+    assert ks < 1.36 / math.sqrt(a.size) * 1.6, ks

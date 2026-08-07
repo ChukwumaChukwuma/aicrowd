@@ -284,3 +284,91 @@ def active_subspace_rotation(R: np.ndarray) -> np.ndarray:
     w, V = np.linalg.eigh(C)
     order = np.argsort(-w)
     return V[:, order].T  # rows = directions, most important first
+
+
+# ---------------------------------------------------------------------------
+# The deployable draw: billed, float32-clean, chunked
+# ---------------------------------------------------------------------------
+
+
+def billed_lattice_base(n_points: int, z, chunk: int = 32768):
+    """``(n_points, d)`` float32 base points ``frac(i z_j / N)``, via flopscope.
+
+    Data-independent, so the submission builds it once in ``setup`` where it is
+    free.  Chunked because the intermediate ``i * z_j`` is float64 and at
+    ``N = 1e5 x 256`` that is 205 MB in one allocation.
+
+    The modulo is exact as long as ``(N-1) * max(z) < 2^53``; at ``N = 131071``
+    that product is 1.7e10, eleven orders inside float64's integer range.
+    """
+    import flopscope.numpy as fnp  # noqa: PLC0415
+
+    zz = fnp.asarray([float(v) for v in z])
+    parts = []
+    for a in range(0, n_points, chunk):
+        b = min(a + chunk, n_points)
+        i = fnp.arange(a, b, dtype=fnp.float64)
+        p = fnp.outer(i, zz)
+        p = p - fnp.floor(p * (1.0 / n_points)) * float(n_points)
+        parts.append((p * (1.0 / n_points)).astype(fnp.float32))
+    return parts[0] if len(parts) == 1 else fnp.concatenate(parts, axis=0)
+
+
+def billed_lattice_normals(base, rng, chunk: int = 32768):
+    """Cranley-Patterson shift + inverse CDF, float64 ppf, float32 out.
+
+    **A8, and it has already cost another team 2x.**  ``flopscope.stats.*``
+    promotes float32 to float64 to match scipy, and a single promoted array
+    reprices the whole downstream chain at the float64 rate.  So the ppf runs
+    in float64 (which is what stops a uniform of exactly 1.0 from returning
+    ``inf``) and the result is cast back to float32 *immediately*, before
+    anything touches it.  ``scripts/51_rqmc_deploy.py --mode cost`` asserts the
+    32 scored matmuls still bill at the float32 rate in a real BudgetContext.
+
+    Measured: 173 FLOPs/element, of which ``norm.ppf`` is 166.  Against 16 for
+    ``standard_normal`` that is +157/element -- 1.0% of a scored pass.
+    """
+    import flopscope as flops  # noqa: PLC0415
+    import flopscope.numpy as fnp  # noqa: PLC0415
+
+    d = base.shape[1]
+    n = base.shape[0]
+    shift = rng.random(d, dtype=fnp.float32)
+    parts = []
+    for a in range(0, n, chunk):
+        b = min(a + chunk, n)
+        u = base[a:b] + shift
+        u = u - fnp.floor(u)
+        u = fnp.minimum(fnp.maximum(u, U_EPS), 1.0 - U_EPS)
+        parts.append(flops.stats.norm.ppf(u).astype(fnp.float32))
+    return parts[0] if len(parts) == 1 else fnp.concatenate(parts, axis=0)
+
+
+def lattice_x0_fn(base, chunk: int = 32768):
+    """An ``x0_fn`` for ``kernels.corrected_sparse_kernel``.
+
+    Signature ``(rng, n_samples, width) -> (n_samples, width) float32``.  The
+    ``rng`` is the kernel's own, which descends from ``mlp.seed``, so the
+    Cranley-Patterson shift is reproducible and per-MLP.
+    """
+    def fn(rng, n_samples, width):
+        if base.shape[0] != n_samples or base.shape[1] != width:
+            raise ValueError(
+                f"lattice base {tuple(base.shape)} does not match "
+                f"({n_samples}, {width})")
+        return billed_lattice_normals(base, rng, chunk)
+    return fn
+
+
+def rotate_first_layer(weights, Q):
+    """``[Q @ W^1] + W[1:]`` — fold a lattice-dimension rotation in for free.
+
+    ``z^1 = x_orig^T W^1`` and ``x_orig = Q^T x_rot``, so feeding the kernel
+    ``x_rot`` with ``W^1 -> Q W^1`` is the identical network evaluated on the
+    identical distribution.  One ``256^3`` matmul per MLP (3.4e7 FLOPs, 0.01%
+    of B) and nothing per sample.
+    """
+    import flopscope.numpy as fnp  # noqa: PLC0415
+
+    return [fnp.asarray(np.asarray(Q, dtype=np.float32)) @ weights[0]] + \
+        list(weights[1:])

@@ -188,19 +188,15 @@ def mode_rate(suite, n_mlps, seed, arms, ngrid, out):
                 key = f"{arm}|{n}|{mi}"
                 if key in store:
                     continue
-                M = np.empty((reps, WIDTH))
-                for r in range(reps):
-                    rng = np.random.default_rng(
-                        (seed + 1) * 1_000_003 + r * 7919 + mi * 104_729)
-                    if arm == "iid":
-                        M[r] = iid_mean(W, n, rng)
-                    elif arm == "cbc":
-                        M[r] = lattice_mean(W, n, zc[n], rng)
-                    elif arm == "roberts":
-                        M[r] = lattice_mean(W, n, zr[n], rng)
-                    else:
-                        raise SystemExit(f"unknown arm {arm}")
-                store[key] = M
+                # COMMON RANDOM NUMBERS across arms: the same rep index gets
+                # the same seed in every arm, so the iid/lattice comparison is
+                # paired rather than two independent draws.
+                sds = [(seed + 1) * 1_000_003 + r * 7919 + mi * 104_729
+                       for r in range(reps)]
+                zz = {"iid": None, "cbc": zc.get(n),
+                      "roberts": zr.get(n)}[arm]
+                store[key] = rep_means(
+                    W, n, reps, "iid" if arm == "iid" else "lat", zz, sds)
             print(f"  N={n:<7} mlp {mi + 1}/{len(seeds)} "
                   f"[{time.time() - t0:.0f}s]", flush=True)
         np.savez_compressed(out, **store)
