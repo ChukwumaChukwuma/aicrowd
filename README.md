@@ -16,28 +16,31 @@ C_m = F_m + λ·R_m        B = 2.72e11 FLOPs        λ = 1e11 FLOPs/s
 Two consequences set the whole design:
 
 1. **The multiplier clamps at 0.1 below 10% budget use.** Anything under
-   `C = 2.72e10` FLOPs is *free*. The strongest bundled baseline (full
-   covariance propagation) spends 3.2e9 — 12% of that. There is roughly 8×
-   more compute available at zero score cost, and accuracy is the only lever
-   that remains.
+   `C = 2.72e10` FLOPs is *free*. Above it the adjusted score is flat in the
+   sample count, so the operating point is exactly at the clamp and accuracy
+   per FLOP is the only lever.
 2. **The reference is itself a Monte-Carlo mean at N = 1e9.** Its own sampling
-   variance is `v/N ≈ 0.18/1e9 ≈ 1.8e-10`, so a *perfect* estimator still
-   measures that. Raw MSE cannot go below ≈1.8e-10; the adjusted score cannot
-   go below ≈**1.8e-11**. That is the floor this repository aims at, and it is
-   derived independently in `scripts/01_derive_noise_floor.py`.
+   variance is `v/N`, so a *perfect* estimator still measures that. Measured
+   on the official suite `v = 0.0495`, giving a raw floor of **4.95e-11** and
+   an adjusted floor of **4.95e-12** (`docs/floor_theorem.md`; the challenge
+   docs' 0.18 is the depth-8 warm-up value and is wrong by 3.3× for this
+   shape).
 
-Sampling cannot get there. Reaching `1.8e-10` by Monte Carlo needs ~9e8 samples
-against a budget of ~64,000 — four orders of magnitude short, and no variance
-reduction closes that. The target therefore *mandates* reading the weights and
-computing the expectation.
+Nothing reaches that floor: it needs a 154,000× variance reduction over plain
+sampling, and the public leaderboard leader is at 73× the floor. What this
+repository does reach is documented in `docs/state_of_play.md`, and the current
+estimator is **sparse Monte Carlo with layer-1 Hermite control variates and an
+offline-trained residual head** (`docs/learned_corrector.md`).
 
 ## Layout
 
 ```
 submission/estimator.py   the graded algorithm; imports only flopscope + whestbench
+submission/corrector.npz  the offline-trained head; loaded at 0 FLOPs in setup
 whestfloor/               research library
   contract.py             FROZEN constants, types, scoring replica  (single owner)
   kernels.py              estimator variants, flopscope-only — same code that ships
+  corrector.py            control-variate features, ridge/MLP heads, numpy generator
   relu_moments.py         exact rectified-Gaussian moments and Hermite coefficients
   mc.py                   raw-NumPy Monte Carlo (ground truth); never shipped
   suite.py                evaluation suites: seeds + two independent GT halves

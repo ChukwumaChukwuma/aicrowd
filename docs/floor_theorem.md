@@ -157,3 +157,46 @@ order ~15. Exactly two objects do:
 
 Route 2 is the only family the barrier does not close, and the competition
 forum independently reports an offline corrector among the mechanisms that work.
+
+### Amendment: the bound was only ever *computed* at k = 1
+
+The theorem above is stated for general `k` and then instantiated at `k = 1`,
+because `f_1` was the only order share that had been measured. `f_2` had not
+been, and it is not small.
+
+Measured on 4 local MLPs x 400,000 samples
+(`scripts/28_learned_corrector.py --mode anova`), by exact projection onto the
+**layer-1 Hermite family** — the statistics `He_k(z^1_i / ||W^1[:,i]||)`, whose
+population Gram is analytic by Mehler and whose expectations are exactly zero:
+
+| cumulative share of `Var(relu(z^32_j))` | mlp 0 | mlp 1 | mlp 2 | mlp 3 | bound |
+|---|---|---|---|---|---|
+| `k = 1` | 23.4% | 29.4% | 23.5% | 29.5% | 1.31-1.42x |
+| `k <= 2` | 37.8% | 47.9% | 38.5% | 44.7% | **1.61-1.92x** |
+| `k <= 3` | 39.6% | 50.3% | 40.7% | 46.8% | 1.66-2.01x |
+| `k <= 6` | 43.4% | 55.9% | 45.0% | 50.9% | 1.77-2.27x |
+
+The `k = 1` row reproduces the 1.38x bound and its `f_1 = 0.276`, from a fifth
+independent estimator — the bound is correct. But **`f_2` is about 0.16 along
+the network's own first-layer directions**, so the `k = 2` instance of the same
+theorem is `1/(1 - 0.43) = 1.75x`, not 1.38x, and it is *reachable*: those
+statistics are already computed by the forward pass, their expectations are
+known in closed form, and contracting the correction costs two length-N
+matvecs (0.4% of the scored pass). `docs/learned_corrector.md` builds it.
+
+Two things this does *not* change:
+
+* Every mechanism in the retrodiction table stays refuted. They were all `k = 1`
+  objects — a Jacobian response *is* the linear response — and 1.38x is still
+  their ceiling. (Measured: mean-field propagation of the layer-1 mean gap
+  lands at 1.33x with pilot gates, 1.37x with scored gates, and no higher.)
+* The bound still bites hard above `k = 2`. `k = 3` adds ~2% of explained
+  variance against `p/N = 256/8500 = 3.0%` of estimation noise per block, so it
+  loses; and the full order-2 basis (all 32,896 quadratics in the input, rather
+  than the 256 along `W^1`) has `p > N` and is unusable at this sample count
+  whatever it costs.
+
+The honest summary is that the barrier is a statement about **which orders you
+can reach**, and the layer-1 Hermite family reaches order 2 for free because
+the first layer of a ReLU MLP is exactly Gaussian in the input. Nothing
+comparable is available at layer 2 or beyond, which is where this line stops.

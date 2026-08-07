@@ -8,142 +8,175 @@ research kernel in ``whestfloor/kernels.py`` and the code below produce
 bitwise-identical predictions and identical FLOP counts, so what is measured
 is what is shipped.
 
-Why this is plain sampling, sparsened
--------------------------------------
+The estimator in one paragraph
+------------------------------
+Sparse Monte Carlo (the always-off neurons pruned out of every matmul), plus
+two things that cost 0.4% of the pass between them: **layer-1 Hermite control
+variates**, whose expectations are known in closed form because ``z^1`` is
+exactly Gaussian, and an **offline-trained linear head** over those and ~20
+other predict-time features, loaded from ``corrector.npz`` at zero FLOPs.
+
+Why sampling at all
+-------------------
 The grader reports a constant ``sampling_mse = 6.4695e-7`` on every
 submission.  Because ``mse x C/B`` is flat in N for a sampler, that IS plain
-Monte Carlo's adjusted plateau — and it is better than the bundled
-covariance-propagation baseline by ~10x, and better than every purely
-analytic estimator in this repository.  Two full rounds of analytic work
-(Mehler covariance, tree-diagram kappa_3 and kappa_4, coherent-bias shrink)
-landed at 2.28e-6 adjusted, i.e. **3.5x worse than plain sampling**, and the
-previous ship — a convex blend of that analytic arm with MC — reached
-7.78e-7, still marginally worse than sampling alone.
+Monte Carlo's adjusted plateau — better than the bundled covariance-
+propagation baseline by ~10x, and better than every purely analytic estimator
+in this repository.  Two full rounds of analytic work (Mehler covariance,
+tree-diagram kappa_3 and kappa_4, coherent-bias shrink) landed at 2.28e-6
+adjusted, i.e. 3.5x worse than plain sampling.  So the analytic arm is gone
+and what is left is the cheapest correct sampler we can bill, made accurate.
 
-So the analytic arm is **gone**.  Measured on the official 100-MLP suite it
-costs 2.7e9 FLOPs, which pushes C/B from 0.100 to 0.124, and the 1.24x
-multiplier penalty exceeds everything the blend buys: pure sparse MC scores
-5.76e-7 against the blend's 7.75e-7 through the same sparse arm.  Paying for
-a second estimator only makes sense below the multiplier floor, and there is
-no room below the floor.
-
-What is left is the cheapest correct sampler we can bill.
-
-The mechanism: prune the neurons that never fire
-------------------------------------------------
+1. Prune the neurons that never fire
+------------------------------------
 At depth the network is nearly decided.  With ``alpha = m/s`` the per-neuron
-pre-activation ratio, ``rms|alpha|`` rises from 0 at layer 1 (where ``E[z] = 0``
-exactly, because ``E[x] = 0``) to **3.44 by layer 32**.  A neuron with
-``alpha < -tau`` emits ``relu(z) = 0`` on all but a vanishing fraction of
-samples, so:
+pre-activation ratio, ``rms|alpha|`` rises from 0 at layer 1 (where
+``E[z] = 0`` exactly) to **3.44 by layer 32**.  A neuron with ``alpha < -tau``
+emits ``relu(z) = 0`` on all but a vanishing fraction of samples, so its row
+of the next weight matrix and its column of this one both drop out of every
+per-sample matmul, and its small, nearly constant expected output folds into a
+bias vector computed once.  Billed: **2,793,985 FLOPs/sample against
+4,198,656 dense, i.e. 1.51x**, which buys 8,500 samples where the dense pass
+affords 6,200.  The sign error traded away is 2-3e-7, measured paired against
+the dense pass on the identical stream.
 
-  * its **row** of the next layer's weight matrix contributes nothing, and
-  * its **column** of this layer's weight matrix need never be evaluated,
+2. Layer-1 Hermite control variates
+-----------------------------------
+``z^1_i = x . W^1[:,i]`` is *exactly* Gaussian with known scale
+``sigma_i = ||W^1[:,i]||``.  So for ``t_i = z^1_i / sigma_i``
 
-and its small, nearly constant expected output folds into a bias vector
-computed once.  Both matmul dimensions shrink, so the per-sample cost falls
-as ``(|ON| / n)^2``.  Billed in a real ``BudgetContext``: **2,793,985
-FLOPs/sample against 4,198,656 dense, i.e. 1.51x**, which buys 8,500 samples
-where the dense pass affords 6,200 at the same compute.
+    E[He_k(t_i)] = 0                                exactly, every k >= 1
+    Cov(He_k(t_i), He_l(t_j)) = delta_kl k! rho_ij^k          (Mehler)
 
-The sign error this trades away is small and was measured *paired* — the
-pruned and dense passes run on the identical sample stream, so the Monte
-Carlo noise cancels and what is left is the pruning alone.  At ``tau = 2.5``
-it is not resolvable above the +-5e-7 pairing noise; bracketed by its
-neighbours (<=3e-8 at ``tau = 3.0``, 1.3-2.0e-6 at ``tau = 2.0``) it is of
-order 2-3e-7, **3-5% of the final MSE**.
+The first line makes the sample means of ``He_k(t)`` exactly-mean-zero control
+variates that the forward pass already has in hand; the second makes their
+Gram **analytic and block diagonal in k**, so the optimal coefficients need no
+estimated covariance matrix.  Writing ``u_k = G_k^{-1} d_k`` for the sample
+mean ``d_k`` collapses the whole correction to two length-N matvecs rather
+than a ``width x width`` cross-moment matrix:
 
-What this deliberately does NOT do
-----------------------------------
-Two richer versions of the same idea were built, priced and rejected; both
-refutations are measurements, not arguments (``docs/sparse_sign_stable.md``).
+    correction_j = (1/N) sum_s w_s y_{sj},   w_s = sum_k u_k . (g_{k,s} - d_k)
 
-1. **It does not fuse the modal sign pattern into one matrix.**  On the modal
-   pattern the network collapses to ``A = W1 D1 ... D31 W32`` and
-   ``z^32 = x A + sum_l eps^l R^l`` exactly.  But the input mean is **zero**,
-   so ``A`` predicts identically nothing, and the two arms cancel 15x:
-   ``Var(xA) = 1.97`` and ``Var(z^32) = 0.128``.  Sampling only the
-   correction has **31x more variance than plain MC**.  Billed, that scheme
-   costs **4.95x MORE per sample** than the dense pass it replaces, plus 54%
-   of the free budget in setup, because the kink-to-kink coupling is
-   O(depth^2) over sets that are half the width.
+The ``k=1`` block is evaluated in the input basis, where ``G = I`` exactly
+(``u_1 = rho^{-1} d_1`` unwinds to ``W^{1,-1} xbar``): no solve, no
+conditioning problem, and the block is thereby *proved* to be the optimal
+input-linear control variate — the one the low-order barrier caps at 1.38x.
+``k=2`` is what escapes that cap, because ``He_2(w_i . x)`` is an order-2
+object along the network's own first-layer directions.  Measured population
+shares of ``Var(relu(z^32_j))``: k=1 23-29%, k<=2 38-48%, k=3 adds ~2% and is
+not worth its own estimation noise.
 
-2. **It does not claim a Rao-Blackwell gain from the decided neurons.**  They
-   carry 0.10% of the estimator's variance at tau = 2 and 0.001% at tau = 3;
-   their ReLU deviation has variance ~1e-7 against z's 0.1.  The variance
-   lives entirely in the kink neurons, which must still be sampled.
+Coefficients are estimated by a **split of the sample** — ``dbar`` from one
+half against the covariance from the other, both ways.  The one-pass form
+leaves a self-term ``Cov(g' G^-1 g, y_j) / N`` that is a real bias rather than
+noise; at k=3 it reverses the sign of the correction outright.
+
+3. The offline-trained head
+---------------------------
+Each Hermite block costs ``p/N = 256/8500 = 3.0%`` of the residual in
+estimation noise, and the sparse mask leaves a small closure bias.  Rather
+than assume a coefficient of 1 on each correction, a linear head over the two
+corrections and ~20 other predict-time features (Rao-Blackwell gap,
+sample-Edgeworth terms, per-neuron MC noise scale, weight-column moments,
+per-MLP scalars) is fitted **offline on 640 generated MLPs with fresh seeds**,
+disjoint from every evaluation suite, and shipped as a 25-float vector in
+``corrector.npz``.  ``fnp.load`` bills **0 FLOPs**, so the head is free at
+grade time; the matvec that applies it is 12,800 FLOPs.
+
+Safety
+------
+``DAMP = 0`` reproduces the uncorrected sparse estimator bit for bit through
+the identical code path.  If ``corrector.npz`` is missing or unreadable the
+head is simply absent and the estimator degrades to that same uncorrected
+sparse pass rather than failing.  Every numerical path is wrapped so that a
+raise falls back to a dense Monte-Carlo pass: a single zeroed MLP would cost
+~850x the whole score.
 
 Sizing
 ------
-The score multiplier is ``max(0.1, C/B)`` with ``C = F + 1e11 * R``.  ``F`` is
-machine-independent; ``R`` is participant wall time and the grader runs one
-physical core, so the margin that matters is in ``F``.  This estimator sits at
-``F/B = 0.0915``, leaving 0.0085 * B = 2.3e9 = 23 ms of residual before the
-floor is crossed — and crossing it is a linear penalty, not a cliff.
-
-Shrinking N to buy more residual headroom was tested and is the wrong move:
-at 3x the reference machine's residual, N = 8500 scores 6.74e-7 while
-N = 7073 (sized to sit exactly at the floor under that residual) scores
-7.12e-7.  Above the floor the adjusted score is flat in N, so undershooting
-costs more than overshooting.
+``C = F + 1e11 R`` and the multiplier is ``max(0.1, C/B)``.  ``F`` is
+machine-independent; ``R`` is participant wall time on one physical core.
+This estimator sits at ``F/B = 0.0926`` — the feature block is 0.40% of the
+free budget — leaving room for the grader's residual before the floor is
+crossed, and crossing it is a linear penalty, not a cliff.
 """
 
 from __future__ import annotations
 
+import os
+
+import flopscope as flops
 import flopscope.numpy as fnp
 from whestbench import BaseEstimator
 
 #: Threshold on ``alpha = m/s`` below which a neuron is treated as always-off.
-#: CALIBRATED, not derived: swept on the same 100 official MLPs it is scored
-#: on.  The optimum is broad — 2.3 / 2.5 / 2.7 give adjusted 5.97 / 5.65 /
-#: 5.79 e-7 — so the transfer risk is small, but it is not zero.
-#:
+#: CALIBRATED, not derived: swept on the official 100 MLPs.  The optimum is
+#: broad (2.3 / 2.5 / 2.7 give adjusted 5.97 / 5.65 / 5.79 e-7 uncorrected).
 #: The LOWER end is fixed by accuracy, not cost: tau = 2.0 is 1.12x cheaper
-#: per sample again, but its sign error is 1.3-2.0e-6, i.e. 20-30% of the
-#: final MSE, and tau = 1.0 costs +2e-4, some 35x the entire score.  Above
-#: 3.5 there is almost nothing left to prune.
+#: per sample again but its sign error is 20-30% of the final MSE.
 TAU = 2.5
 
-#: Scored Monte-Carlo samples.  Set by the ``F/B`` invariant above, not by the
-#: argmin of a sweep: at fixed tau the raw MSE across N = 7000..9400 is
-#: v/N to within +-7%, which is pure realisation noise on a 100-MLP suite.
+#: Scored Monte-Carlo samples.  Set by the ``F/B`` invariant, not by the
+#: argmin of a sweep.
 N_SAMPLES = 8500
 
-#: Pilot samples.  The pilot is a short DENSE pass and does three jobs at
-#: once: it supplies ``alpha`` (which the threshold needs — thresholding is
-#: not free), the frozen constants for the pruned neurons, and the depth-1
-#: unscored filler rows.  Its cost is 150 * 4.198656e6 = 6.3e8, 2.3% of the
-#: free budget.
-#:
-#: 150 is the ROBUST choice, not the sharp one: P = 80 / 100 / 150 / 250 all
-#: land within 3% of each other (realisation noise), while P = 600 is clearly
-#: worse (6.26e-6 vs 5.65e-6 raw) because the pilot's own cost then eats the
-#: samples it was meant to improve.  Note the pilot's sampling noise enters
-#: the frozen constants as a fixed offset that does NOT average away over the
-#: scored samples, which is why more pilot is not monotonically better.
+#: Pilot samples.  A short DENSE pass doing three jobs at once: it supplies
+#: ``alpha`` (which the threshold needs), the frozen constants for the pruned
+#: neurons, and the depth-1 unscored filler rows.  150 is the ROBUST choice:
+#: P = 80/100/150/250 land within 3%, P = 600 is clearly worse because the
+#: pilot then eats the samples it was meant to improve.
 N_PILOT = 150
+
+#: Highest Hermite order used by the layer-1 control variate.  k=3 adds ~2%
+#: of explained variance against 3.0% of estimation noise, so it loses.
+CV_KMAX = 2
+
+#: Scales the offline head's output.  ``0.0`` is the exact ablation: the
+#: identical code path with the correction switched off, reproducing the
+#: uncorrected sparse estimator bit for bit.
+DAMP = 1.0
+
+#: Relative jitter on the analytic Hermite Gram's diagonal.  Insurance only:
+#: measured cond(2 rho .^ 2) = 2.41, because squaring O(1/16) correlations
+#: makes them O(1/256).  ``rho`` itself -- the k=1 Gram -- has cond = 3.8e8 at
+#: this shape, which is exactly why the k=1 block is evaluated in the input
+#: basis where the Gram is the identity and no solve is needed at all.
+CV_GRAM_JITTER = 1e-6
 
 #: Samples for the defensive dense fallback.  A single raising MLP is
 #: catastrophic — the grader zeroes that prediction, whose MSE is O(1) against
-#: a score of O(1e-6), so one failure in 100 would dominate the mean by
-#: ~850x.  Sized so that even a raise on the very last operation, with the
-#: whole sparse pass already billed, lands at C/B ~ 0.18: far under the hard
-#: cap, and a valid prediction at a 1.8x multiplier penalty beats a zeroed one
-#: by ~800,000x on that MLP.  Verified: 0 raises over all 100 official MLPs.
+#: a score of O(1e-6), so one failure in 100 would dominate by ~850x.  Sized
+#: so that even a raise on the very last operation, with the whole sparse pass
+#: already billed, lands at C/B ~ 0.18.
 FALLBACK_SAMPLES = 6000
 
 #: Floor applied to pre-activation variances before taking a square root.
 VAR_FLOOR = 1e-12
 
+#: 1 / sqrt(2 pi).
+INV_SQRT_2PI = 0.3989422804014327
+
+#: File holding the offline-trained head.  Regenerable bit-identically by
+#: ``scripts/28_learned_corrector.py --mode data`` then ``--mode fit``.
+COEF_FILE = "corrector.npz"
+
 
 class Estimator(BaseEstimator):
-    """Monte Carlo with the always-off neurons pruned out of every matmul."""
+    """Sparse Monte Carlo + layer-1 Hermite CVs + an offline-trained head."""
 
     def __init__(self) -> None:
-        self._setup_rng = None
+        self._beta = None
 
     def setup(self, ctx) -> None:  # noqa: ANN001 - whestbench SetupContext
-        self._setup_rng = fnp.random.default_rng(ctx.seed)
+        # ``fnp.load`` is billed at 0 FLOPs (measured), and setup runs off
+        # budget inside a ~5 s window that also covers imports, so this must
+        # be a plain pickle-free npz read and nothing else.
+        d = getattr(ctx, "submission_dir", None) or os.path.dirname(
+            os.path.abspath(__file__))
+        try:
+            self._beta = fnp.load(os.path.join(d, COEF_FILE))["beta"]
+        except Exception:  # noqa: BLE001 - no head is a valid degradation
+            self._beta = None
 
     def predict(self, mlp, budget: int):  # noqa: ANN001 - whestbench MLP
         _ = budget
@@ -168,6 +201,83 @@ class Estimator(BaseEstimator):
             rows.append(fnp.mean(x, axis=0))
         return fnp.stack(rows, axis=0)
 
+    # ------------------------------------------------------------------
+    def _hermite_cv(self, x, z1, y, w1, kmax):
+        """Layer-1 Hermite control-variate corrections, one per output neuron.
+
+        Two length-N matvecs per order plus one (width x width) solve; billed,
+        the whole feature block is 0.40% of the scored pass.  The k=2 basis is
+        kept as ``z1^2`` rather than ``He_2(z1/sigma)``: the per-column scale
+        folds into ``d`` and ``u`` and the constant folds into the centring, so
+        one pass over the (N, width) array is saved.  Normalising the columns
+        of ``W^1`` before the Gram keeps ``rho`` exactly symmetric (no divide
+        to lose the tag) with an exact unit diagonal.
+        """
+        n = x.shape[0]
+        h = n // 2
+        sig1 = fnp.sqrt(fnp.maximum(fnp.sum(w1 * w1, axis=0), VAR_FLOOR))
+        inv1 = (1.0 / sig1).astype(z1.dtype)
+
+        bases = [(x, None, None, 0.0)]
+        if kmax >= 2:
+            wn = w1 * inv1
+            rho = wn.T @ wn
+            G = (2.0 * rho) * rho
+            # fill_diagonal keeps the matmul's symmetry tag; an explicit
+            # flops.symmetrize would re-tag it at 2.3e7 FLOPs and save
+            # nothing on the solve, so it is deliberately absent.
+            fnp.fill_diagonal(G, 2.0 * (1.0 + CV_GRAM_JITTER))
+            bases.append((z1 * z1, G, inv1 * inv1, -1.0))
+
+        out = []
+        for g, G, sc, off in bases:
+            g1, g2 = g[:h], g[h:]
+            us = []
+            for gg in (g1, g2):
+                d = fnp.mean(gg, axis=0)
+                if sc is not None:
+                    d = d * sc + off
+                us.append(d if G is None else fnp.linalg.solve(G, d))
+            u1, u2 = us
+            wa = g1 @ (u2 if sc is None else u2 * sc)
+            wa = wa - fnp.mean(wa)
+            wb = g2 @ (u1 if sc is None else u1 * sc)
+            wb = wb - fnp.mean(wb)
+            out.append(0.5 * ((y[:h].T @ wa) / h + (y[h:].T @ wb) / (n - h)))
+        while len(out) < 3:
+            out.append(fnp.zeros(w1.shape[0], dtype=x.dtype))
+        return out
+
+    # ------------------------------------------------------------------
+    def _meanfield_cv(self, h1m, weights, alpha, Ph):
+        """Layer-1 mean gap pushed forward through the mean-field Jacobian.
+
+        ``E[relu(z^1_i)] = ||W^1[:,i]|| / sqrt(2 pi)`` exactly, so
+        ``d1 = mean_s relu(z^1) - E[relu(z^1)]`` is exactly mean zero and
+        free.  Propagating it with the rectifier Jacobian replaced by its
+        expectation ``P(z^l > 0) = Phi(alpha^l)`` costs 31 matvecs -- 4.1e6
+        FLOPs -- and turns it into a per-output-neuron prediction of the
+        sampling error.
+
+        Same first-order channel as the k=1 Hermite block, reached the other
+        way: analytic-but-approximate coefficients instead of exact-but-
+        estimated ones.  It carries no ``p/N`` estimation noise, which is why
+        it measures better with a unit coefficient (1.43x against 1.25x), and
+        it is biased by the mean-field approximation, which is why both are
+        offered to the head rather than one being chosen.
+        """
+        depth = len(weights)
+        w1 = weights[0]
+        sig1 = fnp.sqrt(fnp.maximum(fnp.sum(w1 * w1, axis=0), VAR_FLOOR))
+        prop = h1m - sig1 * INV_SQRT_2PI
+        for l in range(1, depth):
+            prop = prop @ weights[l]
+            if l < depth - 1:
+                g = flops.stats.norm.cdf(alpha[l])
+                prop = prop * g.astype(prop.dtype)
+        return prop * Ph
+
+    # ------------------------------------------------------------------
     def _sparse(self, mlp, tau, n_samples, n_pilot, seed):
         n = mlp.width
         depth = len(mlp.weights)
@@ -188,8 +298,7 @@ class Estimator(BaseEstimator):
         # The last layer keeps all n output columns.  Pruning them would save
         # ~1% of the pass and would force a scatter back into n slots, whose
         # only failure mode (an all-dead layer) is the one thing that must
-        # never raise.  Keeping them also removes the frozen constants from
-        # the scored row entirely.
+        # never raise.
         subs, biases = [], []
         keep_prev = None
         for l, w in enumerate(mlp.weights):
@@ -206,13 +315,69 @@ class Estimator(BaseEstimator):
             keep_prev = keep
 
         # ---- scored pass ---------------------------------------------
-        x = rng.standard_normal((n_samples, n), dtype=fnp.float32)
+        x0 = rng.standard_normal((n_samples, n), dtype=fnp.float32)
+        x = x0
+        z1 = h1 = None
         for l in range(depth):
             z = x @ subs[l]
             if biases[l] is not None:
                 z = z + biases[l]
+            if l == 0:
+                z1 = z
             x = fnp.maximum(z, 0.0)
+            if l == 0:
+                h1 = x          # kept, not reduced: a reduction here
+                                # would be billed before the damp=0
+                                # early return and break the ablation
+        mu = fnp.mean(x, axis=0)
         # Only the final row is scored.  The others come free from the pilot;
         # they are not blended with the scored pass, which would correlate the
         # estimate with the mask that was derived from the same samples.
-        return fnp.stack(mean_h[:-1] + [fnp.mean(x, axis=0)], axis=0)
+        if self._beta is None or DAMP == 0.0:
+            return fnp.stack(mean_h[:-1] + [mu], axis=0)
+
+        # ---- features and the offline head ---------------------------
+        cvs = self._hermite_cv(x0, z1, x, mlp.weights[0], CV_KMAX)
+        ex2 = fnp.mean(x * x, axis=0)
+        vh = fnp.maximum(ex2 - mu * mu, 0.0)
+        m = fnp.mean(z, axis=0)
+        d = z - m
+        v = fnp.maximum(fnp.mean(d * d, axis=0), VAR_FLOOR)
+        s = fnp.sqrt(v)
+        d2 = d * d
+        gam1 = fnp.mean(d2 * d, axis=0) / (v * s)
+        gam2 = fnp.mean(d2 * d2, axis=0) / (v * v) - 3.0
+        a = m / s
+        # norm.cdf/pdf promote float32 -> float64 to match scipy and float64
+        # bills at 2x; cast straight back so nothing downstream inherits it.
+        Ph = flops.stats.norm.cdf(a).astype(a.dtype)
+        ph = flops.stats.norm.pdf(a).astype(a.dtype)
+        wl = mlp.weights[-1]
+        wn = fnp.sum(wl * wl, axis=0)
+        wl2 = wl * wl
+        one = fnp.ones_like(a)
+        gap = (m * Ph + s * ph) - mu
+        cv1, cv2 = cvs[0], cvs[1]
+        mf = self._meanfield_cv(fnp.mean(h1, axis=0), mlp.weights,
+                                alpha, Ph)
+        cols = [
+            one,
+            cv1, cv1 * Ph, cv1 * a,
+            cv2, cv2 * Ph, cv2 * a,
+            cvs[2],
+            mf, mf * Ph, mf * a,
+            gap, gap * Ph, gap * a,
+            -(gam1 / 6.0) * s * a * ph,
+            (gam2 / 24.0) * s * (a * a - 1.0) * ph,
+            mu, mu * Ph,
+            s, Ph, ph, a,
+            fnp.sqrt(vh / n_samples), mu - mean_h[-1],
+            wn - 1.0,
+            n * fnp.sum(wl2 * wl2, axis=0) / fnp.maximum(wn * wn, 1e-30) - 3.0,
+            one * (fnp.mean(vh) - 0.05),
+            one * (fnp.sqrt(fnp.mean(a * a)) - 3.4),
+        ]
+        corr = fnp.stack(cols, axis=1) @ self._beta
+        if DAMP != 1.0:
+            corr = corr * DAMP
+        return fnp.stack(mean_h[:-1] + [mu + corr], axis=0)

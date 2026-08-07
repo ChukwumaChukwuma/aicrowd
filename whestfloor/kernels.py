@@ -1132,3 +1132,272 @@ def mlmc_kernel(weights, ctx=None, levels=((32, 3000), (256, 500)),
 
 
 KERNELS["mlmc"] = mlmc_kernel
+
+
+# --------------------------------------------------------------------------
+# Offline-trained residual corrector on top of the sparse pass.
+# See docs/learned_corrector.md and whestfloor/corrector.py.
+#
+# Two pieces, both charged and both cheap:
+#
+#   1. LAYER-1 HERMITE CONTROL VARIATES.  z^1_i = x . W^1[:,i] is exactly
+#      Gaussian with known scale, so E[He_k(t_i)] = 0 exactly and
+#      Cov(He_k(t_i), He_l(t_j)) = delta_kl k! rho_ij^k (Mehler).  The sample
+#      means of He_k(t) are therefore free, exactly-mean-zero control variates
+#      whose Gram is ANALYTIC and block diagonal in k.  Writing
+#      u_k = G_k^-1 d_k collapses the correction to two length-N matvecs
+#      instead of a (width x width) cross-moment matrix, so the whole block is
+#      ~0.4% of the scored pass.
+#
+#      The k=1 block is evaluated in the input basis, where G = I exactly:
+#      u_1 = rho^-1 d_1 unwinds to W^{1,-1} xbar, so no solve is needed and
+#      the block is PROVED to be the optimal input-linear control variate.
+#      That is the one the low-order barrier bounds at 1.38x.  k=2 is what
+#      escapes it -- He_2(w_i . x) is order 2 along the network's own first
+#      layer -- and the barrier only ever computed the k=1 instance.
+#
+#      Coefficients are estimated by a SPLIT of the sample: dbar from one half
+#      against chat from the other, both ways.  The one-pass form leaves a
+#      self-term Cov(g' G^-1 g, y_j)/N which is a real bias, not noise, and
+#      at k=3 it reverses the sign of the correction.
+#
+#   2. AN OFFLINE-TRAINED LINEAR HEAD over those corrections and ~20 other
+#      predict-time features, fitted on 640 generated MLPs and loaded from an
+#      npz at 0 FLOPs.  It supplies the shrinkage each block needs (each block
+#      costs p/N = 3% of the residual in estimation noise) rather than
+#      assuming a coefficient of 1.
+#
+# ``damp=0`` is the exact ablation: the identical code path with the head's
+# output scaled to zero, which reproduces ``sparse_mc_kernel`` bit for bit.
+# --------------------------------------------------------------------------
+
+
+def _norm01(a, f32: bool = True):
+    """``(Phi(a), phi(a))``, cast back to ``a``'s dtype.
+
+    ``flops.stats.norm`` promotes float32 to float64 to match scipy and
+    float64 bills at 2x; on 256 elements the cost is noise either way, but the
+    cast keeps every downstream array in float32.
+    """
+    Ph = flops.stats.norm.cdf(a)
+    ph = flops.stats.norm.pdf(a)
+    if f32:
+        Ph = Ph.astype(a.dtype)
+        ph = ph.astype(a.dtype)
+    return Ph, ph
+
+
+#: Relative jitter on the analytic Hermite Gram's diagonal.  Insurance only:
+#: measured cond(2 rho .^ 2) = 2.41, because squaring O(1/16) correlations
+#: makes them O(1/256).  ``rho`` itself -- the k=1 Gram -- has cond = 3.8e8 at
+#: this shape, which is exactly why the k=1 block is evaluated in the input
+#: basis where the Gram is the identity.
+CV_GRAM_JITTER = 1e-6
+
+#: 1 / sqrt(2 pi).
+INV_SQRT_2PI = 0.3989422804014327
+
+
+def _hermite_cv(x, z1, y, w1, kmax: int = 2):
+    """Layer-1 Hermite control-variate corrections; see the module note.
+
+    Two length-N matvecs per order plus one (width x width) solve.  The k=2
+    basis is kept as ``z1^2`` rather than ``He_2(z1/sigma)``: the per-column
+    scale folds into ``d`` and ``u``, and the constant folds into the centring,
+    so one pass over the (N, width) array is saved.
+    """
+    n = x.shape[0]
+    h = n // 2
+    sig1 = fnp.sqrt(fnp.maximum(fnp.sum(w1 * w1, axis=0), 1e-12))
+    inv1 = (1.0 / sig1).astype(z1.dtype)
+
+    bases = [(x, None, None, 0.0)]
+    if kmax >= 2:
+        wn = w1 * inv1
+        rho = wn.T @ wn                       # symmetric by construction
+        G = (2.0 * rho) * rho
+        # fill_diagonal keeps the matmul's symmetry tag; an explicit
+        # flops.symmetrize would re-tag it at a cost of 2.3e7 FLOPs and save
+        # nothing on the solve, so it is deliberately absent.
+        fnp.fill_diagonal(G, 2.0 * (1.0 + CV_GRAM_JITTER))
+        bases.append((z1 * z1, G, inv1 * inv1, -1.0))
+
+    out = []
+    for g, G, sc, off in bases:
+        g1, g2 = g[:h], g[h:]
+        us = []
+        for gg in (g1, g2):
+            d = fnp.mean(gg, axis=0)
+            if sc is not None:
+                d = d * sc + off
+            us.append(d if G is None else fnp.linalg.solve(G, d))
+        u1, u2 = us
+        wa = g1 @ (u2 if sc is None else u2 * sc)
+        wa = wa - fnp.mean(wa)
+        wb = g2 @ (u1 if sc is None else u1 * sc)
+        wb = wb - fnp.mean(wb)
+        out.append(0.5 * ((y[:h].T @ wa) / h + (y[h:].T @ wb) / (n - h)))
+    while len(out) < 3:
+        out.append(fnp.zeros(w1.shape[0], dtype=x.dtype))
+    return out
+
+
+def _meanfield_cv(h1m, w1, weights, alpha, Ph):
+    """Layer-1 mean gap pushed forward through the mean-field linearisation.
+
+    ``E[relu(z^1_i)] = ||W^1[:,i]|| / sqrt(2 pi)`` exactly, so
+    ``d1 = mean_s relu(z^1) - E[relu(z^1)]`` is exactly mean zero and free.
+    Propagating it with the rectifier Jacobian replaced by its expectation
+    ``P(z^l > 0) = Phi(alpha^l)`` costs 31 matvecs -- 4.1e6 FLOPs -- and turns
+    it into a per-output-neuron prediction of the sampling error.
+
+    This is the SAME first-order channel the k=1 Hermite block covers, reached
+    the other way: analytic-but-approximate coefficients instead of
+    exact-but-estimated ones.  It carries no ``p/N`` estimation noise, which
+    is why it measures BETTER (1.43x against 1.25x with unit coefficients),
+    and it is biased by the mean-field approximation, which is why the two are
+    both offered to the head rather than one being chosen.
+    """
+    depth = len(weights)
+    sig1 = fnp.sqrt(fnp.maximum(fnp.sum(w1 * w1, axis=0), 1e-12))
+    prop = h1m - sig1 * INV_SQRT_2PI
+    for l in range(1, depth):
+        prop = prop @ weights[l]
+        if l < depth - 1:
+            g = flops.stats.norm.cdf(alpha[l])
+            prop = prop * g.astype(prop.dtype)
+    return prop * Ph
+
+
+def corrector_design(prim):
+    """``(width, n_features)`` design matrix.  Mirrors ``corrector.build_design``."""
+    a, Ph = prim["alpha"], prim["Phi"]
+    one = fnp.ones_like(a)
+    cv1, cv2, gap = prim["cv1"], prim["cv2"], prim["gap"]
+    mf = prim["cv1mf"]
+    cols = [
+        one,
+        cv1, cv1 * Ph, cv1 * a,
+        cv2, cv2 * Ph, cv2 * a,
+        prim["cv3"],
+        mf, mf * Ph, mf * a,
+        gap, gap * Ph, gap * a,
+        prim["sk"], prim["ku"],
+        prim["mu"], prim["mu"] * Ph,
+        prim["s"], Ph, prim["phi"], a,
+        prim["sd_mc"], prim["dpilot"],
+        prim["wn"] - 1.0, prim["w4"] - 3.0,
+        one * (prim["vbar"] - 0.05), one * (prim["arms"] - 3.4),
+    ]
+    return fnp.stack(cols, axis=1)
+
+
+def _corrected_sparse(weights, tau, n_samples, n_pilot, seed, beta, damp,
+                      kmax):
+    n = weights[0].shape[0]
+    depth = len(weights)
+    rng = fnp.random.default_rng(seed)
+
+    # ---- pilot: identical to _sparse_mc ---------------------------------
+    x = rng.standard_normal((n_pilot, n), dtype=fnp.float32)
+    alpha, mean_h = [], []
+    for w in weights:
+        z = x @ w
+        m = fnp.mean(z, axis=0)
+        v = fnp.maximum(fnp.mean(z * z, axis=0) - m * m, 1e-12)
+        alpha.append(m / fnp.sqrt(v))
+        x = fnp.maximum(z, 0.0)
+        mean_h.append(fnp.mean(x, axis=0))
+
+    subs, biases = [], []
+    keep_prev = None
+    for l, w in enumerate(weights):
+        keep = None if (tau is None or l == depth - 1) else (alpha[l] > -tau)
+        wr = w if keep_prev is None else w[keep_prev, :]
+        subs.append(wr if keep is None else wr[:, keep])
+        if keep_prev is None:
+            biases.append(None)
+        else:
+            dead_mu = mean_h[l - 1] * (1.0 - keep_prev.astype(fnp.float32))
+            wd = w if keep is None else w[:, keep]
+            biases.append(dead_mu @ wd)
+        keep_prev = keep
+
+    # ---- scored pass ----------------------------------------------------
+    x0 = rng.standard_normal((n_samples, n), dtype=fnp.float32)
+    x = x0
+    z1 = h1 = None
+    for l in range(depth):
+        z = x @ subs[l]
+        if biases[l] is not None:
+            z = z + biases[l]
+        if l == 0:
+            z1 = z
+        x = fnp.maximum(z, 0.0)
+        if l == 0:
+            h1 = x          # kept, not reduced: a reduction here
+                            # would be billed before the damp=0
+                            # early return and break the ablation
+    mu = fnp.mean(x, axis=0)
+    if beta is None or damp == 0.0:
+        # exact ablation: identical stream, identical mu, no feature block
+        return fnp.stack(mean_h[:-1] + [mu], axis=0)
+
+    cvs = _hermite_cv(x0, z1, x, weights[0], kmax=kmax)
+
+    ex2 = fnp.mean(x * x, axis=0)
+    vh = fnp.maximum(ex2 - mu * mu, 0.0)
+    m = fnp.mean(z, axis=0)
+    d = z - m
+    v = fnp.maximum(fnp.mean(d * d, axis=0), 1e-12)
+    s = fnp.sqrt(v)
+    d2 = d * d
+    gam1 = fnp.mean(d2 * d, axis=0) / (v * s)
+    gam2 = fnp.mean(d2 * d2, axis=0) / (v * v) - 3.0
+    a = m / s
+    Ph, ph = _norm01(a)
+    wl = weights[-1]
+    wn = fnp.sum(wl * wl, axis=0)
+    wl2 = wl * wl
+    prim = {
+        "mu": mu, "cv1": cvs[0], "cv2": cvs[1], "cv3": cvs[2],
+        "cv1mf": _meanfield_cv(fnp.mean(h1, axis=0), weights[0],
+                               weights, alpha, Ph),
+        "gap": (m * Ph + s * ph) - mu,
+        "sk": -(gam1 / 6.0) * s * a * ph,
+        "ku": (gam2 / 24.0) * s * (a * a - 1.0) * ph,
+        "alpha": a, "Phi": Ph, "phi": ph, "s": s,
+        "sd_mc": fnp.sqrt(vh / n_samples), "dpilot": mu - mean_h[-1],
+        "wn": wn, "w4": n * fnp.sum(wl2 * wl2, axis=0)
+        / fnp.maximum(wn * wn, 1e-30),
+        "vbar": fnp.mean(vh), "arms": fnp.sqrt(fnp.mean(a * a)),
+    }
+    corr = corrector_design(prim) @ beta
+    if damp != 1.0:
+        corr = corr * damp
+    return fnp.stack(mean_h[:-1] + [mu + corr], axis=0)
+
+
+def corrected_sparse_kernel(weights, ctx=None, tau: float | None = 2.5,
+                            n_samples: int = 8500, n_pilot: int = 150,
+                            seed: int = 0, beta=None, damp: float = 1.0,
+                            kmax: int = 2, safe: bool = True):
+    """Sparse Monte Carlo plus the offline-trained residual corrector.
+
+    ``beta`` is the ``(n_features,)`` head loaded from the submission's npz
+    (0 FLOPs).  ``damp=0`` -- or ``beta=None`` -- is the exact ablation: the
+    identical code path with the head switched off, which reproduces
+    :func:`sparse_mc_kernel` bit for bit at the same ``seed``.
+    """
+    if beta is not None:
+        beta = fnp.asarray(beta, dtype=fnp.float32)
+    try:
+        return _corrected_sparse(weights, tau, n_samples, n_pilot, seed, beta,
+                                 damp, kmax)
+    except Exception:  # noqa: BLE001 - a raise on one MLP costs ~850x the score
+        if not safe:
+            raise
+        return _dense_rows(weights, SPARSE_FALLBACK_SAMPLES, seed)
+
+
+KERNELS["corrected_sparse"] = corrected_sparse_kernel

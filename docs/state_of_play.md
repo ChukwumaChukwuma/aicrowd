@@ -21,17 +21,20 @@ independent analytic route via the ReLU arc-cosine overlap map agrees. `v` also
 has CV 0.48 across MLPs, so the floor is a per-suite random variable.
 
 Free compute is `C ≤ 2.72e10` (the multiplier clamps at 0.1 below that). The
-shipped estimator sits at `F/B = 0.0915` — `F` is machine-independent, `C`
+shipped estimator sits at `F/B = 0.0920` — `F` is machine-independent, `C`
 is not, and the grader runs participant code on one physical core, so the
 margin that matters is quoted in `F`.
 
-**The shipped estimator is now plain sampling with the always-off neurons
-pruned out of every matmul** (`docs/sparse_sign_stable.md`): adjusted
-**5.87e-7**, the first estimator here below the grader's own plain-MC constant
-`sampling_mse = 6.4695e-7`. The whole analytic programme below is retained as
-research, not as ship: blending it back in *worsens* the score, because its
-2.7e9 FLOPs push `C/B` from 0.100 to 0.124 and the 1.24x multiplier penalty
-exceeds what it buys.
+**The shipped estimator is sampling with the always-off neurons pruned out of
+every matmul** (`docs/sparse_sign_stable.md`), **plus layer-1 Hermite control
+variates and an offline-trained residual head** (`docs/learned_corrector.md`):
+raw **3.7194e-6**, adjusted **3.99e-7**, 0 raises in 100 — 1.56x raw / 1.52x
+adjusted over the same code path with the head switched off, and now 1.62x
+below the grader's own plain-MC constant `sampling_mse = 6.4695e-7`.
+
+The whole analytic programme below is retained as research, not as ship:
+blending it back in *worsens* the score, because its 2.7e9 FLOPs push `C/B`
+from 0.100 to 0.124 and the 1.24x multiplier penalty exceeds what it buys.
 
 ## Where the error is
 
@@ -70,6 +73,11 @@ every sparse-correction scheme — see `docs/sparse_sign_stable.md`.
 | sign-stable **modal fusion** + kink correction | 4.95× MORE expensive than dense | **dead** | `25` |
 | sign-stable **Rao-Blackwell** on decided neurons | 1.001× at τ=2 | **dead** | `25` |
 | sign-stable **dead-neuron pruning** | 1.51×/sample → **1.44× on score** | **shipped** | `25`, `26` |
+| final-layer Rao-Blackwell (Gaussian closure) | 0.81×; +Edgeworth 0.99×; 1.000× inside the fitted head | **dead** | `28` |
+| **layer-1 mean gap through the mean-field Jacobian** | **1.43×** at unit coefficient | **shipped** | `28` |
+| **layer-1 Hermite control variates, k ≤ 2** | **1.33×** at unit coefficient; k=3 is 1.20× | **shipped** | `28` |
+| **offline-trained ridge head** over both | **1.52× adjusted on the official suite** | **shipped** | `28` |
+| offline-trained **MLP** head, same features | 0.785× vs ridge (bar 1.5×) | **dead** | `28` |
 
 ### Why sign-stable sparsity mostly does not work (`docs/sparse_sign_stable.md`)
 
@@ -140,12 +148,18 @@ diagrams are not negligible and the series should not be pushed further.
 
 ## Honest position
 
-Shipped: **3.234e-5 raw / 3.234e-6 adjusted-equivalent = 5.9e5× the floor.**
-That is 2.11× the strongest bundled baseline, ablation-clean and parity-tested
-against the research kernel, but it is **not at the floor**. The cumulant
-family's ceiling (~10–20× over covariance propagation, i.e. ~3–6e-6 raw) is
-still well above it, so reaching the floor needs a mechanism outside that
-family.
+Shipped: **3.7194e-6 raw / 3.99e-7 adjusted = 80,600× the floor**, 0 raises in
+100, ablation-clean (`damp=0` reproduces the previous ship bitwise *and*
+FLOP-for-FLOP) and parity-tested against the research kernel. That is 1.62×
+below the grader's own plain-Monte-Carlo constant and 2.5× behind the best
+sign-stable entry on the public board.
+
+The barrier theorem still stands, with one amendment: it was only ever
+*computed* at `k = 1`. Its `k = 2` instance is 1.75×, not 1.38×, and the
+layer-1 Hermite family reaches order 2 for free because `z¹ = x W¹` is exactly
+Gaussian — the one place in the network where a moment is known in closed
+form. Nothing comparable exists at layer 2 or beyond, which is where this line
+stops.
 
 ## Open lines
 
@@ -158,10 +172,13 @@ family.
    it needs a `log det` / saddlepoint shortcut.
 2. **Fourth-cumulant diagrams**, same factorisation trick. Bounded upside
    (~2–4×) given the oracle-cumulant ceiling, but cheap.
-3. **Offline-calibrated residual correction.** Training and precomputation are
-   unbounded and load free at grade time; the Edgeworth *form* with learned
-   coefficients could absorb the truncation error. Label noise averages out
-   over many (MLP, neuron) pairs, so moderate-N ground truth suffices.
+3. ~~**Offline-calibrated residual correction.**~~ **Done** — see
+   `docs/learned_corrector.md`. The Edgeworth form with learned coefficients
+   turned out to be worth nothing (the final-layer Gaussian closure is *worse*
+   than plain averaging at depth 32); what the learned head is actually
+   weighting is a **layer-1 Hermite control variate**, which is free because
+   `z¹` is exactly Gaussian and its Mehler Gram is analytic. The label-noise
+   argument held: 640 MLPs at N_gt = 2×10⁵ each was enough.
 
 ## Where this leaves the board
 
@@ -170,11 +187,12 @@ family.
 | proven noise floor (`docs/floor_theorem.md`) | 4.949e-12 | 1.0 |
 | leaderboard #1 (dpskv5) | 3.63e-10 | 73.3 |
 | the sign-stable family as a competitor ships it | 1.60e-7 | 32,300 |
-| **this repo, now** | **5.87e-7** | **118,600** |
+| **this repo, now** | **3.99e-7** | **80,600** |
+| this repo, previous ship (sparse MC) | 5.87e-7 | 118,600 |
 | grader's plain-MC constant `sampling_mse` | 6.4695e-7 | 130,700 |
-| this repo, previous ship (analytic blend) | 7.7791e-7 | 157,200 |
+| this repo, two ships ago (analytic blend) | 7.7791e-7 | 157,200 |
 
-The entire remaining headroom in the benchmark is 73.3× and we are 1,616× behind
+The entire remaining headroom in the benchmark is 73.3× and we are 1,100× behind
 the leader, so the gap is not a modelling gap — it is that nothing here yet
 beats sampling by more than a constant factor.
 

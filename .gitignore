@@ -4,6 +4,12 @@ _artifacts/
 *.npz
 *.tar.gz
 
+# ...with one exception: the offline-trained head IS part of the submission.
+# It is a few hundred bytes, it is what the grader loads, and it is still
+# regenerable bit-for-bit (scripts/28_learned_corrector.py --mode data, then
+# --mode fit --install).
+!submission/corrector.npz
+
 # Local environment
 .venv/
 venv/
