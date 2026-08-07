@@ -86,8 +86,8 @@ every sparse-correction scheme — see `docs/sparse_sign_stable.md`.
 | **linear CV in the layer-`L` activations** (the 90%-explaining functions) | `R² = 86%` at `L=16`, `98.9%` at `L=32`, free — but the analytic mean is wrong by `rms 7e-3` and the whole ladder is **1.03×** | **dead — `E[g]`, not the basis** | `41` |
 | **antithetic `x → −x`** (kills every odd Hermite degree, exactly) | 1.077× on raw variance, **0.958×** composed with the shipped CV | **dead** | `41` |
 | **radial Rao-Blackwell** from exact positive homogeneity | 1.038× on raw variance, **0.975×** composed | **dead** | `41` |
-| **`relu(z¹)` in place of `He₂`** (256 features, exact mean) | **1.018×** on `v_eff`, free | live, not integrated | `41` |
-| **degree-2 in `z²` on the kink frame** (exact mean via arc-cosine) | **1.087×** on `v_eff` for 0.65% of `c`; frame costs ~60 dispatches | live, not integrated | `41` |
+| **`relu(z¹)` in place of `He₂`** (256 features, exact mean) | 1.020× predicted, **1.014×** on unbiased true MSE (48 MLPs) | live, not integrated | `41` |
+| **degree-2 in `z²` on the kink frame** (exact mean via arc-cosine) | **1.10× jointly fitted**, **≤ 1.000×** at every deployable block weight | **dead — overlap** | `41` |
 
 ### Why sign-stable sparsity mostly does not work (`docs/sparse_sign_stable.md`)
 
@@ -305,13 +305,23 @@ stops.
    question reduces to the closure-accuracy question**, which is
    `docs/floor_theorem.md`'s programme, not a new one.
 
-   What survives is small and exact: `relu(z¹)` in place of `He₂` (1.018×, 256
-   features instead of 512) and a degree-2 block in `z²` on the kink frame
-   (1.087× on `v_eff`, 0.65% of `c` per sample, exact mean from the
-   arc-cosine kernel). Both are implemented in `whestfloor/corrector.py`
-   (`layer12_moments`, `kink_frame`, `relu1_cv`, `quad2_cv`) and neither is
-   wired in: the `q2` frame needs the same ~60-dispatch sweep that made `cva`
-   a net loss.
+   What survives is small and exact: `relu(z¹)` in place of `He₂` — 256
+   features instead of 512, **1.014×** on unbiased true MSE over 48 generated
+   MLPs against a 1.020× prediction. The degree-2 block in `z²` (exact mean
+   from the arc-cosine kernel, `z²` already computed) is **1.10× jointly
+   fitted and ≤ 1.000× at every one of 15 deployable block weights**: 8.6 of
+   its 15.7 population points are already inside the shipped blocks, so a
+   separately-optimal correction re-removes signal while carrying its own
+   heavier (product-feature) noise, and the cross-block Gram that would
+   residualise it costs 44% of `N`. Both are implemented in
+   `whestfloor/corrector.py` (`layer12_moments`, `kink_frame`, `relu1_cv`,
+   `quad2_cv`); neither is wired in.
+
+   **Standing rule this round adds:** a held-out `R²` measured with a JOINT fit
+   is an upper bound on a shipped sum of blocks, and the gap is the overlap.
+   Round 9 (`cva`) and round 12 (`q2`) both lost the gain on the way to the
+   score for different reasons. Quote every new dictionary twice — jointly
+   fitted, and at deployable block weights on unbiased true MSE.
 
 ## Where this leaves the board
 

@@ -39,9 +39,16 @@ Modes
                    Hermite degree exactly) and the network's exact positive
                    homogeneity ``y(x) = ||x|| y(x/||x||)`` (Rao-Blackwellises
                    the radius against an exactly known ``E[chi_n]``).
+``--mode summary`` the ladder scored against the exact objective, with the
+                   optimal shrinkage on the biased correction, plus the
+                   sensitivity to the analytic accuracy factor ``r``.
+``--mode mse``     ``R^2`` converted to unbiased true MSE at UNIT coefficient
+                   over many generated MLPs -- no head, no shrinkage, no
+                   selection -- with a paired bootstrap over MLPs.
 
-All MLPs are LOCAL (``make_mlp``, seed base 950000) unless ``--official`` is
-given; the official suite is opened only to confirm a frozen conclusion.
+All MLPs are LOCAL (``make_mlp``, seed base 900000/960000) unless
+``--official`` is given; the official suite is opened only to confirm a frozen
+conclusion.
 """
 
 from __future__ import annotations
@@ -73,6 +80,12 @@ from whestfloor.relu_moments import (  # noqa: E402
 ART = Path(os.environ.get("WHEST_ARTIFACTS", "artifacts"))
 INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
 CHUNK = 2048
+
+#: Global shrinkages swept for the non-orthogonal q2 block in ``--mode mse``.
+THETAS = (0.0, 0.15, 0.3, 0.5, 1.0)
+#: ...swept jointly against the cv2 block it overlaps, because the offline head
+#: fits one coefficient per block and would reweight both.
+THETA2 = (0.5, 0.75, 1.0)
 
 
 def load_official_seeds():
@@ -725,6 +738,118 @@ def mode_anti(n_mlps, n_samples, seed0, official, n_ship):
 
 
 # ---------------------------------------------------------------------------
+# mode: mse -- convert R^2 into unbiased true MSE, at unit coefficient
+# ---------------------------------------------------------------------------
+def mode_mse(n_mlps, n_samples, n_ref, seed0, kq, official):
+    """Unbiased true MSE per arm, no fitting anywhere.
+
+    ``R^2`` is the right currency for comparing dictionaries but the score is
+    an MSE, so this converts.  Every arm applies its control variate at
+    **coefficient exactly 1** -- no head, no shrinkage, no selection -- and the
+    error is measured with the two-independent-halves estimator
+    ``mean_j (p_j - a_j)(p_j - b_j)``, which is unbiased for the true MSE with
+    the references' own sampling variance removed (``whestfloor/suite.py``).
+    This is the same table ``docs/hermite_rank_ceiling.md`` sec 9.2 used, and it
+    is the step at which that page's prediction was CORRECT; what failed there
+    was the head, which is downstream of this and not measured here.
+    """
+    from whestfloor.corrector import (  # noqa: PLC0415
+        hermite_cv, kink_frame, layer12_moments, quad2_cv, relu1_cv,
+    )
+    n = WIDTH
+    arms = (("plain", "-cv1", "-cv1-cv2", "-h1", "-q2")
+            + tuple(f"-cv1-{t2:g}cv2-{tq:g}q2"
+                    for t2 in THETA2 for tq in THETAS)
+            + tuple(f"-h1-{t:g}q2" for t in THETAS))
+    acc = {a: 0.0 for a in arms}
+    per = {a: [] for a in arms}
+    print("# Unbiased true MSE at UNIT coefficient -- no head, no shrinkage.\n"
+          f"# {n_mlps} MLPs, N = {n_samples}, references 2 x {n_ref}, "
+          f"q2 on the kink frame at k = {kq}.\n"
+          "# Dense forward pass (not the shipped sparse mask), so this "
+          "measures the\n# control-variate mechanism, not the shipped "
+          "pipeline.\n")
+    t00 = time.time()
+    for k in range(n_mlps):
+        seed, W = mlp_weights(k, seed0, official)
+        mz, Cz, _, _ = analytic_moments(W)
+        mh1, Ch1, m2, C2 = layer12_moments(W)
+        A2 = kink_frame(W, mz, Cz, kq)
+
+        rng = np.random.default_rng(abs(seed) % 100000 + 20250807)
+        x0 = rng.standard_normal((n_samples, n), dtype=np.float32)
+        z1 = x0 @ W[0]
+        h1 = np.maximum(z1, 0.0)
+        z2 = h1 @ W[1]
+        h = h1
+        for w in W[1:]:
+            h = np.maximum(h @ w, 0.0)
+        y = h.astype(np.float64)
+        mu = np.mean(y, axis=0)
+        cv1, cv2 = hermite_cv(x0, z1, y, W[0], kmax=2, split=True)
+        ch1 = relu1_cv(h1, y, mh1, Ch1)
+        cq2 = quad2_cv(z2, y, m2, C2, A2)
+        pred = {
+            "plain": mu, "-cv1": mu - cv1, "-cv1-cv2": mu - cv1 - cv2,
+            "-h1": mu - ch1, "-q2": mu - cq2,
+        }
+        # A block that is NOT orthogonal to the ones already applied cannot be
+        # added at unit coefficient: more than half of q2's population span is
+        # already inside SHIP + h1 (46.46% against 39.41% + 15.67%), so
+        # subtracting both separately-optimal corrections double-counts the
+        # overlap.  ``theta`` is ONE global constant -- the same for every MLP,
+        # never fitted per MLP -- which is exactly what the offline head learns.
+        for t2 in THETA2:
+            for tq in THETAS:
+                pred[f"-cv1-{t2:g}cv2-{tq:g}q2"] = (
+                    mu - cv1 - t2 * cv2 - tq * cq2)
+        for tq in THETAS:
+            pred[f"-h1-{tq:g}q2"] = mu - ch1 - tq * cq2
+        refs = []
+        for r in (0, 1):
+            rg = np.random.default_rng(abs(seed) % 100000 + 555000 + r)
+            s = np.zeros(n)
+            done = 0
+            while done < n_ref:
+                m = min(4096, n_ref - done)
+                xx = rg.standard_normal((m, n), dtype=np.float32)
+                hh = xx
+                for w in W:
+                    hh = np.maximum(hh @ w, 0.0)
+                s += hh.sum(0, dtype=np.float64)
+                done += m
+            refs.append(s / n_ref)
+        for a in arms:
+            v = float(np.mean((pred[a] - refs[0]) * (pred[a] - refs[1])))
+            acc[a] += v
+            per[a].append(v)
+        if (k + 1) % 8 == 0 or k + 1 == n_mlps:
+            print(f"  ... {k+1}/{n_mlps} MLPs [{time.time()-t00:.0f}s]",
+                  flush=True)
+    # PAIRED bootstrap over MLPs: the arms share samples and references, so
+    # the ratios are far better determined than the levels (the reference
+    # noise enters every arm through the same (a + b) and mostly cancels).
+    P = {a: np.array(per[a]) for a in arms}
+    rg = np.random.default_rng(0)
+    idx = rg.integers(0, n_mlps, size=(2000, n_mlps))
+    print(f"\n  {'arm':<18} {'unbiased true MSE':>19} {'x plain':>9} "
+          f"{'x -cv1-cv2':>11} {'+-':>8}")
+    base = acc["plain"] / n_mlps
+    ship = acc["-cv1-cv2"] / n_mlps
+    rows = []
+    for a in arms:
+        v = acc[a] / n_mlps
+        bs = P["-cv1-cv2"][idx].mean(1) / P[a][idx].mean(1)
+        se = float(np.std(bs))
+        print(f"  {a:<18} {v:19.6e} {base/v:9.4f} {ship/v:11.4f} {se:8.4f}")
+        rows.append({"arm": a, "mse": v, "x_plain": base / v,
+                     "x_ship": ship / v, "x_ship_se": se, "n_mlps": n_mlps,
+                     "n_samples": n_samples, "kq": kq})
+    (ART / "cv").mkdir(parents=True, exist_ok=True)
+    (ART / "cv" / "mse.json").write_text(json.dumps(rows, indent=1))
+
+
+# ---------------------------------------------------------------------------
 # mode: summary -- the ladder read against the CORRECT objective
 # ---------------------------------------------------------------------------
 def mode_summary(v0, r_grid):
@@ -782,7 +907,7 @@ def mode_summary(v0, r_grid):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", required=True,
-                    choices=("eig", "ladder", "quad", "anti", "summary"))
+                    choices=("eig", "ladder", "quad", "anti", "summary", "mse"))
     ap.add_argument("--mlps", type=int, default=3)
     ap.add_argument("--samples", type=int, default=120_000)
     ap.add_argument("--ref-samples", type=int, default=2_000_000)
@@ -809,6 +934,9 @@ def main():
         mode_anti(a.mlps, a.samples, a.seed0, a.official, a.n_ship)
     elif a.mode == "summary":
         mode_summary(a.v0, [float(v) for v in a.r_grid.split(",")])
+    elif a.mode == "mse":
+        mode_mse(a.mlps, a.n_ship, a.ref_samples, a.seed0, a.kq,
+                 a.official)
 
 
 if __name__ == "__main__":

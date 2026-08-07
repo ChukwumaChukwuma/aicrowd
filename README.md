@@ -62,6 +62,38 @@ insuring against the very `p/N` it removes. On the official suite: raw
 3.7039e-6 (0.32% better, machine-independent), adjusted 4.2494e-7 (**0.945×**,
 worse). Not shipped.
 
+**And the dictionary-free bound that page left open is a tautology**
+(`docs/integrable_cv.md`). "The top-8 eigenfunctions of `Cov(y)` explain 90.1%"
+is true and is not a construction: that operator maps every function into
+`span{ȳ_j}`, so its eigenfunctions *are* linear combinations of the centred
+outputs, and their means are zero only because `E[y]` was subtracted — which is
+the answer. Measured, they are 51.4% degree `≤ 2` in `x`, against a 75% bar.
+
+The 90% is nonetheless reachable and free: a **linear** control variate in
+`relu(z^L)` reaches `R² = 86%` at `L = 16` and **98.9%** at `L = 32`, on
+features the forward pass already computed. What closes it is `E[g]`. `z¹` is
+exactly Gaussian, so layer 1 — and hence `E[z²]`, `Cov(z²)` — is exactly
+integrable and nothing deeper is; the Gaussian closure's error rises from
+`rms 1.6e-3` at `L = 2` to `7.0e-3` at `L = 32` and enters the score as
+`0.1 b²`. With the optimal shrinkage `θ* = D/(D+b²)` on the biased correction,
+**the entire ladder from `L = 2` to `L = 32` is worth 1.03×.** The
+forward-looking number is one scalar: the analytic layer-mean would have to
+improve by **4.2–4.6×** to break even, and past that the payoff is 1.9× at
+`r = 4.4`, 5.4× at `r = 10`, 25× at `r = 30`. So the control-variate question
+reduces to the closure-accuracy question — the basis is not the lever.
+
+What survives is exact and small: `relu(z¹)` in place of `He₂` — 256 features
+instead of 512, exact mean `σ_i/√(2π)`, **1.014×** on unbiased true MSE over 48
+generated MLPs against a 1.020× prediction. The one dictionary that looked like
+more, degree 2 in the layer-1 *activations* (`E[relu·relu]` is the arc-cosine
+kernel, so its mean is exact and `z²` is already computed), is **1.10× jointly
+fitted and ≤ 1.000× at every deployable block weight**: more than half of its
+span is already inside the shipped blocks, so a separately-optimal correction
+re-removes signal while adding its own heavier noise, and the cross-block Gram
+that would separate them costs 44% of `N`. Same shape as `cva`, a different
+reason — hence the standing rule this round adds: **quote every new dictionary
+twice, jointly fitted and at deployable block weights on unbiased true MSE.**
+
 ## Layout
 
 ```

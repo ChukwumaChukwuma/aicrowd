@@ -306,3 +306,65 @@ if want("official_confirmation"):
             "exact integrability at layer 1 holds on the graded networks."),
     ).__str__()
     print("recorded: official_confirmation")
+
+# ---------------------------------------------------------------------------
+if want("end_to_end_block_weights"):
+    Experiment(
+        name="end_to_end_block_weights",
+        script="scripts/41_integrable_cv.py",
+        hypothesis=(
+            "The 41.66% held-out R^2 of SHIP + h1 + q2(k=32) was measured with a "
+            "JOINT ridge fit over 1,296 coefficients.  What ships is a SUM OF "
+            "BLOCKS, each with its own within-block coefficients and one scalar "
+            "weight the offline head learns.  Measure the deployable object "
+            "directly: unbiased true MSE at fixed global block weights, no "
+            "fitting anywhere.  If the joint gain survives, q2 is shippable at "
+            "1.087x; if it does not, the R^2 was an upper bound and the gap is "
+            "the overlap between the blocks."),
+        acceptance_bar=1.05, bar_metric="best_x_ship_end_to_end",
+        bar_direction="higher_is_better",
+    ).record(
+        gt_samples=300_000, seed=960_000, n_mlps=48,
+        estimator="mu - cv1 - theta2 cv2 - thetaq q2, and mu - relu1_cv",
+        best_x_ship_end_to_end=1.0142,
+        raw_final_layer_mse=8.9366e-07, compute_ratio=0.1,
+        b=0.0, v_eff_r2=0.3745, c=2.79e6,
+        n_samples=27_000, n_ref_per_half=150_000, kq=32,
+        mse_plain=1.613360e-06, mse_cv1=1.223215e-06,
+        mse_ship=9.063820e-06 / 10.0, mse_h1=8.936566e-07,
+        mse_q2_alone=1.825606e-06,
+        x_ship_h1=1.0142, x_ship_h1_se=0.0397, x_ship_h1_predicted=1.0202,
+        theta_grid_q2=[0.0, 0.15, 0.3, 0.5, 1.0],
+        theta_grid_cv2=[0.5, 0.75, 1.0],
+        x_ship_grid={
+            "cv2=1.00": [1.0000, 0.9821, 0.9443, 0.8709, 0.6467],
+            "cv2=0.75": [0.9852, 0.9782, 0.9504, 0.8874, 0.6718],
+            "cv2=0.50": [0.9274, 0.9305, 0.9144, 0.8667, 0.6761],
+            "h1": [1.0142, 1.0030, 0.9704, 0.9007, 0.6737]},
+        argmax_theta_q=0.0,
+        q2_overlap_points=8.6, q2_pop_points=15.67,
+        cross_block_gram_flops=1.1e10, cross_block_gram_share_of_B=0.041,
+        cross_block_gram_share_of_shipped_F=0.44,
+        notes=(
+            "PASSES for h1 (1.0142x +- 0.0397 against a 1.0202x prediction -- "
+            "the R^2 converts) and FAILS for q2 at every one of the 15 block "
+            "weights tried; the argmax of the whole 2-D grid is theta_q = 0, "
+            "i.e. the shipped basis.  THIS RETRACTS the 1.087x quoted for q2 in "
+            "experiment exactly_integrable_quadratic_in_h1, which was a "
+            "joint-fit number.  MECHANISM: 8.6 of q2's 15.7 population points "
+            "are already inside SHIP + h1 (39.41 + 15.67 = 55.1 separate "
+            "against 46.46 joint), so a separately-optimal q2 correction "
+            "re-removes signal cv1 + cv2 has already removed, while carrying "
+            "its own heavier estimation noise -- the features are PRODUCTS, so "
+            "their fourth moments are far from Gaussian and the coefficient "
+            "noise exceeds the layer-1 blocks' at equal p.  Shrinking by theta "
+            "scales duplicate signal and noise together, so no theta > 0 wins.  "
+            "Residualising q2 against the layer-1 blocks needs the cross-block "
+            "Gram, N p1 p2 = 1.1e10 FLOPs = 4% of B = +44% of the shipped F, "
+            "which at the clamp costs 44% of N against a 1.10x gain.  STANDING "
+            "RULE: a held-out R^2 from a joint fit is an UPPER BOUND on a "
+            "shipped sum of blocks and the gap is the overlap; quote every new "
+            "dictionary twice, jointly fitted and at deployable block weights "
+            "on unbiased true MSE."),
+    ).__str__()
+    print("recorded: end_to_end_block_weights")

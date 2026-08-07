@@ -19,6 +19,13 @@ depth from 6 to 32; at `r = 4.4` the ladder pays 1.9x, at `r = 10` it pays
 5.4x, at `r = 30` it pays 25x. So the control-variate question reduces to the
 closure-accuracy question: the basis is not the lever, `E[g]` is.**
 
+**The one thing that survives is small: `relu(z^1)` in place of `He_2` — 256
+features instead of 512, an exact mean `sigma_i/sqrt(2 pi)`, and 1.014x on
+unbiased true MSE over 48 generated MLPs. The one new dictionary that looked
+like more — degree 2 in the layer-1 activations, 1.10x jointly fitted — is
+dead at every deployable block weight (§4.4), for the same overlap reason
+`cva` was.**
+
 Reproducible from `scripts/41_integrable_cv.py`
 (`--mode eig|ladder|summary|quad|anti`), 3 local MLPs (seed base 900000, the
 same networks `docs/hermite_rank_ceiling.md` measured, so every number below
@@ -29,8 +36,8 @@ before anything new is measured.
 | route | exactly integrable? | held-out `R^2` | scored | verdict |
 |---|---|---|---|---|
 | shipped layer-1 Hermite `k <= 2` | yes | 39.3% | 1.00x | the incumbent |
-| `relu(z^1)` (`h1`), 256 features (§4) | **yes** | 38.6% at **half** the features | **1.018x** | small, real, free |
-| degree-2 in `z^2` on the kink frame (§4) | **yes** | 46.5% pop / 41.7% eff | **1.087x** on `v_eff` | the frontier; frame costs a sweep |
+| `relu(z^1)` (`h1`), 256 features (§4) | **yes** | 38.6% at **half** the features | **1.014x** end to end | small, real, free |
+| degree-2 in `z^2` on the kink frame (§4) | **yes** | 46.5% pop, **1.10x jointly fitted** | **<= 1.000x** at any block weight (§4.4) | **dead — the overlap eats it** |
 | linear in `relu(z^L)`, `L >= 2` (§3) | no | up to 98.9% | **1.03x** | **dead — the bias eats it** |
 | antithetic `x -> -x` (§5) | yes, by symmetry | 1.077x raw | **0.958x** | **dead** |
 | homogeneity Rao-Blackwell (§5) | yes, exactly | 1.038x raw | **0.975x** | **dead** |
@@ -156,7 +163,10 @@ Three things to read off.
 measured bias 8.8e-05 sits below the 2e6-sample reference's own noise floor of
 1.35e-04, and `rms(mtilde^1 - m^1) = 5.8e-04` is exactly `sd(h^1)/sqrt(2e6)`.
 The 0.97x against the ship is the agreement between this measurement and the
-shipped estimator, not a loss.
+shipped estimator, not a loss. (The `L = 1` row *is* the `h1` block of §4,
+reached from the other direction and on a different sample: 37.73% here against
+37.68% there, on the same three networks. The two halves of this page agree to
+0.05 points where they overlap.)
 
 **The 90% is real, cheap and constructive.** `R^2` climbs monotonically to
 98.9%, with 256 features and zero extra FLOPs, on features the network hands
@@ -379,10 +389,71 @@ it and layers 28-32 carry 53% — so `Q` cannot be assembled from a local
 computation; it needs both the forward normal recursion and the backward
 Jacobian sweep, ~60 flopscope dispatches, which `docs/hermite_rank_ceiling.md`
 §9.4 measured at ~15 ms, i.e. 5.5% of the free budget against this block's
-7.2%. That trade is exactly the one the shipped `N` is currently being tuned
-against and is left to the integrator; the zero-setup alternative is the
-unadapted frame (`--sketch first`), which reaches roughly half of the adapted
-gain.
+8.7%. That trade is exactly the one the shipped `N` is currently being tuned
+against and is left to the integrator. The zero-setup alternative is not a
+partial fallback: §4.1 measures the unadapted frame at **1.004x**, so dropping
+the sweep drops the block. One thing that may soften the bill and is worth a
+measurement rather than an argument: the shipped path *already* runs a 31-step
+mean-field propagation for `cv1mf`, at the same shapes, so the marginal
+dispatch cost of a second sweep may be well below the 5.5% `cva` paid cold.
+
+### 4.4 The end-to-end check, and what it takes back
+
+`R^2` is a claim about a *jointly fitted* dictionary. What ships is a sum of
+blocks, each with its own within-block coefficients and one scalar weight that
+the offline head learns. `--mode mse` measures that object directly: 48
+generated MLPs, `N = 27000`, unbiased true MSE against two independent
+150,000-sample references, **no fitting anywhere** — every `theta` below is one
+global constant, the same for every MLP, which is exactly what the head can
+learn. Paired bootstrap over MLPs in the `+-` column.
+
+| arm | unbiased true MSE | x plain | x `-cv1-cv2` | `+-` |
+|---|---|---|---|---|
+| plain | 1.6134e-06 | 1.000 | 0.562 | 0.091 |
+| `-cv1` | 1.2232e-06 | 1.319 | 0.741 | 0.073 |
+| **`-cv1-cv2` (the shipped mechanism)** | 9.0638e-07 | 1.780 | **1.000** | — |
+| **`-h1`** | **8.9366e-07** | **1.805** | **1.014** | 0.040 |
+| `-q2` alone | 1.8256e-06 | 0.884 | 0.497 | 0.115 |
+
+and the two-dimensional block-weight sweep, `mu - cv1 - theta_2 cv2 - theta_q q2`:
+
+| `theta_q` = | 0 | 0.15 | 0.3 | 0.5 | 1.0 |
+|---|---|---|---|---|---|
+| `theta_2 = 1.00` | **1.000** | 0.982 | 0.944 | 0.871 | 0.647 |
+| `theta_2 = 0.75` | 0.985 | 0.978 | 0.950 | 0.887 | 0.672 |
+| `theta_2 = 0.50` | 0.927 | 0.931 | 0.914 | 0.867 | 0.676 |
+| `-h1 - theta_q q2` | **1.014** | 1.003 | 0.970 | 0.901 | 0.674 |
+
+**`h1` delivers what §4 predicted and `q2` does not.** `h1` is 1.014x measured
+against 1.020x predicted, inside one standard error — it is a *replacement* for
+`He_2`, so overlap never arises. `q2` is a loss at every one of the 15 block
+weights tried; the argmax of the whole grid is `theta_q = 0`, i.e. the shipped
+basis.
+
+**Mechanism, and it is `cva`'s, exactly.** More than half of `q2`'s population
+span is already inside `SHIP + h1`: 39.41 + 15.67 = 55.1 points of separate
+content collapse to 46.46 jointly, so 8.6 of `q2`'s 15.7 points are duplicates.
+A separately-optimal `q2` correction therefore re-removes signal `cv1 + cv2`
+has already removed, and it does so carrying its own estimation error — which
+is worse than the layer-1 blocks' because the features are *products*, so their
+fourth moments are far from Gaussian and the coefficient noise is heavier at
+equal `p`. Shrinking by `theta` scales the duplicated signal and the noise
+together, so there is no `theta > 0` that wins.
+
+The joint 1.10x is therefore a **ceiling that needs joint coefficients**, not a
+drop-in. Realising it means residualising `q2`'s features against the layer-1
+blocks before forming its coefficients, which needs the cross-block Gram:
+`N p_1 p_2 = 27000 x 768 x 528 = 1.1e10` FLOPs, **4% of `B` and +44% of the
+shipped `F`**. At the clamp that costs 44% of `N`, i.e. 1.44x of variance,
+against a 1.10x gain. It does not close.
+
+> **A held-out `R^2` measured with a joint fit is an upper bound on a shipped
+> sum of blocks, and the gap is exactly the overlap.** `docs/hermite_rank_ceiling.md`
+> §9.3 found the same thing for `cva` from the other side (the head had already
+> bought it); here the block is genuinely new content and the overlap still
+> eats it. Two rounds, one lesson: **report the increment jointly fitted AND at
+> deployable block weights, or the number does not mean anything.**
+
 
 ## 5. Symmetry-derived variates: exact, and worth less than nothing
 
@@ -478,7 +549,8 @@ every depth, which moves nothing: the break-even `r` is 4.0-4.3 instead of
 | 1 | the top-8 eigenfunctions are `> 75%` degree `<= 2` in `x` (which would make their means exact by Wick) | **51.4%**, and the full degree-`<=2` space is 45.6% of `Var(y)` for 32,896 coefficients (`p/N = 1.22`) | **FAIL** |
 | 2 | some layer of the depth ladder beats the shipped adjusted 2.47e-07 | argmin is `L = 1` at 2.536e-07 (0.97x); every `L >= 2` is worse; with optimal shrinkage the whole ladder is 1.03x | **FAIL** |
 | 3 | a symmetry-derived variate is `> 1.05x` on residual per unit cost | antithetic **0.958x**, homogeneity **0.975x**, both **0.913x** | **FAIL** |
-| 4 | a new **exactly integrable** dictionary reaches held-out `R^2 > 60%` net of `p/N` | best is SHIP + `h1` + `q2(k=32)` at **41.66%** (1.714x against the shipped 1.577x) | **FAIL on the bar, 1.087x on `v_eff`** |
+| 4 | a new **exactly integrable** dictionary reaches held-out `R^2 > 60%` net of `p/N` | best is SHIP + `h1` + `q2(k=32)` at **41.7%** jointly fitted (1.71x against 1.58x) | **FAIL** |
+| 4b | ...and that gain survives end to end at deployable block weights | `h1` **1.014x** (predicted 1.020x); `q2` **<= 1.000x** at all 15 block weights, argmax is `theta_q = 0` | **`h1` PASS, `q2` FAIL** |
 | 5 | the conclusion transfers to the official suite | §6: same argmax, every gain within 1.1%, and the `SHIP` row reproduces `hermite_rank_ceiling` §7's official 39.69% exactly | **PASS** |
 | 6 | the exactness claims are asserted, not assumed | `tests/test_integrable_cv.py`: layer-1 Mehler == arc-cosine to 1e-12, `E[h^1]`/`Cov(h^1)`/`E[z^2]`/`Cov(z^2)` within 6 sigma of 2e6 samples, `E[z^3]` NOT (>20 sigma), antithetic kills degree 1, `y(3x) = 3y(x)` to 1e-10 | **PASS** |
 | 7 | shipped estimator untouched | `git diff submission/` empty | **PASS** |
@@ -495,11 +567,13 @@ costs `rms b = 3.4e-3`.
 * `docs/cost_floor.md`: `c` is closed at 1.13x.
 * `docs/hermite_rank_ceiling.md`: the rank-one Hermite family is closed at
   1.76x on `v_eff`, of which 1.65x is realised.
-* this page: the *exactly integrable* extension of that family is closed at
-  **1.71x** (SHIP + `h1` + `q2(k=32)`, against the shipped 1.577x on the same
-  three networks), and the 90%-explaining functions that
-  would give 10x exist, are free to evaluate, and are unusable **only** because
-  `E[g]` is not known to better than `rms 7e-3`.
+* this page: the *exactly integrable* extension of that family has a joint-fit
+  ceiling of 1.71x (SHIP + `h1` + `q2(k=32)` against the shipped 1.58x) and a
+  **deployable** value of 1.014x, because the only genuinely new block overlaps
+  the shipped ones and the cross-block Gram that would separate them costs 44%
+  of `N`. And the 90%-explaining functions that would give 10x exist, are free
+  to evaluate, and are unusable **only** because `E[g]` is not known to better
+  than `rms 7e-3`.
 
 Everything now points at one scalar. Writing `r` for the factor by which the
 analytic layer-mean accuracy would have to improve:
@@ -519,13 +593,18 @@ different programme from control variates, it is the one
 this page's contribution is to price exactly what it would be worth: **1.9x at
 `r = 4.4`, 5.4x at `r = 10`, and the whole 25x at `r = 30`.**
 
-Two smaller things are live and cheap, both exactly integrable, both left for
-the integrator because they interact with the fitted head the way `cva` did:
+**One thing is live**, and it is small: swap the 256-feature `relu(z^1)` block
+in for the 256-feature `He_2(t)` block. Same cost (the forward pass already has
+`relu(z^1)`), exact mean `sigma_i/sqrt(2 pi)`, analytic arc-cosine Gram, half
+the coefficients, and **1.014x** on unbiased true MSE over 48 generated MLPs
+against a 1.020x prediction. `whestfloor.corrector.relu1_cv`. It is a
+replacement, not an addition — stacking it on top of `t + He_2` is 0.9997x.
 
-1. **`h1` for `He_2`** — swap the 256-feature `relu(z^1)` block in for the
-   256-feature `He_2(t)` block: same features, exact mean, **1.018x**, free.
-2. **`q2(k=32)`** — the degree-2 block in `z^2` on the kink frame: **1.087x** on
-   `v_eff` for 0.65% of `c` per sample, against a ~2-6% setup residual for the
-   frame (which is not optional: §4.1). Net positive but of the same size as Strassen's 1.0121x, and subject
-   to the same head-absorption risk that turned `cva`'s 1.032x raw into
-   +0.002x inside the ridge.
+**And one methodological correction worth carrying forward.** Rounds 9 and 12
+both produced a real held-out `R^2` gain that evaporated on the way to the
+score, for two different reasons — `cva` because the fitted head had already
+bought it, `q2` because the block overlaps what is already being subtracted and
+a per-block scalar cannot undo an overlap. The fix is procedural: **quote every
+new dictionary twice, jointly fitted AND at deployable block weights on
+unbiased true MSE.** `--mode quad` and `--mode mse` are those two halves and
+should be run together from now on.
