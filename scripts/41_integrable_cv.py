@@ -64,6 +64,7 @@ from whestfloor.official_seeds import make_official_mlp  # noqa: E402
 from whestfloor.relu_moments import (  # noqa: E402
     Phi,
     phi,
+    relu_cov_exact_centered,
     relu_cov_mehler,
     relu_mean,
     relu_var,
@@ -110,7 +111,15 @@ def analytic_moments(W, kmax: int = 8):
         mz.append(m.copy())
         Cz.append(C.copy())
         hm = relu_mean(m, s)
-        hC = relu_cov_mehler(C, m, s, kmax=kmax)
+        if l == 0:
+            # ``E[z^1] = 0`` exactly, so the arc-cosine kernel is CLOSED FORM
+            # here -- no Mehler truncation.  Using the k<=8 series instead
+            # costs 8e-07 absolute, which is 1e-06 relative and far below any
+            # Monte-Carlo error on this page, but the q2 block of sec 4 claims
+            # an EXACT mean and this is the line that makes it true.
+            hC = relu_cov_exact_centered(C, s)
+        else:
+            hC = relu_cov_mehler(C, m, s, kmax=kmax)
         np.fill_diagonal(hC, relu_var(m, s))
         mh.append(hm)
         Ch.append(hC)
@@ -445,16 +454,70 @@ def mode_ladder(n_mlps, n_samples, n_ref, seed0, official, layers, n_ship,
 # ---------------------------------------------------------------------------
 # mode: quad
 # ---------------------------------------------------------------------------
+def kink_frames(W, mz, Cz, kq):
+    """Adapted frames for the degree-2 content, from the weights alone.
+
+    ``docs/hermite_rank_ceiling.md`` sec 5.2: a ReLU network's degree-2 chaos is
+    carried entirely by its kink surfaces, neuron ``(l,i)`` contributing the
+    rank-one term ``E[delta(z^l_i)] (dy_j/dz^l_i) n_{l,i} (x) n_{l,i}`` along
+    its own normal ``n_{l,i} = grad z^l_i``.  At ``l = 1`` that normal is the
+    constant ``W^1[:,i]`` -- the shipped basis.  Deeper normals vary with ``x``
+    but their MEAN-FIELD values are computable from the weights, and the
+    weighted second-moment matrix of all 8,192 of them,
+
+        Q = sum_{l,i} (phi(alpha_li)/s_li)^2 ||R^l[i,:]||^2 nhat nhat'
+
+    has as its top eigenvectors the best shared directions for a degree-2
+    dictionary.  This is the frame sec 5.2's rank bound is about, built rather
+    than bounded.  Returned in x-space (for the He_2 block) and in
+    ``z^2``-space (for the layer-1-activation quadratic block).
+    """
+    n = WIDTH
+    dep = len(W)
+    g = [Phi(mz[l] / np.sqrt(np.maximum(np.diag(Cz[l]), 1e-30)))
+         for l in range(dep)]
+    s = [np.sqrt(np.maximum(np.diag(Cz[l]), 1e-30)) for l in range(dep)]
+    al = [mz[l] / s[l] for l in range(dep)]
+    # downstream mean-field Jacobians R^l (n, n_out)
+    R = [None] * dep
+    R[dep - 1] = np.diag(g[dep - 1])
+    for l in range(dep - 2, -1, -1):
+        R[l] = g[l][:, None] * (W[l + 1].astype(np.float64) @ R[l + 1])
+    rn = [np.sum(R[l] * R[l], axis=1) for l in range(dep)]
+    # input-space normals N^l and z^2-space normals M^l
+    Qx = np.zeros((n, n))
+    Q2 = np.zeros((n, n))
+    Nl = W[0].astype(np.float64)
+    Ml = None
+    for l in range(dep):
+        w = (phi(al[l]) / s[l]) ** 2 * rn[l]
+        A = Nl / np.maximum(np.linalg.norm(Nl, axis=0), 1e-30)
+        Qx += (A * w) @ A.T
+        if Ml is not None:
+            B = Ml / np.maximum(np.linalg.norm(Ml, axis=0), 1e-30)
+            Q2 += (B * w) @ B.T
+        if l + 1 < dep:
+            Nl = (Nl * g[l]) @ W[l + 1].astype(np.float64)
+            Ml = (np.eye(n) if l + 1 == 1
+                  else (Ml * g[l]) @ W[l + 1].astype(np.float64))
+    e1, V1 = np.linalg.eigh(Qx)
+    e2, V2 = np.linalg.eigh(Q2)
+    return V1[:, ::-1][:, :kq], V2[:, ::-1][:, :kq]
+
+
 def build_blocks(W, x, mh0, mz1, Cz1, Cz0, sk1, sk2, kq):
     """Design blocks with EXACTLY known means, from one forward pass.
 
     * ``t``       : ``z^1_i / sigma_i``          E = 0 exactly (z^1 Gaussian)
     * ``he2``     : ``t_i^2 - 1``                E = 0 exactly
     * ``h1``      : ``relu(z^1_i) - sigma_i/sqrt(2pi)``   E = 0 exactly
-    * ``q1``      : ``u_a u_b - Cov``, ``u = z^1 S1``     E = 0 exactly (Wick)
-    * ``q2``      : ``v_a v_b - Cov``, ``v = z^2 S2``     E = 0 exactly
+    * ``q1``      : ``u_a u_b - delta_ab``, ``u = x A1``  E = 0 exactly (Wick):
+                    the degree-2 Wiener chaos on an adapted orthonormal frame
+    * ``q2``      : ``v_a v_b - Cov``, ``v = (z^2 - m) A2``  E = 0 exactly
                     (arc-cosine kernel gives Cov(h^1) in closed form, hence
-                    Cov(z^2) = W^2' Cov(h^1) W^2 exactly)
+                    Cov(z^2) = W^2' Cov(h^1) W^2 exactly).  NOT a polynomial in
+                    ``x`` at all -- ``relu(z^1_i) relu(z^1_j)`` carries every
+                    even degree -- so this block is not bounded by ``f_1 + f_2``.
     """
     n = WIDTH
     z1 = x @ W[0]
@@ -468,12 +531,11 @@ def build_blocks(W, x, mh0, mz1, Cz1, Cz0, sk1, sk2, kq):
         "h1": h1.astype(np.float64) - mh0,
     }
     if kq:
-        u = z1.astype(np.float64) @ sk1                 # (m, kq)
+        u = x.astype(np.float64) @ sk1                  # (m, kq), Cov = I
         v = (z2.astype(np.float64) - mz1) @ sk2
-        Cu = sk1.T @ Cz0 @ sk1
         Cv = sk2.T @ Cz1 @ sk2
         iu, ju = np.triu_indices(kq)
-        blocks["q1"] = u[:, iu] * u[:, ju] - Cu[iu, ju]
+        blocks["q1"] = u[:, iu] * u[:, ju] - (iu == ju).astype(np.float64)
         blocks["q2"] = v[:, iu] * v[:, ju] - Cv[iu, ju]
         blocks["l2"] = v
     h = h1
@@ -500,24 +562,8 @@ def mode_quad(n_mlps, n_samples, seed0, official, kq, n_ship, sketch):
         if sketch == "first":
             S1 = np.eye(n)[:, :kq]
             S2 = np.eye(n)[:, :kq]
-        elif sketch == "mf":
-            # mean-field Jacobian from each layer to the output
-            g = [Phi(mz[l] / np.sqrt(np.maximum(np.diag(Cz[l]), 1e-30)))
-                 for l in range(len(W))]
-            J1 = np.eye(n)
-            M = W[-1].astype(np.float64)
-            for l in range(len(W) - 1, 0, -1):
-                M = (g[l - 1][:, None] * M)
-                if l - 1 > 0:
-                    M = W[l - 1].astype(np.float64) @ M
-                else:
-                    J1 = M
-            # J1: layer-1 pre-activation -> output, (n, n)
-            S1 = np.linalg.svd(J1, full_matrices=False)[0][:, :kq]
-            M2 = W[-1].astype(np.float64)
-            for l in range(len(W) - 1, 1, -1):
-                M2 = W[l - 1].astype(np.float64) @ (g[l - 1][:, None] * M2)
-            S2 = np.linalg.svd(g[1][:, None] * M2, full_matrices=False)[0][:, :kq]
+        elif sketch == "kink":
+            S1, S2 = kink_frames(W, mz, Cz, kq)
         else:
             rg = np.random.default_rng(12345)
             S1 = np.linalg.qr(rg.standard_normal((n, kq)))[0]
@@ -553,29 +599,51 @@ def mode_quad(n_mlps, n_samples, seed0, official, kq, n_ship, sketch):
             print(f"    mean-zero check {nm:>4}: max |z| = "
                   f"{np.max(np.abs(zsc[i])):6.2f}  "
                   f"rms |mean|/sd = {np.sqrt(np.mean((mDA[i]/sdD[i])**2)):.2e}")
+        # sub-frames are nested (the frames are top eigenvectors and the
+        # triangular blocks are indexed by (a<=b<k)), so one design serves
+        # every k in the sweep.
+        iu, ju = np.triu_indices(kq)
+        ksweep = [k_ for k_ in (8, 16, 24, 32, 48, 64, 96, 128) if k_ <= kq]
+        if kq not in ksweep:
+            ksweep.append(kq)
+
+        def qidx(nm, k_):
+            return offs[nm][np.flatnonzero(ju < k_)]
+
         dicts = [
             ("SHIP  t+he2", ["t", "he2"]),
-            ("h1", ["h1"]),
-            ("t", ["t"]),
-            ("t+he2+h1", ["t", "he2", "h1"]),
-            (f"q1 (deg2 chaos, k={kq})", ["q1"]),
-            (f"q2 (deg2 in z^2, k={kq})", ["q2"]),
-            (f"SHIP+q1", ["t", "he2", "q1"]),
-            (f"SHIP+q2", ["t", "he2", "q2"]),
-            (f"SHIP+h1+q2", ["t", "he2", "h1", "q2"]),
-            (f"SHIP+h1+q1+q2", ["t", "he2", "h1", "q1", "q2"]),
-            ("ALL", names),
+            ("h1  (relu(z^1), exact)", ["h1"]),
+            ("t   (degree-1 chaos)", ["t"]),
+            ("SHIP+h1", ["t", "he2", "h1"]),
         ]
-        print(f"  {'dictionary':<28} {'p':>6} {'R2_pop':>9} {'R2_hold':>9} "
+        print(f"  {'dictionary':<30} {'p':>6} {'R2_pop':>9} {'R2_hold':>9} "
               f"{'R2_eff':>9} {'1/(1-eff)':>10}")
         for nm, bl in dicts:
             idx = np.concatenate([offs[b] for b in bl])
             pop, hold, lam, b, eff, T = span_r2(H, idx, n_ship=n_ship)
-            print(f"  {nm:<28} {len(idx):>6} {pop*100:8.2f}% {hold*100:8.2f}% "
+            print(f"  {nm:<30} {len(idx):>6} {pop*100:8.2f}% {hold*100:8.2f}% "
                   f"{eff*100:8.2f}% {1.0/max(1e-9,1-eff):10.3f}")
             rows.append({"mlp": int(seed), "dict": nm, "p": int(len(idx)),
                          "R2_pop": pop, "R2_hold": hold, "R2_eff": eff,
                          "kq": kq, "sketch": sketch})
+        for k_ in ksweep:
+            for nm, bl in ((f"q1 deg2-chaos k={k_}", [("q1", k_)]),
+                           (f"q2 deg2-in-z^2 k={k_}", [("q2", k_)]),
+                           (f"SHIP+h1+q1 k={k_}",
+                            ["t", "he2", "h1", ("q1", k_)]),
+                           (f"SHIP+h1+q2 k={k_}",
+                            ["t", "he2", "h1", ("q2", k_)]),
+                           (f"SHIP+h1+q1+q2 k={k_}",
+                            ["t", "he2", "h1", ("q1", k_), ("q2", k_)])):
+                idx = np.concatenate([qidx(*b) if isinstance(b, tuple)
+                                      else offs[b] for b in bl])
+                pop, hold, lam, bb, eff, T = span_r2(H, idx, n_ship=n_ship)
+                print(f"  {nm:<30} {len(idx):>6} {pop*100:8.2f}% "
+                      f"{hold*100:8.2f}% {eff*100:8.2f}% "
+                      f"{1.0/max(1e-9,1-eff):10.3f}")
+                rows.append({"mlp": int(seed), "dict": nm, "p": int(len(idx)),
+                             "R2_pop": pop, "R2_hold": hold, "R2_eff": eff,
+                             "kq": k_, "sketch": sketch})
         print()
     (ART / "cv").mkdir(parents=True, exist_ok=True)
     (ART / "cv" / f"quad_{sketch}_{kq}.json").write_text(json.dumps(rows, indent=1))
@@ -651,10 +719,65 @@ def mode_anti(n_mlps, n_samples, seed0, official, n_ship):
     (ART / "cv" / "anti.json").write_text(json.dumps(rows, indent=1))
 
 
+# ---------------------------------------------------------------------------
+# mode: summary -- the ladder read against the CORRECT objective
+# ---------------------------------------------------------------------------
+def mode_summary(v0, r_grid):
+    """The depth ladder scored with the optimal shrinkage, stacked on layer 1.
+
+    A biased correction is never used at full strength.  With a scalar
+    shrinkage ``theta`` on the layer-``L`` correction, on top of the exactly
+    integrable layer-1 control variate,
+
+        MSE(theta) = (1 - R1) V/N - 2 theta D + theta^2 D + theta^2 b^2,
+        D := (R_L - R1) V/N        (the incremental variance the CV can save)
+
+    which is minimised at ``theta* = D / (D + b^2)`` and delivers a saving of
+    ``D^2 / (D + b^2)`` instead of ``D``.  So a control variate whose mean is
+    wrong by ``b`` is worth exactly the fraction ``D / (D + b^2)`` of itself:
+    **the bias does not merely add, it multiplicatively discounts the whole
+    correction.**  This is the honest objective and it is what decides the
+    ladder; the unshrunk column in ``--mode ladder`` is an upper bound on the
+    damage, this is the exact one.
+    """
+    rows = json.loads((ART / "cv" / "ladder.json").read_text())
+    by = {}
+    for r in rows:
+        by.setdefault(r["L"], []).append(r)
+    VN = v0 / 0.1
+    R1 = float(np.mean([x["R2_eff"] for x in by[1]]))
+    print("# The depth ladder against the correct objective: optimal shrinkage\n"
+          "# on the biased correction, stacked on the exactly integrable\n"
+          f"# layer-1 control variate (R^2 = {R1*100:.2f}%, bias 0).\n"
+          f"# V/N = {VN:.3e}, ship adjusted = 2.47e-07.\n")
+    hdr = (f"  {'L':>3} {'R2_eff':>8} {'dR2':>7} {'rms b':>10} "
+           f"{'theta*':>7} {'adjusted':>10} {'x ship':>7}   "
+           + "  ".join(f"r={r:g}" for r in r_grid))
+    print(hdr)
+    for L in sorted(by):
+        g = by[L]
+        r2 = float(np.mean([x["R2_eff"] for x in g]))
+        b = math.sqrt(float(np.mean([x["rms_bias"] ** 2 for x in g])))
+        D = max(r2 - R1, 0.0) * VN
+        cells = []
+        for r in r_grid:
+            b2 = (b / r) ** 2
+            mse = (1 - R1) * VN - (D * D / (D + b2) if D > 0 else 0.0)
+            cells.append(2.47e-07 / (0.1 * mse))
+        b2 = b * b
+        th = D / (D + b2) if D + b2 > 0 else 0.0
+        mse = (1 - R1) * VN - (D * D / (D + b2) if D > 0 else 0.0)
+        print(f"  {L:>3} {r2*100:7.2f}% {(r2-R1)*100:6.2f}% {b:10.3e} "
+              f"{th:7.4f} {0.1*mse:10.3e} {2.47e-07/(0.1*mse):7.3f}   "
+              + "  ".join(f"{c:5.2f}x" for c in cells))
+    print("\n# columns r=... : what the same layer would be worth if the "
+          "analytic\n# layer-mean error were r times smaller.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", required=True,
-                    choices=("eig", "ladder", "quad", "anti"))
+                    choices=("eig", "ladder", "quad", "anti", "summary"))
     ap.add_argument("--mlps", type=int, default=3)
     ap.add_argument("--samples", type=int, default=120_000)
     ap.add_argument("--ref-samples", type=int, default=2_000_000)
@@ -662,9 +785,11 @@ def main():
     ap.add_argument("--official", action="store_true")
     ap.add_argument("--kq", type=int, default=48)
     ap.add_argument("--sketch", default="first",
-                    choices=("first", "mf", "rand"))
+                    choices=("first", "kink", "rand"))
     ap.add_argument("--n-ship", type=int, default=27_000)
     ap.add_argument("--layers", default="1,2,3,4,6,8,12,16,20,24,28,30,31,32")
+    ap.add_argument("--v0", type=float, default=4.06e-07)
+    ap.add_argument("--r-grid", default="1,2,4.4,10,30")
     a = ap.parse_args()
     if a.mode == "eig":
         mode_eig(a.mlps, a.samples, a.seed0, a.official)
@@ -677,6 +802,8 @@ def main():
                   a.sketch)
     elif a.mode == "anti":
         mode_anti(a.mlps, a.samples, a.seed0, a.official, a.n_ship)
+    elif a.mode == "summary":
+        mode_summary(a.v0, [float(v) for v in a.r_grid.split(",")])
 
 
 if __name__ == "__main__":
