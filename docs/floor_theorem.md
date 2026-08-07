@@ -112,3 +112,48 @@ Two consequences, in opposite directions:
 The remaining 72.4% of the variance sits in interactions of order >= 2, which
 bounds how much RQMC can buy: the first-order part can be integrated at a much
 faster rate, the remainder converges at the Monte Carlo rate.
+
+## Theorem (low-order barrier) — why every surrogate family failed
+
+Measured on 12 official MLPs (`scripts/27_anova.py`, three mutually validating
+estimators): first-order ANOVA share `f_1 = 0.276 +- 0.016`, mean ANOVA
+dimension `d_M = sum_d d f_d = 11.5 +- 0.9`.
+
+Therefore the non-additive mass sits at average ANOVA order
+
+    dbar_{>=2} = (d_M - f_1) / (1 - f_1) = (11.5 - 0.276) / 0.724 = 15.5
+
+**Bound.** Let `h` be any surrogate whose ANOVA content is concentrated in
+orders `<= k`. Its maximal correlation with the integrand is
+`rho = sqrt(sum_{d<=k} f_d)`, so the variance reduction from using it as a
+control variate is at most `1 / (1 - sum_{d<=k} f_d)`. For `k = 1`:
+
+    max variance reduction = 1 / (1 - 0.276) = 1.38x
+
+**This retrodicts every measurement in the ledger:**
+
+| mechanism | measured | bound |
+|---|---|---|
+| optimal linear control variate | 1.33x | 1.38x |
+| MLMC over rank-truncated nets | 0.94x | 1.38x |
+| Rao-Blackwell on decided neurons | 1.001x | 1.38x |
+| RQMC (first-order accelerated, rest at MC rate) | pending | 1.38x |
+
+RQMC deserves a word because it is not a control variate: it integrates the
+first-order part at a much faster rate and leaves the remainder at the Monte
+Carlo rate, so its asymptotic variance is `(1 - f_1) sigma^2 / N` — the SAME
+1.38x ceiling, reached from a different direction. A 1.5x bar is therefore
+unreachable, and this is a prediction made before the measurement lands.
+
+**Constructive content.** A surrogate that helps must itself carry ANOVA mass at
+order ~15. Exactly two objects do:
+
+1. **The network itself.** Measured: coupling `rho >= 0.975` needs `r = 251` of
+   256, at 1.96x the dense cost. Self-defeating (`docs/mlmc.md`).
+2. **A learned map fitted to the weight -> mean relation.** Not built from
+   low-order structure, so not subject to the bound. Training and offline
+   precomputation are unbounded and load at zero cost at grade time, and the
+   submission may carry 50 MiB (~13M float32 parameters).
+
+Route 2 is the only family the barrier does not close, and the competition
+forum independently reports an offline corrector among the mechanisms that work.
