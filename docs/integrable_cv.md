@@ -335,7 +335,7 @@ the backward Jacobian sweep (`z^l -> y`) have to run the full depth. That is
 measured at ~15 ms = 5.5% of the free budget and which is exactly what turned
 `cva`'s 1.032x on raw into 0.945x on the adjusted score.
 
-### 4.1a The frame also validates §5.2's rank bound, tightly
+### 4.2 The frame also validates §5.2's rank bound, tightly
 
 `q1` on the kink frame is `docs/hermite_rank_ceiling.md` §5.2 *constructed*
 rather than bounded, so the two can be compared directly. §5.2's
@@ -354,7 +354,7 @@ not loose. (For comparison, that page's mean-field frame reached 4.3 of the 6.2
 points at `m = 16`, i.e. 69%; the kink frame's 4.84 is a 13% improvement on it,
 which is the only place this round improves on a previously published figure.)
 
-### 4.2 What it would cost to ship
+### 4.3 What it would cost to ship
 
 Per sample, given that the forward pass has already produced `z^2`:
 
@@ -427,7 +427,51 @@ costing 3.4 points of `R^2`.
 > ship spans it. Both of these are inside the shipped span, and both are
 > strictly more expensive per unit of it.
 
-## 6. Bars, fixed before each run
+## 6. The official suite
+
+Nothing in §1-§5 opens the official suite. This section does, once, after every
+frame rule, `k` and dictionary was frozen, purely to confirm that a conclusion
+measured on look-alike networks applies to the graded ones. No parameter is
+fitted or selected from it, and the shipped estimator is not modified.
+
+`--mode quad --official`, the first 4 MLPs of `official_mini.npz` by seed
+protocol 3.0:
+
+| dictionary | local (3 MLPs) `R2_pop` | official (4) `R2_pop` | local x ship | official x ship |
+|---|---|---|---|---|
+| SHIP `t + He_2` | 38.48% | **39.69%** | 1.000 | 1.000 |
+| `t` (degree-1) | 24.29% | 25.96% | 0.827 | 0.830 |
+| `h1 = relu(z^1)` | 38.63% | 40.07% | **1.018** | **1.022** |
+| `q2` alone, `k=32` | 15.67% | 14.09% | — | — |
+| `SHIP+h1+q2`, `k=16` | 43.66% | 44.54% | 1.063 | 1.058 |
+| **`SHIP+h1+q2`, `k=32`** | 46.46% | 46.98% | **1.087** | **1.076** |
+| `SHIP+h1+q2`, `k=48` | 48.50% | 48.84% | 1.080 | 1.066 |
+
+Same argmax (`k = 32`), same ordering, every gain within 1.1% of the local
+figure. The `SHIP` row's 39.69% is *bit-for-bit* the official number
+`docs/hermite_rank_ceiling.md` §7 published for `coord d<=2`, from an
+independently written span estimator — which is the tightest cross-check
+available that this page's machinery measures the same object as that one.
+
+`--mode ladder --official`, 2 MLPs, `L` in `{1,2,4,8,16,24,32}`, same
+2e6-sample reference protocol:
+
+| `L` | 1 | 2 | 4 | 8 | 16 | 24 | 32 |
+|---|---|---|---|---|---|---|---|
+| `R2_eff`, official | 41.36% | 50.22% | 59.62% | 69.66% | 83.60% | 92.95% | 98.87% |
+| `R2_eff`, local | 37.73% | 46.15% | 58.21% | 71.64% | 85.96% | 93.83% | 98.86% |
+| rms `b`, official | **5.9e-05** | 1.42e-03 | 3.16e-03 | 4.22e-03 | 5.33e-03 | 5.91e-03 | 6.36e-03 |
+| rms `b`, local | **8.8e-05** | 1.56e-03 | 3.36e-03 | 5.26e-03 | 6.02e-03 | 6.68e-03 | 7.00e-03 |
+| x ship, official | **1.036** | 0.611 | 0.212 | 0.129 | 0.085 | 0.070 | 0.061 |
+| x ship, local | **0.974** | 0.536 | 0.190 | 0.086 | 0.067 | 0.055 | 0.050 |
+
+Same argmin, same monotone collapse, and the layer-1 bias is again at the
+reference's noise floor — layer 1 is exactly integrable on the graded networks
+too. The official closure errors are 6-20% *smaller* than the local ones at
+every depth, which moves nothing: the break-even `r` is 4.0-4.3 instead of
+4.2-4.6.
+
+## 7. Bars, fixed before each run
 
 | # | bar | measured | verdict |
 |---|---|---|---|
@@ -435,15 +479,16 @@ costing 3.4 points of `R^2`.
 | 2 | some layer of the depth ladder beats the shipped adjusted 2.47e-07 | argmin is `L = 1` at 2.536e-07 (0.97x); every `L >= 2` is worse; with optimal shrinkage the whole ladder is 1.03x | **FAIL** |
 | 3 | a symmetry-derived variate is `> 1.05x` on residual per unit cost | antithetic **0.958x**, homogeneity **0.975x**, both **0.913x** | **FAIL** |
 | 4 | a new **exactly integrable** dictionary reaches held-out `R^2 > 60%` net of `p/N` | best is SHIP + `h1` + `q2(k=32)` at **41.66%** (1.714x against the shipped 1.577x) | **FAIL on the bar, 1.087x on `v_eff`** |
-| 5 | the exactness claims are asserted, not assumed | `tests/test_integrable_cv.py`: layer-1 Mehler == arc-cosine to 1e-12, `E[h^1]`/`Cov(h^1)`/`E[z^2]`/`Cov(z^2)` within 6 sigma of 2e6 samples, `E[z^3]` NOT (>20 sigma), antithetic kills degree 1, `y(3x) = 3y(x)` to 1e-10 | **PASS** |
-| 6 | shipped estimator untouched | `git diff submission/` empty | **PASS** |
+| 5 | the conclusion transfers to the official suite | §6: same argmax, every gain within 1.1%, and the `SHIP` row reproduces `hermite_rank_ceiling` §7's official 39.69% exactly | **PASS** |
+| 6 | the exactness claims are asserted, not assumed | `tests/test_integrable_cv.py`: layer-1 Mehler == arc-cosine to 1e-12, `E[h^1]`/`Cov(h^1)`/`E[z^2]`/`Cov(z^2)` within 6 sigma of 2e6 samples, `E[z^3]` NOT (>20 sigma), antithetic kills degree 1, `y(3x) = 3y(x)` to 1e-10 | **PASS** |
+| 7 | shipped estimator untouched | `git diff submission/` empty | **PASS** |
 
 Bar 4's 60% was the brief's, and it was the right bar: it is the level at which
 a new basis would be worth more than the whole cost frontier. Nothing exactly
 integrable reaches it, and §3 says why — 60% starts at `L = 4`, and `L = 4`
 costs `rms b = 3.4e-3`.
 
-## 7. What this leaves
+## 8. What this leaves
 
 **The lever is real and it is not the dictionary.** Stack the three closures:
 

@@ -83,6 +83,11 @@ every sparse-correction scheme — see `docs/sparse_sign_stable.md`.
 | **dropping the 13 measured-1.000× head columns** | **1.016× adjusted** (1.035× at 3× residual), free | **shipped** | `28`, `30` |
 | **high-degree Hermite CVs on adapted directions** | whole family `R² = 43.2%` vs a 0.75 bar; shipped `k ≤ 2` already has 39.2% | **dead** | `32` |
 | **adapted degree-1 CV** (24–48 mean-field directions) | 1.371× at unit coefficient vs 1.328× — but +0.002× inside the head, and 0.945× adjusted | **dead** | `28`, `32` |
+| **linear CV in the layer-`L` activations** (the 90%-explaining functions) | `R² = 86%` at `L=16`, `98.9%` at `L=32`, free — but the analytic mean is wrong by `rms 7e-3` and the whole ladder is **1.03×** | **dead — `E[g]`, not the basis** | `41` |
+| **antithetic `x → −x`** (kills every odd Hermite degree, exactly) | 1.077× on raw variance, **0.958×** composed with the shipped CV | **dead** | `41` |
+| **radial Rao-Blackwell** from exact positive homogeneity | 1.038× on raw variance, **0.975×** composed | **dead** | `41` |
+| **`relu(z¹)` in place of `He₂`** (256 features, exact mean) | **1.018×** on `v_eff`, free | live, not integrated | `41` |
+| **degree-2 in `z²` on the kink frame** (exact mean via arc-cosine) | **1.087×** on `v_eff` for 0.65% of `c`; frame costs ~60 dispatches | live, not integrated | `41` |
 
 ### Why sign-stable sparsity mostly does not work (`docs/sparse_sign_stable.md`)
 
@@ -272,6 +277,41 @@ stops.
    only if its `v_eff` matches ours, and a sampler that cheap has `b² ≥
    3.8e-6`, 89,000× its measured raw. It is a better `v_eff` or a
    deterministic estimator, not a cheaper sampler.
+
+6. ~~**A control-variate basis that is both expressive and exactly
+   integrable.**~~ **Closed** — `docs/integrable_cv.md`. The `hermite_rank_ceiling`
+   §5.3 bound that motivated it (top-8 eigenfunctions of `Cov(y)` reach 90.1%)
+   is a **tautology**: that operator's eigenfunctions are linear combinations
+   of the centred outputs themselves, so "90.1% at `p = 8`" says only that
+   `Cov(y)` has effective rank 8, and their means are zero because `E[y]` was
+   subtracted. Measured, those eigenfunctions are 51.4% degree `≤ 2` in `x`,
+   and the whole degree-`≤2` space is `f₁+f₂ = 45.6%` for 32,896 coefficients.
+
+   The 90% *is* nonetheless reachable and free — a linear CV in `relu(z^L)`
+   gets 86% at `L = 16` and 98.9% at `L = 32`, on features the forward pass
+   already computed. What kills it is `E[g]`. `z¹` is exactly Gaussian, so
+   layer 1 (and hence `E[z²]`, `Cov(z²)`) is exactly integrable and everything
+   deeper is not: measured bias `rms 1.6e-3` at `L = 2` rising to `7.0e-3` at
+   `L = 32`, against a sampling term that only ever buys `4.06e-7`. With the
+   optimal shrinkage `θ* = D/(D+b²)` on the biased correction, **the entire
+   ladder from `L = 2` to `L = 32` is worth 1.03×** and `θ*` is 0.05.
+
+   The forward-looking number is one scalar: the factor `r` by which the
+   analytic layer-mean accuracy would have to improve to break even is
+   **4.2–4.6 at every depth from 6 to 32**, and past it the payoff is
+   1.91× at `r = 4.4`, 5.4× at `r = 10`, 25× at `r = 30`. Today's Gaussian
+   closure is `r = 1`, this repo's κ₃ arm is `r ≈ 1.45`, and `scripts/11`'s
+   exact-cumulant oracle tops out at `r ≈ 2.9`. **So the control-variate
+   question reduces to the closure-accuracy question**, which is
+   `docs/floor_theorem.md`'s programme, not a new one.
+
+   What survives is small and exact: `relu(z¹)` in place of `He₂` (1.018×, 256
+   features instead of 512) and a degree-2 block in `z²` on the kink frame
+   (1.087× on `v_eff`, 0.65% of `c` per sample, exact mean from the
+   arc-cosine kernel). Both are implemented in `whestfloor/corrector.py`
+   (`layer12_moments`, `kink_frame`, `relu1_cv`, `quad2_cv`) and neither is
+   wired in: the `q2` frame needs the same ~60-dispatch sweep that made `cva`
+   a net loss.
 
 ## Where this leaves the board
 

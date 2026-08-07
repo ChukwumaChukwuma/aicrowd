@@ -75,10 +75,15 @@ INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
 CHUNK = 2048
 
 
+def load_official_seeds():
+    """Seed protocol 3.0 on the held-out suite, same accessor as scripts/32."""
+    from whestfloor.suite import Suite  # noqa: PLC0415
+    return list(Suite.load(ART / "suites" / "official_mini.npz").mlp_seeds)
+
+
 def mlp_weights(k: int, base: int, official: bool = False):
     if official:
-        from whestfloor.official_seeds import OFFICIAL_SEEDS  # noqa: PLC0415
-        seed = OFFICIAL_SEEDS[k]
+        seed = int(load_official_seeds()[k])
         return seed, make_official_mlp(WIDTH, DEPTH, seed)
     seed = base + k
     return seed, make_mlp(WIDTH, DEPTH, seed)
@@ -472,8 +477,8 @@ def kink_frames(W, mz, Cz, kq):
     than bounded.  Returned in x-space (for the He_2 block) and in
     ``z^2``-space (for the layer-1-activation quadratic block).
     """
-    n = WIDTH
     dep = len(W)
+    n = W[0].shape[1]
     g = [Phi(mz[l] / np.sqrt(np.maximum(np.diag(Cz[l]), 1e-30)))
          for l in range(dep)]
     s = [np.sqrt(np.maximum(np.diag(Cz[l]), 1e-30)) for l in range(dep)]

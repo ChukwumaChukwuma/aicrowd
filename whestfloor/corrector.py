@@ -282,6 +282,183 @@ def adapted_cv(x, y, Q, split: bool = True):
     return 0.5 * ((y[:h].T @ wa) / h + (y[h:].T @ wb) / (n - h))
 
 
+# ---------------------------------------------------------------------------
+# ROUND 12: the exactly-integrable blocks (docs/integrable_cv.md).
+#
+# ``z^1 = x W^1`` is exactly ``N(0, W^1'W^1)``, so ``E[relu(z^1)]`` is closed
+# form and ``Cov(relu(z^1))`` is the arc-cosine kernel -- which makes
+# ``E[z^2]`` and ``Cov(z^2)`` exact too.  Those are the LAST exact objects in
+# the network (``tests/test_integrable_cv.py`` pins layer 3 as not exact, at
+# >20 sigma of 2e6 samples).  The two control variates below live entirely
+# inside that region, so their means carry no bias at all.
+#
+# Measured on 3 local MLPs, held out, net of ``p/N`` at ``N = 27000``
+# (``scripts/41_integrable_cv.py --mode quad``):
+#
+#     shipped t + He_2                      R^2_eff 36.58%   1.577    1.000x
+#     relu1_cv alone (256 features)                 37.68%   1.605    1.018x
+#     shipped + relu1 + quad2(k=32)                 41.66%   1.714    1.087x
+#
+# NOT wired into ``FEATURES``: the ``quad2`` frame needs ~60 flopscope
+# dispatches (see :func:`kink_frame`), which is the same tax that made ``cva``
+# a net loss, and the integration decision belongs with whoever is tuning
+# ``N`` against the grader.
+# ---------------------------------------------------------------------------
+def layer12_moments(weights):
+    """``(mh1, Ch1, m2, C2)`` -- the exact layer-1 and layer-2 moments.
+
+    ``x ~ N(0, I)`` exactly, so with ``S = W^1' W^1`` and ``s = sqrt(diag S)``:
+
+        E[relu(z^1_i)]                = s_i / sqrt(2 pi)                exact
+        Cov(relu(z^1_i), relu(z^1_j)) = arc-cosine kernel of S_ij/s_i s_j
+        E[z^2] = W^2' E[relu(z^1)],  Cov(z^2) = W^2' Cov(relu(z^1)) W^2
+
+    all in closed form.  ``O(n^2)`` elementwise work plus two ``n^3`` matmuls.
+    """
+    from .relu_moments import relu_cov_exact_centered, relu_var  # noqa: PLC0415
+    W1 = np.asarray(weights[0], dtype=np.float64)
+    W2 = np.asarray(weights[1], dtype=np.float64)
+    S = W1.T @ W1
+    s = np.sqrt(np.maximum(np.diag(S), VAR_FLOOR))
+    mh1 = s * INV_SQRT_2PI
+    Ch1 = relu_cov_exact_centered(S, s)
+    np.fill_diagonal(Ch1, relu_var(np.zeros_like(s), s))
+    return mh1, Ch1, W2.T @ mh1, W2.T @ Ch1 @ W2
+
+
+def kink_frame(weights, mz, Cz, k: int):
+    """Top-``k`` directions of the degree-2 chaos, in ``z^2`` coordinates.
+
+    ``docs/hermite_rank_ceiling.md`` sec 5.2: the degree-2 chaos of a ReLU
+    network is carried entirely by its kink surfaces, neuron ``(l,i)``
+    contributing a rank-one term along its own normal ``n_li = grad z^l_i``
+    with weight ``E[delta(z^l_i)] dy_j/dz^l_i``.  The weighted second-moment
+    matrix of all 8,192 of them,
+
+        Q = sum_{l,i} (phi(alpha_li)/s_li)^2 ||R^l[i,:]||^2 nhat_li nhat_li'
+
+    (``R^l`` the mean-field Jacobian from layer ``l`` to the output), has as its
+    top eigenvectors the best *shared* frame for a degree-2 dictionary.
+    Measured, it reaches 78-85% of sec 5.2's every-subspace-at-once bound at
+    every ``m``, against 69% for the mean-field frame at ``m = 16``.
+
+    ``mz``/``Cz`` are the Gaussian-closure pre-activation moments per layer;
+    only ``alpha = m/s`` and ``s`` enter, and only through the *weight*, so
+    closure error here costs frame quality and never bias.
+
+    **Cost warning.** The kink weight lives at the deep end -- layers 21-32
+    carry 87% of it -- so ``Q`` needs the forward normal recursion AND the
+    backward Jacobian sweep over the full depth: ~60 flopscope dispatches,
+    ~15 ms, i.e. ~5.5% of the free budget (``hermite_rank_ceiling`` sec 9.4).
+    Without the adapted frame the block is worth 1.004x instead of 1.087x, so
+    this cost is not optional; it is the mechanism.
+    """
+    from .relu_moments import phi as _phi  # noqa: PLC0415
+    dep = len(weights)
+    n = weights[0].shape[1]
+    Wf = [np.asarray(w, dtype=np.float64) for w in weights]
+    s = [np.sqrt(np.maximum(np.diag(Cz[l]), VAR_FLOOR)) for l in range(dep)]
+    al = [mz[l] / s[l] for l in range(dep)]
+    g = [norm_cdf(al[l]).astype(np.float64) for l in range(dep)]
+    R = [None] * dep
+    R[dep - 1] = np.diag(g[dep - 1])
+    for l in range(dep - 2, -1, -1):
+        R[l] = g[l][:, None] * (Wf[l + 1] @ R[l + 1])
+    Q = np.zeros((n, n))
+    Ml = None
+    for l in range(dep):
+        w = (_phi(al[l]) / s[l]) ** 2 * np.sum(R[l] * R[l], axis=1)
+        if Ml is not None:
+            B = Ml / np.maximum(np.linalg.norm(Ml, axis=0), 1e-30)
+            Q += (B * w) @ B.T
+        if l + 1 < dep:
+            Ml = np.eye(n) if l + 1 == 1 else (Ml * g[l]) @ Wf[l + 1]
+    return np.linalg.eigh(Q)[1][:, ::-1][:, :k]
+
+
+def relu1_cv(h1, y, mh1, Ch1, split: bool = True, jitter: float = 1e-6):
+    """Control variate on ``relu(z^1)`` itself -- 256 features, exact mean.
+
+    ``E[relu(z^1_i)] = sigma_i/sqrt(2 pi)`` exactly and the Gram is the
+    ANALYTIC arc-cosine matrix, so nothing but ``Cov(feature, y)`` is
+    estimated.  This is a *replacement* for the shipped ``t`` + ``He_2`` pair,
+    not an addition: measured 1.018x with half the coefficients, and 0.9997x
+    when stacked on top of them.  ``relu`` mixes Hermite degrees 1 and 2 in the
+    ratio 73.4 : 23.4 of its own variance, which is close to what this target
+    wants, so one feature per direction does what two were doing.
+
+    ``Ch1`` inherits the conditioning of ``W^1' W^1`` (~1e8 at this shape), so
+    the solve is float64 with a relative diagonal jitter; a float32 solve here
+    would lose the answer, exactly as :data:`GRAM_JITTER` notes for ``rho``.
+    """
+    n = h1.shape[0]
+    G = np.array(Ch1, dtype=np.float64, copy=True)
+    G[np.diag_indices_from(G)] += jitter * float(np.trace(G)) / len(G)
+    gg = np.asarray(h1, dtype=np.float64) - mh1
+    return _cv_from_gram(gg, y, G, split)
+
+
+def quad2_cv(z2, y, m2, C2, A2, split: bool = True):
+    """Degree-2 control variate in the layer-1 ACTIVATIONS, exact mean.
+
+    Features ``v_a v_b - (A2' C2 A2)_ab`` with ``v = (z^2 - m^2) A2``.  Because
+    ``Cov(z^2)`` is exact (:func:`layer12_moments`), every feature is exactly
+    mean zero -- and ``z^2`` is already on hand from the forward pass, so the
+    marginal cost is ``k n 2 + k(k+1)/2`` multiplies a sample (1.9e4 FLOPs at
+    ``k = 32``, 0.65% of the scored pass).
+
+    The Gram is taken from Wick on the exact ``Cov(z^2)``,
+    ``Cov(v_av_b, v_cv_d) = C_ac C_bd + C_ad C_bc``, which assumes ``z^2``
+    Gaussian.  It is not, but **that approximation costs efficiency and never
+    bias**: the mean of every feature is exact regardless of the Gram, and a
+    wrong Gram only mis-weights the correction.  Avoiding it would need an
+    ``N p^2`` covariance pass, which at ``p = 528`` is 2.8% of the whole FLOP
+    budget -- 40x what the features themselves cost.
+
+    This block is not bounded by the two ceilings that closed everything else:
+    ``relu(z_i) relu(z_j)`` is not a polynomial so it escapes
+    ``f_1 + f_2 = 45.6%``, and it is not rank-one at degree 2 so it escapes
+    ``docs/hermite_rank_ceiling.md`` sec 5.  Measured 15.7% alone at ``k = 32``
+    and 1.087x in combination.
+    """
+    k = A2.shape[1]
+    Cv = A2.T @ np.asarray(C2, dtype=np.float64) @ A2
+    v = (np.asarray(z2, dtype=np.float64) - m2) @ A2
+    iu, ju = np.triu_indices(k)
+    gg = v[:, iu] * v[:, ju] - Cv[iu, ju]
+    G = (Cv[np.ix_(iu, iu)] * Cv[np.ix_(ju, ju)]
+         + Cv[np.ix_(iu, ju)] * Cv[np.ix_(ju, iu)])
+    return _cv_from_gram(gg, y, G, split)
+
+
+def _cv_from_gram(gg, y, G, split: bool):
+    """``c_j = Cov(y_j, g' G^-1 gbar)``, split-sample so it is unbiased.
+
+    Shared by :func:`relu1_cv` and :func:`quad2_cv`.  ``G`` is the ANALYTIC
+    Gram, so the only estimated quantity is the covariance with the target and
+    the ``Cov(g' G^-1 g, y)/N`` self-term of the one-pass form is removed by
+    the two-half split exactly as in :func:`hermite_cv`.
+    """
+    n = len(gg)
+    ev, V = np.linalg.eigh(G)
+    ev = np.maximum(ev, 1e-12 * max(float(ev.max()), 1e-300))
+
+    def _w(block, d):
+        u = V @ ((V.T @ d) / ev)
+        w = block @ u
+        return w - np.mean(w)
+
+    if not split:
+        return (np.asarray(y, dtype=np.float64).T
+                @ _w(gg, np.mean(gg, axis=0))) / n
+    h = n // 2
+    g1, g2 = gg[:h], gg[h:]
+    d1, d2 = np.mean(g1, axis=0), np.mean(g2, axis=0)
+    y = np.asarray(y, dtype=np.float64)
+    return 0.5 * ((y[:h].T @ _w(g1, d2)) / h
+                  + (y[h:].T @ _w(g2, d1)) / (n - h))
+
+
 def feature_columns(f) -> dict:
     """Every named column, from the primitives.
 

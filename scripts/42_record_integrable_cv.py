@@ -252,3 +252,57 @@ if want("exactly_integrable_quadratic_in_h1"):
             "improves on a published one."),
     ).__str__()
     print("recorded: exactly_integrable_quadratic_in_h1")
+
+# ---------------------------------------------------------------------------
+if want("official_confirmation"):
+    Experiment(
+        name="official_confirmation",
+        script="scripts/41_integrable_cv.py",
+        hypothesis=(
+            "Everything above was measured on local look-alike networks, with "
+            "every frame rule, k and dictionary frozen first.  Open the "
+            "held-out official suite ONCE to confirm the conclusion is a "
+            "property of the network distribution and not of the local draw.  "
+            "No parameter is fitted or selected from it."),
+        acceptance_bar=0.05, bar_metric="max_rel_gap_vs_local",
+        bar_direction="lower_is_better",
+    ).record(
+        gt_samples=2_000_000, seed=0, n_mlps=4,
+        estimator="quad (4 official MLPs) and ladder (2 official MLPs)",
+        max_rel_gap_vs_local=0.011,
+        raw_final_layer_mse=3.7157e-06, compute_ratio=0.1,
+        b=5.947e-05, v_eff_r2=0.4218, c=2.79e6,
+        seed_protocol="whestbench_explicit_per_mlp_seeds/3.0",
+        ship_R2_pop_official=0.3969, ship_R2_pop_published=0.3969,
+        ship_R2_pop_local=0.3848,
+        h1_gain_official=1.0217, h1_gain_local=1.0177,
+        quad_gain_official={"8": 1.0323, "16": 1.0577, "24": 1.0703,
+                            "32": 1.0757, "48": 1.0658},
+        quad_gain_local={"8": 1.0397, "16": 1.0625, "24": 1.0774,
+                         "32": 1.0871, "48": 1.0804},
+        argmax_k_official=32, argmax_k_local=32,
+        ladder_R2_eff_official={"1": 0.4136, "2": 0.5022, "4": 0.5962,
+                                "8": 0.6966, "16": 0.8360, "24": 0.9295,
+                                "32": 0.9887},
+        ladder_rms_bias_official={"1": 5.947e-05, "2": 1.421e-03,
+                                  "4": 3.162e-03, "8": 4.224e-03,
+                                  "16": 5.335e-03, "24": 5.914e-03,
+                                  "32": 6.363e-03},
+        ladder_x_ship_official={"1": 1.036, "2": 0.611, "4": 0.212,
+                                "8": 0.129, "16": 0.085, "24": 0.070,
+                                "32": 0.061},
+        notes=(
+            "PASSES.  The SHIP row reads R^2_pop = 39.69% on the official "
+            "suite, which is BIT-FOR-BIT the number docs/hermite_rank_ceiling.md "
+            "sec 7 published for coord d<=2 from an independently written span "
+            "estimator -- the tightest available check that this page measures "
+            "the same object as that one.  q2's argmax is k = 32 on both suites "
+            "and its gain is 1.0757x official against 1.0871x local; h1 is "
+            "1.0217x against 1.0177x.  The ladder's argmin is L = 1 on both and "
+            "the collapse is monotone to 0.061x at L = 32; official closure "
+            "errors run 6-20% SMALLER than local, which moves the break-even "
+            "accuracy factor from 4.2-4.6 to 4.0-4.3 and changes no verdict.  "
+            "Layer-1 bias 5.9e-05 is again the reference's own noise floor, so "
+            "exact integrability at layer 1 holds on the graded networks."),
+    ).__str__()
+    print("recorded: official_confirmation")

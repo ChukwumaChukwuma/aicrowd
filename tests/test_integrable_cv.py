@@ -136,6 +136,64 @@ def test_shrinkage_optimum_matches_the_closed_form():
         assert abs((base - f(D / (D + b2))) - D * D / (D + b2)) < 1e-14
 
 
+def test_corrector_blocks_match_the_research_script():
+    """``whestfloor.corrector``'s round-12 blocks are the measured ones.
+
+    ``docs/integrable_cv.md`` sec 4's numbers come from
+    ``scripts/41_integrable_cv.py``; the deployable copies in
+    :mod:`whestfloor.corrector` must be the same objects or the page stops
+    describing what an integrator would ship.
+    """
+    from whestfloor import corrector as C
+
+    W = _mlp()
+    mz, Cz, mh, Ch = ICV.analytic_moments(W)
+    mh1, Ch1, m2, C2 = C.layer12_moments(W)
+    assert np.max(np.abs(mh1 - mh[0])) < 1e-14
+    assert np.max(np.abs(Ch1 - Ch[0])) < 1e-14
+    assert np.max(np.abs(m2 - mz[1])) < 1e-13
+    assert np.max(np.abs(C2 - Cz[1])) < 1e-13
+
+    A = C.kink_frame(W, mz, Cz, 8)
+    Ak = ICV.kink_frames(W, mz, Cz, 8)[1]
+    assert np.max(np.abs(A.T @ A - np.eye(8))) < 1e-12
+    # same subspace, up to the sign of each eigenvector
+    assert np.max(np.abs(np.abs(A.T @ Ak) - np.eye(8))) < 1e-9
+
+
+def test_quad2_features_are_exactly_mean_zero():
+    """The whole point: ``E[v_a v_b] = (A2' Cov(z^2) A2)_ab`` with no model.
+
+    A biased control variate would show up here as a systematic offset; the
+    check is against Monte-Carlo error, at 2e6 samples, on every one of the
+    ``k(k+1)/2`` features at once.
+    """
+    from whestfloor import corrector as C
+
+    W = _mlp()
+    mz, Cz, _, _ = ICV.analytic_moments(W)
+    _, _, m2, C2 = C.layer12_moments(W)
+    A = C.kink_frame(W, mz, Cz, 8)
+    Cv = A.T @ C2 @ A
+    iu, ju = np.triu_indices(8)
+    rng = np.random.default_rng(7)
+    M, s1, s2 = 2_000_000, 0.0, 0.0
+    done = 0
+    while done < M:
+        m = min(20000, M - done)
+        x = rng.standard_normal((m, N))
+        z2 = np.maximum(x @ W[0], 0.0) @ W[1]
+        v = (z2 - m2) @ A
+        g = v[:, iu] * v[:, ju] - Cv[iu, ju]
+        s1 += g.sum(0)
+        s2 += np.einsum("ij,ij->j", g, g)
+        done += m
+    mean = s1 / M
+    sd = np.sqrt(np.maximum(s2 / M - mean * mean, 1e-300))
+    z = np.abs(mean) / (sd / math.sqrt(M))
+    assert np.max(z) < 6.0, (np.max(z), np.argmax(z))
+
+
 if __name__ == "__main__":
     fails = 0
     for nm, fn in sorted(globals().items()):
