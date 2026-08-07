@@ -187,14 +187,49 @@ TAU = 2.5
 #: 1.241x against 8500.  The minimum is broad and the grader carries ~2% of
 #: run-to-run noise (28000 and 31000 invert), so 20000-25000 is the flat
 #: region and 22000 is its centre rather than a sharp argmin.
-N_SAMPLES = 22000
+#:
+#: RAISED to 27000 together with ``N_PILOT``, because what pinned that argmin
+#: was the bias floor and the bias floor was the PILOT (see ``N_PILOT``).  With
+#: ``P = 600`` the floor is unmeasurable and the N curve goes flat out to
+#: ~50000; 27000 is chosen well inside that flat region rather than at its far
+#: end, for two reasons that are both about ``lambda R`` rather than FLOPs:
+#: past ~35000 the ``(N, |keep|)`` sample array stops fitting in cache and the
+#: billed residual jumps 3x on this box (36 ms at 32000, 99 ms at 38000,
+#: 153 ms at 45000, for identical FLOPs), and the cache size of the grader's
+#: box is not something we can measure.  Chunking the scored pass removes that
+#: cliff entirely -- measured, 10x less residual at N = 45000 for bit-identical
+#: FLOPs -- and is the prerequisite for going further.
+N_SAMPLES = 27000
 
 #: Pilot samples.  A short DENSE pass doing three jobs at once: it supplies
 #: ``alpha`` (which the threshold needs), the frozen constants for the pruned
-#: neurons, and the depth-1 unscored filler rows.  150 is the ROBUST choice:
-#: P = 80/100/150/250 land within 3%, P = 600 is clearly worse because the
-#: pilot then eats the samples it was meant to improve.
-N_PILOT = 150
+#: neurons, and the depth-1 unscored filler rows.
+#:
+#: 150 was chosen when N was 8500, on a sweep that found P = 80/100/150/250
+#: within 3% of each other.  That sweep could not see what matters now,
+#: because at N = 8500 the pilot's contribution was 5% of the error and the
+#: sweep's own noise was larger.  **The pilot's Monte-Carlo error is the bias
+#: floor of the whole estimator**: the frozen dead-neuron constants and the
+#: mask are both functions of the pilot draw alone, so their error does NOT
+#: shrink with N.  Fitting ``raw = b^2 + v_eff/N`` over N = 8500/22000/45000
+#: on 400 generated MLPs (200 held out):
+#:
+#:      P     b^2         raw @ 22000   raw @ 45000   head gain @ 45000
+#:      150   2.10e-07    1.5542e-06    7.7428e-07    1.490x
+#:      600   < 0         1.4862e-06    6.8433e-07    1.601x
+#:
+#: i.e. at P = 600 the floor is gone -- the two-point fit returns a NEGATIVE
+#: b^2, meaning the measurements are consistent with pure 1/N -- and the
+#: penalty P = 150 was paying grows with N exactly as an N-independent error
+#: must: 4.4% at N = 22000, 11.6% at N = 45000.
+#:
+#: The mechanism is specific and it is why the old sweep's intuition ("the
+#: pilot eats the samples it was meant to improve") pointed the wrong way: a
+#: DEAD neuron fires on ~0.6% of draws, so its P = 150 sample mean of
+#: ``relu(z)`` averages about one nonzero observation and carries ~100%
+#: relative error.  600 samples cost 1.9e9 FLOPs, 0.7% of the budget and 2.5%
+#: of C at this N -- against 4.4% of raw MSE bought back.
+N_PILOT = 600
 
 #: Highest Hermite order used by the layer-1 control variate.  k=3 adds ~2%
 #: of explained variance against 3.0% of estimation noise, so it loses.

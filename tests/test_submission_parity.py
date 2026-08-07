@@ -274,13 +274,16 @@ def test_submission_contract():
     # happen, and it is the only thing asserted here.
     assert C <= 272_000_000_000, f"effective compute {C:.3e} exceeds the budget"
     # Crossing FREE_COMPUTE is NOT a failure -- above it the multiplier grows
-    # linearly. But FLOPs are machine-independent and residual wall time is
-    # not, so the FLOP-only ratio is what we pin: it must leave room for the
-    # grader's residual, billed at 1e11 FLOP/s on one physical core.
+    # linearly, and the graded N sweep showed the optimum is at C/B ~ 0.2-0.3,
+    # well past the 0.1 clamp. What still has to hold is a MARGIN under the
+    # hard cap, because F is machine-independent while R is not: the grader's
+    # residual is billed at 1e11 FLOP/s on one physical core and we cannot
+    # measure its box. Half the budget leaves room for a residual three times
+    # this box's worst case before anything is zeroed.
     flop_ratio = ctx.flops_used / 272_000_000_000
-    assert flop_ratio <= 0.10, (
-        f"FLOPs alone are {flop_ratio:.3f} of budget, leaving no headroom "
-        f"for grader residual")
+    assert flop_ratio <= 0.50, (
+        f"FLOPs alone are {flop_ratio:.3f} of budget, leaving too little "
+        f"margin under the hard cap for the grader's residual")
 
 
 def test_submission_size_limits():
