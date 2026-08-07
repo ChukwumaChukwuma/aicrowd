@@ -314,6 +314,26 @@ def mode_anatomy(args) -> int:
             c = np.cumsum(c) / c.sum()
             cum[nm] = [float(c[j - 1]) for j in (1, 2, 4, 8, 16, 32, 64, 256)]
 
+        # (c) the readout form itself, with the strongest oracle possible:
+        #     give EVERY neuron its own optimal K-cell 1-D mixture, aligned to
+        #     its own pre-activation.  No shared mixture can do this -- one
+        #     partition has to serve all 256 neurons at once -- so if this is
+        #     small the obstruction is the sharing, and if it is large the
+        #     readout form  sum_k w_k relu_mean(m_k, s_k)  is itself the wall.
+        perneuron = {}
+        Zs = np.sort(Zd, axis=0)
+        c1 = np.concatenate([np.zeros((1, 256)), np.cumsum(Zs, axis=0)])
+        c2 = np.concatenate([np.zeros((1, 256)), np.cumsum(Zs * Zs, axis=0)])
+        N = Zd.shape[0]
+        for Kc in (2, 4, 6, 16, 64):
+            e = np.linspace(0, N, Kc + 1).astype(np.int64)
+            cnt = (e[1:] - e[:-1]).astype(np.float64)[:, None]
+            mc = (c1[e[1:]] - c1[e[:-1]]) / cnt
+            vc = np.maximum((c2[e[1:]] - c2[e[:-1]]) / cnt - mc * mc, 1e-30)
+            pred = (cnt * relu_mean(mc, np.sqrt(vc))).sum(axis=0) / N
+            perneuron[Kc] = float(np.mean((pred - truth) ** 2))
+        del Zs, c1, c2
+
         # (b) participation ratios
         pr_var = float(ev.sum() ** 2 / (ev ** 2).sum())
         T = (Zd - m0) @ U
@@ -336,6 +356,7 @@ def mode_anatomy(args) -> int:
             "err_cum_share_chain": cum["chain"],
             "rms_oracle": float(np.sqrt(np.mean(err_oracle ** 2))),
             "rms_chain": float(np.sqrt(np.mean(err_chain ** 2))),
+            "per_neuron_oracle_mse": {str(k): v for k, v in perneuron.items()},
         }
         out["mlps"].append(rec)
         print(f"  seed {seed}: PR(var)={pr_var:.1f}  top1 var share="
@@ -361,6 +382,14 @@ def mode_anatomy(args) -> int:
     print(f"  participation ratio of |skewness|          {avg('pr_abs_skew'):.1f}")
     print(f"  top-1 eigendirection: share of variance    {avg('ev_top1_share'):.3f}")
     print(f"  top-1 eigendirection: share of |kurtosis|  {avg('kurt_top1_share'):.3f}")
+    print()
+    print("# premise (c): is the READOUT FORM the wall, or is it the sharing?")
+    print("#   every neuron given its own optimal K-cell 1-D mixture on its own")
+    print("#   pre-activation -- an oracle no shared mixture can reach")
+    for Kc in ("2", "4", "6", "16", "64"):
+        v = float(np.mean([m["per_neuron_oracle_mse"][Kc] for m in out["mlps"]]))
+        print(f"  K = {Kc:>2} per neuron       raw MSE {v:.4e}   "
+              f"rms {np.sqrt(v):.3e}")
     (ART / "anatomy.json").write_text(json.dumps(out, indent=1))
     print(f"\n# wrote {ART / 'anatomy.json'}")
     return 0
@@ -383,7 +412,7 @@ def mixture_predict(W, nodes, r=1, split_at=0, resplit=0, kmax=8, K=None):
     st = MixtureState.gaussian(np.zeros(n), W64[0].T @ W64[0])
     K = K or nodes ** r
     for l in range(len(W)):
-        if l == split_at:
+        if l == split_at and nodes > 1:
             for _ in range(r):
                 st = st.split(st.top_direction(), nodes)
         elif resplit and l > split_at and (l - split_at) % resplit == 0:
@@ -414,12 +443,12 @@ def mixture_kernel(weights, ctx=None, nodes=6, r=1, kmax=4, split_at=0):
     for li, w in enumerate(weights):
         pre = [(w.T @ mu, fnp.einsum("ij,ia,jb->ab", cov, w, w))
                for mu, cov in zip(mus, covs)]
-        if li == split_at:
+        if li == split_at and nodes > 1:
             for _ in range(r):
                 npre, nws = [], []
                 for (mu_pre, cov_pre), wk in zip(pre, ws):
                     u = fnp.ones(n, dtype=fnp.float32) * fnp.float32(1.0 / n ** 0.5)
-                    for _ in range(15):
+                    for _ in range(40):
                         u = cov_pre @ u
                         u = u / fnp.sqrt(fnp.sum(u * u))
                     cu = cov_pre @ u
