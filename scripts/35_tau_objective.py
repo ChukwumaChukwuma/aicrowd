@@ -1,19 +1,23 @@
 #!/usr/bin/env python
-"""Re-sweep the sparsity threshold ``tau`` against the CLAMPED objective.
+"""Re-sweep the sparsity threshold ``tau`` against the RIGHT objective.
 
-Why the old sweep answered the wrong question
----------------------------------------------
-``adjusted = raw x max(0.1, C/B)``.  The graded run (submission 325593) came
-back at ``C/B = 0.10012`` -- we sit ON the clamp.  There, ``N`` is not a free
-parameter: it is pinned at ``N* = (0.1 B - F_fix - lambda R) / c(tau)``, and
+Why every earlier sweep answered the wrong question
+---------------------------------------------------
+``adjusted = raw x max(0.1, C/B)`` with ``C = F_fix + c(tau) N + lambda R``.
+``N`` is not a constant of the estimator -- it is an inner variable, and the
+sweep has to re-optimise it at every ``tau``:
 
-    adjusted(tau) = 0.1 * [ b(tau)^2  +  v_eff(tau) / N*(tau) ]
+    adjusted(tau) = min_N [ b(tau)^2 + v_eff(tau)/N ]
+                         * max(0.1, (F0 + c(tau) N) / B)
 
-so a cheaper ``tau`` does not pay a multiplier penalty -- it buys samples.  The
-whole trade is ``bias^2`` against ``v_eff * c``.  Every previous sweep
-minimised raw MSE at FIXED ``N``, or adjusted score above the clamp, and both
-of those price ``c`` far too dearly.  The bias budget is much larger than we
-were treating it as: an RMS bias of 1.8e-3 costs one whole current score.
+Holding ``N`` fixed prices ``c`` at zero.  Pinning ``N`` to the 0.1 clamp
+prices it at the clamp's slope.  Both are wrong, in opposite directions.  The
+graded 11-point N-sweep (325597-325608) showed the optimum is INTERIOR and
+sits at ``C/B ~ 0.22``, 2.2x past the clamp: above the clamp the objective is
+``(1/B)[F0 b^2 + c v_eff + F0 v_eff/N + c b^2 N]``, so the fixed compute
+``F0`` amortising is what pulls ``N`` up and the bias floor is what pushes it
+back.  In the zero-bias limit the whole score is ``v_eff * c / B`` -- the
+product this sweep exists to minimise.
 
 How ``b`` and ``v`` are separated
 ---------------------------------
@@ -26,17 +30,44 @@ low-variance estimate of the pruning bias, and
     v/N  =  mean_j (mu_1j - mu_2j)^2 / 2
 
 The pilot -- hence the mask -- is drawn from the same generator before the
-scored draw, exactly as the shipped kernel does, so nothing about the pairing
-changes the estimator being measured.
+scored draw, exactly as the shipped kernel does, so the pairing changes
+nothing about the estimator being measured.  ``c(tau)`` is flopscope's own
+``dF/dN`` on the real kernel.
 
-``c(tau)`` is read from flopscope directly, by differencing the billed FLOPs
-of the real kernel at two sample counts.
+The answer, and it is a refutation
+----------------------------------
+The premise was that the bias budget is underspent, so a much lower ``tau``
+should win.  It does not, and the reason is not bias at all: **pruning a
+marginal neuron injects variance faster than it saves compute.**  Measured on
+48 local MLPs, ``v_raw`` against ``c``:
+
+    tau    keep    c/sample   v_raw     v_raw*c    b^2        adjusted x2.5
+    4.00   0.924   3.63e6     0.05168   1.876e5    -1.7e-14   0.808
+    3.00   0.848   3.10e6     0.05192   1.610e5     4.4e-11   0.934
+    2.75   0.827   2.96e6     0.05179   1.534e5     5.8e-10   0.978
+    2.50   0.806   2.82e6     0.05296   1.496e5     3.9e-09   1.000  <- min
+    2.25   0.784   2.68e6     0.05641   1.513e5     2.9e-08   0.978
+    2.00   0.760   2.53e6     0.06198   1.571e5     2.5e-07   0.883
+    1.50   0.709   2.23e6     0.09079   2.023e5     8.7e-06   0.272
+    1.00   0.653   1.91e6     0.24160   4.603e5     2.0e-04   0.018
+
+``v_raw * c`` is minimised AT tau = 2.5, and it is minimised there by the
+variance term alone -- the bias only makes low ``tau`` worse on top.  Below
+2.5, ``v_raw`` rises 17% (2.0), 71% (1.5), 356% (1.0) while ``c`` falls only
+10%, 21%, 33%.  Above 2.5 the trade reverses and ``c`` dominates.  The optimum
+is broad: 2.25 and 2.75 are both 0.978x, so nothing here is delicately tuned.
+
+The pruning bias is also an order of magnitude smaller than the repository
+believed: ``b^2(2.5) = 3.9e-09``, i.e. an RMS sign error of 6.3e-05, against
+the docstring's claim of "2-3e-7 in raw-MSE terms".  It is NOT what limits
+``N``.  What limits ``N`` is ``b2_head`` -- see ``--mode objective``.
 
 Selection data
 --------------
 LOCAL MLPs only (``--seed-base``, default 700000), disjoint from the official
 suite and from the corrector's training seeds.  ``official_mini.npz`` is never
-read by this script.
+read by this script; the graded constants it consumes (``--f0``, ``--c-ref``)
+come from the submitted N-sweep, not from any local suite.
 """
 
 from __future__ import annotations
@@ -196,32 +227,62 @@ def mode_sweep(taus, n_mlps: int, seed_base: int, n_samples: int,
 
 
 # ---------------------------------------------------------------------------
-def mode_objective(path: str, f_fix: float, resid_s: float, head_gain: float,
-                   lam: float = 1.0e11) -> None:
-    """Turn the measured ``(b^2, v_raw, c)`` curve into the clamped score."""
+def mode_objective(path: str, f0: float, head_gain: float, b2_head: float,
+                   c_ref: float) -> None:
+    """Score each ``tau`` at ITS OWN optimal ``N``.
+
+    ``N`` is an inner variable, not a constant of the estimator, and pinning
+    it -- to 8500, or to the clamp -- misprices ``c`` in opposite directions.
+    The graded 11-point N-sweep settled where the optimum actually is:
+
+        adjusted(tau) = min_N [ b(tau)^2 + v_eff(tau)/N ]
+                             * max(0.1, (F0 + c(tau) N) / B)
+
+    with ``F0 = F_fix + lambda R`` the N-independent compute.  Above the clamp
+    this is ``(1/B)[F0 b^2 + c v_eff + F0 v_eff/N + c b^2 N]``, whose interior
+    minimum is ``N* = sqrt(v_eff F0 / (b^2 c))``.  The fixed residual is
+    exactly what makes the optimum interior; the bias is exactly what stops it
+    running away.  Both branches are evaluated on a grid so the clamped branch
+    wins wherever it should.
+
+    ``b^2 = b_prune^2(tau) + b2_head``, the second being the N-INDEPENDENT
+    error the offline head injects -- 88% of it is ``dpilot``, which carries
+    the 150-sample pilot's own Monte-Carlo error and therefore does not shrink
+    with ``N``.
+    """
     d = json.loads((artifacts() / path).read_text())
-    free = MULTIPLIER_FLOOR * FLOP_BUDGET - f_fix - lam * resid_s
-    print(f"# clamped objective   adjusted = 0.1 * [ b^2 + v_eff / N* ]")
-    print(f"# N*(tau) = ({MULTIPLIER_FLOOR*FLOP_BUDGET:.4g} - F_fix "
-          f"{f_fix:.4g} - 1e11*R {lam*resid_s:.4g}) / c(tau) = "
-          f"{free:.5g} / c")
-    print(f"# v_eff = v_raw / {head_gain:.3f}  (head's measured variance gain)")
-    hdr = (f"{'tau':>6} {'c/sample':>10} {'N*':>7} {'0.1 b^2':>11} "
-           f"{'0.1 v/N*':>11} {'adjusted':>11} {'x ship':>7}")
+    grid = np.geomspace(4.0e3, 4.0e5, 1500)
+    print("# adjusted(tau) = min_N [b^2 + v_eff/N] * max(0.1, (F0 + c N)/B)")
+    print(f"# F0 = {f0:.4g} ({f0/FLOP_BUDGET:.5f} of B),  "
+          f"v_eff = v_raw/{head_gain:.3f},  b^2 = b_prune^2 + b_head^2 "
+          f"({b2_head:.3e})")
+    print(f"# c(tau) rescaled so c(2.5) = {c_ref:,.0f}, the graded value\n")
+    hdr = (f"{'tau':>6} {'c/sample':>10} {'b^2':>10} {'v_eff':>8} "
+           f"{'v_eff*c':>10} {'N*':>8} {'C/B':>7} {'raw':>11} "
+           f"{'adjusted':>11} {'x tau2.5':>9}")
     print(hdr)
     print("-" * len(hdr))
-    base = None
+    c25 = next(r["c"] for r in d["rows"] if abs(r["tau"] - 2.5) < 1e-9)
+    out, base = [], None
     for r in d["rows"]:
-        N = free / r["c"]
-        bias_term = MULTIPLIER_FLOOR * r["b2"]
-        var_term = MULTIPLIER_FLOOR * (r["v_raw"] / head_gain) / N
-        adj = bias_term + var_term
+        c = r["c"] / c25 * c_ref
+        v = r["v_raw"] / head_gain
+        b2 = max(r["b2"], 0.0) + b2_head
+        raw = b2 + v / grid
+        mult = np.maximum(MULTIPLIER_FLOOR, (f0 + c * grid) / FLOP_BUDGET)
+        adj = raw * mult
+        i = int(np.argmin(adj))
         if abs(r["tau"] - 2.5) < 1e-9:
-            base = adj
-        print(f"{r['tau']:6.2f} {r['c']:10.4g} {N:7.0f} {bias_term:11.4e} "
-              f"{var_term:11.4e} {adj:11.4e} "
-              + (f"{base/adj:7.3f}" if base else "      -"))
-    print("\n(x ship > 1 is better; the tau=2.5 row is the reference)")
+            base = float(adj[i])
+        out.append((r["tau"], c, b2, v, float(grid[i]), float(adj[i]),
+                    float(raw[i]), float(mult[i])))
+    for t, c, b2, v, N, a, raw, m in out:
+        print(f"{t:6.2f} {c:10.4g} {b2:10.3e} {v:8.5f} {v*c:10.4g} "
+              f"{N:8.0f} {m:7.4f} {raw:11.4e} {a:11.4e} "
+              f"{(base / a) if base else 0:9.3f}")
+    print("\n(x tau2.5 > 1 is better.  `v_eff * c` is the entire objective in "
+          "the zero-bias limit --\n the score asymptotes to it at large N -- "
+          "so it is printed separately.)")
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +328,13 @@ def main() -> int:
     ap.add_argument("--n-samples", type=int, default=8500)
     ap.add_argument("--n-pilot", type=int, default=150)
     ap.add_argument("--out", default="tau_curve.json")
-    ap.add_argument("--f-fix", type=float, default=2.05e8)
-    ap.add_argument("--resid", type=float, default=0.0209)
-    ap.add_argument("--head-gain", type=float, default=1.866)
+    # Defaults are the GRADED constants: F0 and c come from regressing the
+    # 11 submitted C/B values on N (residual < 0.4% of B); b2_head is the
+    # N-independent error the head injects, dominated by ``dpilot``.
+    ap.add_argument("--f0", type=float, default=2.437e9)
+    ap.add_argument("--c-ref", type=float, default=2.790e6)
+    ap.add_argument("--head-gain", type=float, default=1.60)
+    ap.add_argument("--b2-head", type=float, default=1.029e-7)
     args = ap.parse_args()
 
     taus = [float(x) for x in args.taus.split(",") if x]
@@ -279,7 +344,8 @@ def main() -> int:
     elif args.mode == "check":
         mode_check(taus, args.seed_base, args.n_pilot)
     else:
-        mode_objective(args.out, args.f_fix, args.resid, args.head_gain)
+        mode_objective(args.out, args.f0, args.head_gain,
+                       args.b2_head, args.c_ref)
     return 0
 
 
