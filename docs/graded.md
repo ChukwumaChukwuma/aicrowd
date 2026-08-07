@@ -19,7 +19,7 @@ The local harness is **15% conservative**, so every raw figure in
 That direction matters: it means no local result needs re-auditing for
 over-claiming.
 
-## 2. The cost frontier is closed at 1.0012x
+## 2. The cost frontier is worth 1.10x — via samples, not via the multiplier
 
 The implied multiplier is `adj/raw = 0.100120`. The scoring rule is
 
@@ -30,11 +30,38 @@ adjusted = raw x max(0.1, C/B)
 so `C/B = 0.10012` on grader hardware — **0.12% above the clamp**. Local
 measurement said 0.108 and the packaging sandbox said 0.1172. Both were
 inflated by `residual_wall_time_s` on slower boxes; only residual is billed at
-`λ`, and the grader is fast enough that residual is nearly free there.
+`λ`, and the grader is fast enough that residual is much cheaper there.
 
-The whole cost-frontier program — dispatch-count reduction, `out=` buffers to
-cut per-call residual ~6x, dropping the 31 unscored layer reductions, dtype
-work — is therefore bounded above by **1.0012x**. It is closed.
+That the observed multiplier is `0.100120` and not exactly `0.1000000` is the
+tell that we are **unclamped**: `0.10012` is the true ratio, not a floor
+reading. Splitting it against the deterministic, machine-independent FLOP
+count:
+
+```
+F/B      = 0.09100      (24,751,725,967 FLOPs — exact, same on every box)
+λ·R/B    = 0.00912      -> R = 24.8 ms of billed residual
+C/B      = 0.10012
+```
+
+**Residual is 9.1% of our billed compute.** It is tempting to read the 0.12%
+overshoot as the whole prize and call the cost frontier closed. That is wrong,
+and an earlier revision of this document said so in error. Repairing the
+multiplier alone *is* only `1.0012x` — but the freed budget does not vanish, it
+buys samples. Driving `R -> 0` lets `N` rise by `0.1/0.0910 = 1.0989x` while
+staying at the clamp, and `raw = v_eff/N` falls with it:
+
+| | value |
+|---|---|
+| multiplier repair alone | 1.0012x |
+| **repair + spending the freed budget on samples** | **1.1002x** |
+| projected adjusted | **2.9458e-07** |
+
+So the cost-frontier program — dispatch-count reduction, `out=` buffers (which
+cut per-call residual ~6x), dropping the 31 unscored layer reductions — is
+worth about **10%**. Real, worth taking, and not remotely sufficient on its
+own: rank 4 needs 7x.
+
+Three supporting negatives, each measured directly rather than inferred:
 
 Three supporting negatives, each measured directly rather than inferred:
 
@@ -44,7 +71,16 @@ Three supporting negatives, each measured directly rather than inferred:
 | some op bills a contraction below cost | **False.** `a@b`, `matmul`, `dot`, `inner`, `einsum ij,jk->ik`, `tensordot`, `linalg.matmul`, `multi_dot` all bill exactly `n·w·(2w−1)`. |
 | the RNG is worth optimising | **No.** 0.14% of budget (`standard_normal` 16 flops/elem, `random` 1/elem). |
 
-There is no accounting exploit in the op surface. The cost model is honest.
+There is no accounting exploit in the op surface. The cost model is honest, so
+the 10% above is the whole of it — there is no larger cost prize hiding behind
+a mispriced operation.
+
+The graded multiplier also settles a documentation conflict: the challenge
+Overview's prose writes the floor as `max(0.5, C/B)`, while
+`whestbench/budget.py::score_multiplier` implements `max(0.1, C/B)`. An
+observed multiplier of **0.10012** is below 0.5, so the 0.5 in the prose is
+refuted empirically, not just by reading the source. The estimator is tuned to
+the rule the grader actually runs.
 
 ## 3. What the clamp does to the objective
 
