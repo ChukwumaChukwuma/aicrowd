@@ -743,7 +743,7 @@ def _pilot_stats(weights, rng, n_pilot, n):
     return m / fnp.sqrt(v), fnp.stack(mhs, axis=0)
 
 
-def _sparse_plan(weights, alpha, mean_h, tau):
+def _sparse_plan(weights, alpha, mean_h, tau, even: bool = False):
     """Masks, pre-sliced weights and frozen biases: billed once, not per sample.
 
     The last layer keeps all n output columns.  Pruning them would save ~1% of
@@ -760,6 +760,12 @@ def _sparse_plan(weights, alpha, mean_h, tau):
     for bit.  (2) ``fnp.where`` replaces ``mean_h * (1 - keep.astype(f32))``:
     one dispatch instead of three, and identical output because the multiplier
     is exactly 0 or exactly 1.
+
+    ``even=True`` rounds every kept set UP to an even size, which is what
+    :func:`_strassen_layer` needs to split the contraction.  It rounds UP --
+    the least-dead pruned neuron is put back, ``alpha >= max(alpha | pruned)``
+    -- so the mask is a superset of the ``tau`` mask and the approximation is
+    strictly WEAKER, never stronger.  At most one neuron a layer moves.
     """
     depth = len(weights)
     keeps = None if tau is None else (alpha > -tau)
@@ -768,6 +774,12 @@ def _sparse_plan(weights, alpha, mean_h, tau):
     for l, w in enumerate(weights):
         keep = None if (keeps is None or l == depth - 1) else keeps[l]
         wc = w if keep is None else w[:, keep]
+        if even and keep is not None and wc.shape[1] % 2:
+            # Largest alpha among the PRUNED neurons; ties are not possible
+            # for float alphas that came out of a division.
+            best = fnp.max(fnp.where(keep, -3.0e38, alpha[l]))
+            keep = fnp.logical_or(keep, alpha[l] >= best)
+            wc = w[:, keep]
         subs.append(wc if keep_prev is None else wc[keep_prev, :])
         if keep_prev is None:
             biases.append(None)
@@ -777,7 +789,119 @@ def _sparse_plan(weights, alpha, mean_h, tau):
     return subs, biases
 
 
-def _sparse_mc(weights, tau, n_samples, n_pilot, seed):
+# --------------------------------------------------------------------------
+# Strassen.  See docs/cost_floor.md sec 5.
+#
+# The layer matmul is a contraction and docs/graded.md established that every
+# EQUIVALENT contraction bills the same ``n w (2w-1)``.  Strassen is not an
+# equivalent contraction: it is a different algorithm that returns the same
+# matrix from 7 half-size products instead of 8.  Billed, one level of it takes
+# the scored pass from 2,845,682 to 2,508,045 FLOPs/sample -- 1.1346x -- and the
+# answer moves by 3.5e-06 absolute against activations of order 2.5, i.e. 1.4e-6
+# relative, six orders under the ~1.7e-3 residual the head is predicting.
+#
+# The activation is carried as FOUR QUADRANT BLOCKS (top/bottom row half x
+# left/right column half) and never reassembled between layers: Strassen's
+# outputs are exactly those blocks and the next layer's inputs are exactly
+# those blocks, so no concatenate is ever billed.  Reassembling every layer
+# would cost 512 FLOPs/sample and 3 dispatches.
+#
+# WHAT DECIDES WHETHER IT PAYS is not the FLOPs, it is the RESIDUAL: 7 matmul
+# dispatches plus 13 elementwise ones per layer instead of 3, and a flopscope
+# dispatch costs ~26 us (elementwise) to ~106 us (matmul) of billed residual on
+# this box.  Measured, that is +26 ms = 2.6e9 effective FLOPs, a FIXED cost
+# that amortises over N while the 1.1346x is per sample -- so the gain grows
+# with N and is the full 1.1346x in the large-N limit.
+# --------------------------------------------------------------------------
+
+
+def _strassen_weights(w):
+    """The 7 weight-side operands, built ONCE per MLP off the per-sample path.
+
+    ``w`` must have both dimensions even.  Five ``(p/2, q/2)`` adds, which for
+    a 256x256 layer is 82k FLOPs against 2.5e6 per SAMPLE.
+    """
+    p, q = w.shape
+    i, j = p // 2, q // 2
+    b11, b12, b21, b22 = w[:i, :j], w[:i, j:], w[i:, :j], w[i:, j:]
+    return (b11 + b22, b11, b12 - b22, b21 - b11, b22, b11 + b12, b21 + b22)
+
+
+def _strassen_layer(a, s):
+    """``[C11, C12, C21, C22] = A @ W`` from 7 products instead of 8."""
+    a11, a12, a21, a22 = a
+    m1 = (a11 + a22) @ s[0]
+    m2 = (a21 + a22) @ s[1]
+    m3 = a11 @ s[2]
+    m4 = a22 @ s[3]
+    m5 = (a11 + a12) @ s[4]
+    m6 = (a21 - a11) @ s[5]
+    m7 = (a12 - a22) @ s[6]
+    return [m1 + m4 - m5 + m7, m3 + m5, m2 + m4, m1 - m2 + m3 + m6]
+
+
+def _strassen_plan(subs, biases):
+    """Per-layer ``(7 weight operands, (bias_left, bias_right))``."""
+    out = []
+    for w, b in zip(subs, biases):
+        j = w.shape[1] // 2
+        out.append((_strassen_weights(w),
+                    None if b is None else (b[:j], b[j:])))
+    return out
+
+
+def _strassen_forward(x0, plan):
+    """Run the whole scored pass in quadrant-block form.
+
+    Returns blocks of ``(x_final, z_layer1, x_layer1, z_final)``; the caller
+    stitches only what the feature block needs.
+    """
+    h, m = x0.shape[0] // 2, x0.shape[1] // 2
+    a = [x0[:h, :m], x0[:h, m:], x0[h:, :m], x0[h:, m:]]
+    z1 = h1 = c = None
+    for s, bb in plan:
+        c = _strassen_layer(a, s)
+        if bb is not None:
+            c = [c[0] + bb[0], c[1] + bb[1], c[2] + bb[0], c[3] + bb[1]]
+        if z1 is None:
+            z1 = c
+        a = [fnp.maximum(t, 0.0) for t in c]
+        if h1 is None:
+            h1 = a
+    return a, z1, h1, c
+
+
+def _unblock(b):
+    """Stitch four quadrant blocks back into one ``(N, width)`` array."""
+    return fnp.concatenate([fnp.concatenate([b[0], b[1]], axis=1),
+                            fnp.concatenate([b[2], b[3]], axis=1)], axis=0)
+
+
+def _chunks(n_samples, chunk):
+    """Row slices of the scored draw.  ``chunk=None`` yields one whole slice.
+
+    WHY THE SCORED PASS IS CHUNKED AT ALL, since it changes no FLOP: past
+    ``N ~ 35000`` the ``(N, |keep|)`` activation array stops fitting in cache
+    and the BILLED RESIDUAL -- ``wall - backend - overhead``, charged at
+    1e11 FLOP/s -- jumps threefold for a bit-identical FLOP count.  Measured
+    on this box, 32 layers at width 200:
+
+        N       one slice   chunk 16384
+        8500       4.3 ms       7.1 ms
+        22000      6.4 ms       9.3 ms
+        45000    144.0 ms      13.9 ms     <- 10x, same FLOPs
+
+    Below ~25000 chunking LOSES, because each extra chunk repeats ~95
+    dispatches at ~22 us of residual each and there is no cache pressure to
+    pay for them.  So this is a large-N device and the default is off.
+    """
+    if not chunk or chunk >= n_samples:
+        return [slice(0, n_samples)]
+    return [slice(lo, min(lo + chunk, n_samples))
+            for lo in range(0, n_samples, chunk)]
+
+
+def _sparse_mc(weights, tau, n_samples, n_pilot, seed, chunk=None):
     n = weights[0].shape[0]
     depth = len(weights)
     rng = fnp.random.default_rng(seed)
@@ -786,12 +910,17 @@ def _sparse_mc(weights, tau, n_samples, n_pilot, seed):
     subs, biases = _sparse_plan(weights, alpha, mean_h, tau)
 
     # ---- scored pass ---------------------------------------------------
-    x = rng.standard_normal((n_samples, n), dtype=fnp.float32)
-    for l in range(depth):
-        z = x @ subs[l]
-        if biases[l] is not None:
-            z = z + biases[l]
-        x = fnp.maximum(z, 0.0)
+    x0 = rng.standard_normal((n_samples, n), dtype=fnp.float32)
+    outs = []
+    for sl in _chunks(n_samples, chunk):
+        x = x0[sl]
+        for l in range(depth):
+            z = x @ subs[l]
+            if biases[l] is not None:
+                z = z + biases[l]
+            x = fnp.maximum(z, 0.0)
+        outs.append(x)
+    x = outs[0] if len(outs) == 1 else fnp.concatenate(outs, axis=0)
     # Only the last row is scored; rows 0..depth-2 come free from the pilot
     # and are already stacked, so one concatenate replaces a 32-way stack.
     return fnp.concatenate([mean_h[:-1], fnp.mean(x, axis=0)[None, :]],
@@ -800,7 +929,7 @@ def _sparse_mc(weights, tau, n_samples, n_pilot, seed):
 
 def sparse_mc_kernel(weights, ctx=None, tau: float | None = 2.5,
                      n_samples: int = 8500, n_pilot: int = 150,
-                     seed: int = 0, safe: bool = True):
+                     seed: int = 0, safe: bool = True, chunk=None):
     """Monte Carlo with the always-off neurons pruned out of every matmul.
 
     ``tau`` is the threshold on ``alpha = m/s``: a neuron with
@@ -824,7 +953,7 @@ def sparse_mc_kernel(weights, ctx=None, tau: float | None = 2.5,
     3% of each other), so the transfer risk is small, but it is not zero.
     """
     try:
-        return _sparse_mc(weights, tau, n_samples, n_pilot, seed)
+        return _sparse_mc(weights, tau, n_samples, n_pilot, seed, chunk)
     except Exception:  # noqa: BLE001 - a raise on one MLP costs ~850x the score
         if not safe:
             raise
@@ -1317,35 +1446,100 @@ def corrector_design(prim):
 
 
 def _corrected_sparse(weights, tau, n_samples, n_pilot, seed, beta, damp,
-                      kmax):
+                      kmax, chunk=None, strassen=False, even=None):
     n = weights[0].shape[0]
     depth = len(weights)
     rng = fnp.random.default_rng(seed)
 
     # ---- pilot and plan: identical to _sparse_mc ------------------------
     alpha, mean_h = _pilot_stats(weights, rng, n_pilot, n)
-    subs, biases = _sparse_plan(weights, alpha, mean_h, tau)
+    subs, biases = _sparse_plan(weights, alpha, mean_h, tau,
+                                even=strassen if even is None else even)
+
+    if strassen:
+        # Same mask (rounded up to even), same frozen constants, same answer
+        # to 1.4e-6 relative, 1.1346x fewer billed FLOPs a sample.
+        # ``strassen=False`` runs the loop below and is the exact ablation.
+        plan = _strassen_plan(subs, biases)
+        # The row half is a plain batch split, so an odd N just drops one
+        # sample rather than falling back to the dense path.
+        n_samples -= n_samples % 2
+        x0 = rng.standard_normal((n_samples, n), dtype=fnp.float32)
+        # Chunking composes with the quadrant split: each chunk is halved into
+        # its own top/bottom rows, so the answer is unchanged and only the
+        # working-set size moves.  It matters MORE here than on the direct
+        # path, because Strassen already pays 28 dispatches a layer and the
+        # cache cliff would land on top of that.
+        cs = _chunks(n_samples, chunk)
+        xs, z1s, h1s, zs = [], [], [], []
+        for sl in cs:
+            xb, z1b, h1b, zb = _strassen_forward(x0[sl], plan)
+            xs.append(_unblock(xb))
+            z1s.append(z1b)
+            h1s.append(h1b)
+            zs.append(zb)
+        x = xs[0] if len(xs) == 1 else fnp.concatenate(xs, axis=0)
+        mu = fnp.mean(x, axis=0)
+        if beta is None or damp == 0.0:
+            return fnp.concatenate([mean_h[:-1], mu[None, :]], axis=0)
+        def _stitch(parts):
+            u = [_unblock(p) for p in parts]
+            return u[0] if len(u) == 1 else fnp.concatenate(u, axis=0)
+        return _corrected_head(weights, alpha, mean_h, x0, x, _stitch(z1s),
+                               _stitch(h1s), _stitch(zs), mu, beta, damp,
+                               kmax)
 
     # ---- scored pass ----------------------------------------------------
+    # Chunked when ``chunk`` is set: identical FLOPs, but the working set
+    # stays in cache, which is worth 10x of BILLED RESIDUAL past N ~ 35000.
+    # ``z1`` and the final ``z``/``x`` are still needed whole by the feature
+    # block, so they are concatenated back -- one linear pass each, against
+    # 32 layers of cache-missing matmuls.
     x0 = rng.standard_normal((n_samples, n), dtype=fnp.float32)
-    x = x0
-    z1 = h1 = None
-    for l in range(depth):
-        z = x @ subs[l]
-        if biases[l] is not None:
-            z = z + biases[l]
-        if l == 0:
-            z1 = z
-        x = fnp.maximum(z, 0.0)
-        if l == 0:
-            h1 = x          # kept, not reduced: a reduction here
-                            # would be billed before the damp=0
-                            # early return and break the ablation
+    z1p, zp, xp, h1p = [], [], [], []
+    for sl in _chunks(n_samples, chunk):
+        x = x0[sl]
+        for l in range(depth):
+            z = x @ subs[l]
+            if biases[l] is not None:
+                z = z + biases[l]
+            if l == 0:
+                z1p.append(z)
+            x = fnp.maximum(z, 0.0)
+            if l == 0:
+                h1p.append(x)   # kept, not reduced: a reduction here would
+                                # be billed before the damp=0 early return
+                                # and break the ablation
+        zp.append(z)
+        xp.append(x)
+    # Only ``x`` is needed before the ablation's early return, so only ``x``
+    # is stitched here; z1/z/h1 are stitched after it, which keeps damp=0
+    # billing FLOP-for-FLOP identical to ``sparse_mc_kernel`` at every chunk.
+    x = xp[0] if len(xp) == 1 else fnp.concatenate(xp, axis=0)
     mu = fnp.mean(x, axis=0)
     if beta is None or damp == 0.0:
         # exact ablation: identical stream, identical mu, no feature block
         return fnp.concatenate([mean_h[:-1], mu[None, :]], axis=0)
 
+    if len(xp) == 1:
+        z1, z, h1 = z1p[0], zp[0], h1p[0]
+    else:
+        z1 = fnp.concatenate(z1p, axis=0)
+        z = fnp.concatenate(zp, axis=0)
+        h1 = fnp.concatenate(h1p, axis=0)
+    return _corrected_head(weights, alpha, mean_h, x0, x, z1, h1, z, mu,
+                           beta, damp, kmax)
+
+
+def _corrected_head(weights, alpha, mean_h, x0, x, z1, h1, z, mu, beta,
+                    damp, kmax):
+    """Feature block and offline head.  Shared verbatim by both scored passes.
+
+    Factored out so the Strassen path cannot drift from the direct one: every
+    feature, every dispatch and every FLOP after the forward pass is the same
+    code, and the only difference between the two variants is how ``x``, ``z1``,
+    ``h1`` and ``z`` were produced.
+    """
     w1 = weights[0]
     sig1 = fnp.sqrt(fnp.maximum(fnp.sum(w1 * w1, axis=0), 1e-12))
     cvs = _hermite_cv(x0, z1, x, w1, sig1, kmax=kmax)
@@ -1376,19 +1570,23 @@ def _corrected_sparse(weights, tau, n_samples, n_pilot, seed, beta, damp,
 def corrected_sparse_kernel(weights, ctx=None, tau: float | None = 2.5,
                             n_samples: int = 8500, n_pilot: int = 150,
                             seed: int = 0, beta=None, damp: float = 1.0,
-                            kmax: int = 2, safe: bool = True):
+                            kmax: int = 2, safe: bool = True, chunk=None,
+                            strassen: bool = False, even=None):
     """Sparse Monte Carlo plus the offline-trained residual corrector.
 
     ``beta`` is the ``(n_features,)`` head loaded from the submission's npz
     (0 FLOPs).  ``damp=0`` -- or ``beta=None`` -- is the exact ablation: the
     identical code path with the head switched off, which reproduces
     :func:`sparse_mc_kernel` bit for bit at the same ``seed``.
+
+    ``strassen=True`` runs the scored pass through :func:`_strassen_layer`;
+    ``strassen=False`` is its ablation and is bit-for-bit the previous ship.
     """
     if beta is not None:
         beta = fnp.asarray(beta, dtype=fnp.float32)
     try:
         return _corrected_sparse(weights, tau, n_samples, n_pilot, seed, beta,
-                                 damp, kmax)
+                                 damp, kmax, chunk, strassen, even)
     except Exception:  # noqa: BLE001 - a raise on one MLP costs ~850x the score
         if not safe:
             raise

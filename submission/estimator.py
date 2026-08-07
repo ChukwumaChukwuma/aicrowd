@@ -231,6 +231,28 @@ N_SAMPLES = 27000
 #: of C at this N -- against 4.4% of raw MSE bought back.
 N_PILOT = 600
 
+#: Rows of the scored draw pushed through the network at a time; ``None``
+#: means all of them.  This changes no FLOP and (measured, bitwise) no output
+#: -- every sample row is processed independently either way.  What it changes
+#: is the BILLED RESIDUAL, ``wall - flopscope_backend - flopscope_overhead``,
+#: charged at ``lambda = 1e11`` FLOP/s.  Past ``N ~ 35000`` the
+#: ``(N, |keep|)`` activation array no longer fits in cache and 32 layers of
+#: matmul start missing it.  Measured on this box at width 200, identical
+#: FLOPs throughout:
+#:
+#:      N        one slice   chunk 16384
+#:      8500        4.3 ms       7.1 ms
+#:      22000       6.4 ms       9.3 ms
+#:      45000     144.0 ms      13.9 ms     <- 10x
+#:
+#: Below ~25000 chunking LOSES: each extra chunk repeats ~95 dispatches at
+#: ~22 us of billed residual each and there is no cache pressure to pay for
+#: them.  At ``N_SAMPLES = 27000`` we are still on the flat side of the cliff,
+#: so it is OFF -- but it is the thing that has to be on before N goes past
+#: ~32000, and the stitching that makes it possible (three ``concatenate``
+#: calls, 4 FLOPs/element, 0.04% of the budget) is already wired.
+CHUNK = None
+
 #: Highest Hermite order used by the layer-1 control variate.  k=3 adds ~2%
 #: of explained variance against 3.0% of estimation noise, so it loses.
 CV_KMAX = 2
@@ -469,26 +491,46 @@ class Estimator(BaseEstimator):
         subs, biases = self._plan(mlp.weights, alpha, mean_h, tau)
 
         # ---- scored pass ---------------------------------------------
+        # Optionally chunked.  It changes no FLOP and (measured) no bit, but
+        # past N ~ 35000 the (N, |keep|) activation array stops fitting in
+        # cache and the BILLED RESIDUAL -- wall minus flopscope's own backend
+        # and dispatch time, charged at 1e11 FLOP/s -- triples for an
+        # identical FLOP count.  See CHUNK.
         x0 = rng.standard_normal((n_samples, n), dtype=fnp.float32)
-        x = x0
-        z1 = h1 = None
-        for l in range(depth):
-            z = x @ subs[l]
-            if biases[l] is not None:
-                z = z + biases[l]
-            if l == 0:
-                z1 = z
-            x = fnp.maximum(z, 0.0)
-            if l == 0:
-                h1 = x          # kept, not reduced: a reduction here
-                                # would be billed before the damp=0
-                                # early return and break the ablation
+        z1p, zp, xp, h1p = [], [], [], []
+        for lo in range(0, n_samples, CHUNK or n_samples):
+            x = x0[lo:lo + (CHUNK or n_samples)]
+            for l in range(depth):
+                z = x @ subs[l]
+                if biases[l] is not None:
+                    z = z + biases[l]
+                if l == 0:
+                    z1p.append(z)
+                x = fnp.maximum(z, 0.0)
+                if l == 0:
+                    h1p.append(x)   # kept, not reduced: a reduction here
+                                    # would be billed before the damp=0
+                                    # early return and break the ablation
+            zp.append(z)
+            xp.append(x)
+        # Only ``x`` is needed before the ablation's early return, so only
+        # ``x`` is stitched here; z1/z/h1 are stitched after it, which keeps
+        # damp=0 billing FLOP-for-FLOP identical to the uncorrected sparse
+        # pass at every chunk size.
+        x = xp[0] if len(xp) == 1 else fnp.concatenate(xp, axis=0)
         mu = fnp.mean(x, axis=0)
         # Only the final row is scored.  The others come free from the pilot;
         # they are not blended with the scored pass, which would correlate the
         # estimate with the mask that was derived from the same samples.
         if self._beta is None or DAMP == 0.0:
             return fnp.concatenate([mean_h[:-1], mu[None, :]], axis=0)
+
+        if len(xp) == 1:
+            z1, z, h1 = z1p[0], zp[0], h1p[0]
+        else:
+            z1 = fnp.concatenate(z1p, axis=0)
+            z = fnp.concatenate(zp, axis=0)
+            h1 = fnp.concatenate(h1p, axis=0)
 
         # ---- features and the offline head ---------------------------
         # FIFTEEN columns.  Thirteen more were fitted, measured at exactly

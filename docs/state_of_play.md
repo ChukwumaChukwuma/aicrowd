@@ -251,6 +251,28 @@ stops.
    `docs/hermite_rank_ceiling.md`. The family is at 94% of a proved ceiling
    and the ceiling is 1.76×.
 
+5. ~~**Cut the billed FLOPs per sample 6–9×.**~~ **Closed** —
+   `docs/cost_floor.md`. Since `adjusted = v_eff·c/B`, and `v_eff` is capped at
+   1.76×, the whole remaining hope was `c`. It is not there. The bound that
+   settles it is the **cheap-model floor**: anything costing less than a
+   forward pass must replace a prefix of the network by a distribution, and an
+   *oracle* Gaussian (exact mean and full covariance of `z^j` from a
+   400k-sample pass) plus exact layers after it floors at `b² = 3.8e-6` at 4
+   layer-equivalents/sample, rising to 8.9e-6 at 13 — so `adjusted ≥ 0.1·b²`
+   puts **every** point of that family worse than the shipped 2.6082e-7, at
+   any `N`. Linearise-and-fold (`relu(z) = a + Φ(α)z + δ`, affine blocks
+   compose out of the matmuls) is 9.19× at `b² = 1.4e-5` and 1.00× at the
+   `|E|` where `b²` is affordable — the curve never passes through useful,
+   because the linearisation residual is spread over all 7,936 neurons. The
+   only honest cut found is **Strassen, 1.1296× on billed `c`**, and whether
+   it nets out depends on `N` through the dispatch residual.
+
+   This also refutes the reading of graded submission 323861 that motivated
+   the round: raw 4.24e-8 at `C/B = 1.12` back-solves to ~478,000 FLOPs/sample
+   only if its `v_eff` matches ours, and a sampler that cheap has `b² ≥
+   3.8e-6`, 89,000× its measured raw. It is a better `v_eff` or a
+   deterministic estimator, not a cheaper sampler.
+
 ## Where this leaves the board
 
 | | adjusted | × floor |
