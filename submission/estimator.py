@@ -76,12 +76,20 @@ noise; at k=3 it reverses the sign of the correction outright.
 Each Hermite block costs ``p/N = 256/8500 = 3.0%`` of the residual in
 estimation noise, and the sparse mask leaves a small closure bias.  Rather
 than assume a coefficient of 1 on each correction, a linear head over the two
-corrections and ~20 other predict-time features (Rao-Blackwell gap,
-sample-Edgeworth terms, per-neuron MC noise scale, weight-column moments,
-per-MLP scalars) is fitted **offline on 640 generated MLPs with fresh seeds**,
-disjoint from every evaluation suite, and shipped as a 25-float vector in
-``corrector.npz``.  ``fnp.load`` bills **0 FLOPs**, so the head is free at
-grade time; the matvec that applies it is 12,800 FLOPs.
+corrections and a handful of other predict-time features is fitted **offline
+on 640 generated MLPs with fresh seeds**, disjoint from every evaluation
+suite, and shipped as a 15-float vector in ``corrector.npz``.  ``fnp.load``
+bills **0 FLOPs**, so the head is free at grade time.
+
+The design was 28 columns and is now 15.  The thirteen that went — the
+Rao-Blackwell gap, the two sample-Edgeworth terms, the multiplicative shrink,
+the per-neuron MC noise scale, the weight-column moments and the per-MLP
+scalars — each measured at **exactly 1.000x** in the leave-one-group-out table
+(removing the group left validation at 1.504x, unchanged to three decimals),
+and between them they cost **eight passes over the (8500, 256) sample array**:
+``d^3`` and ``d^4`` for the Edgeworth skew/kurtosis, and ``mean(x*x)`` for
+``Var(relu z)``.  That is participant wall time, billed at ``lambda = 1e11``
+FLOP/s, and it was the single largest avoidable term in ``C/B``.
 
 Safety
 ------
@@ -96,9 +104,15 @@ Sizing
 ------
 ``C = F + 1e11 R`` and the multiplier is ``max(0.1, C/B)``.  ``F`` is
 machine-independent; ``R`` is participant wall time on one physical core.
-This estimator sits at ``F/B = 0.0926`` — the feature block is 0.40% of the
+This estimator sits at ``F/B = 0.0919`` — the feature block is 0.35% of the
 free budget — leaving room for the grader's residual before the floor is
 crossed, and crossing it is a linear penalty, not a cliff.
+
+``N`` was re-swept against the budget the lean feature block frees, and it does
+NOT buy samples: ``N = 9000`` and ``N = 9500`` both lower the raw MSE (3.58e-6,
+3.53e-6 against 3.72e-6) and both *raise* the adjusted score, to 0.996x and
+0.964x of this configuration, because ``C/B`` is already above the 0.1 floor
+and the sparse mask's closure bias does not shrink with ``N``.
 """
 
 from __future__ import annotations
@@ -157,8 +171,21 @@ VAR_FLOOR = 1e-12
 INV_SQRT_2PI = 0.3989422804014327
 
 #: File holding the offline-trained head.  Regenerable bit-identically by
-#: ``scripts/28_learned_corrector.py --mode data`` then ``--mode fit``.
+#: ``scripts/28_learned_corrector.py --mode data`` then
+#: ``--mode fit --install``.
 COEF_FILE = "corrector.npz"
+
+#: Column order of ``corrector.npz``'s ``beta``, for audit.  Must equal
+#: ``whestfloor.corrector.FEATURES``; ``tests/test_submission_parity.py``
+#: pins the two designs against each other bitwise.
+FEATURES = (
+    "one",
+    "cv1", "cv1_Phi", "cv1_a",
+    "cv2", "cv2_Phi", "cv2_a",
+    "cv1mf", "cv1mf_Phi", "cv1mf_a",
+    "s", "Phi", "phi", "a",
+    "dpilot",
+)
 
 
 class Estimator(BaseEstimator):
@@ -244,7 +271,7 @@ class Estimator(BaseEstimator):
             wb = g2 @ (u1 if sc is None else u1 * sc)
             wb = wb - fnp.mean(wb)
             out.append(0.5 * ((y[:h].T @ wa) / h + (y[h:].T @ wb) / (n - h)))
-        while len(out) < 3:
+        while len(out) < 2:
             out.append(fnp.zeros(w1.shape[0], dtype=x.dtype))
         return out
 
@@ -337,26 +364,23 @@ class Estimator(BaseEstimator):
             return fnp.stack(mean_h[:-1] + [mu], axis=0)
 
         # ---- features and the offline head ---------------------------
+        # FIFTEEN columns.  Thirteen more were fitted, measured at exactly
+        # 1.000x on validation, and deleted -- see FEATURES below.  ``v`` comes
+        # from the raw second moment rather than a centred copy of the
+        # (N, width) array, which is one pass fewer; at rms|alpha| = 3.44 the
+        # cancellation costs 1e-6 relative on ``v``, six orders under the
+        # ~1.7e-3 residual the head predicts, and the pilot above already uses
+        # exactly this form.
         cvs = self._hermite_cv(x0, z1, x, mlp.weights[0], CV_KMAX)
-        ex2 = fnp.mean(x * x, axis=0)
-        vh = fnp.maximum(ex2 - mu * mu, 0.0)
         m = fnp.mean(z, axis=0)
-        d = z - m
-        v = fnp.maximum(fnp.mean(d * d, axis=0), VAR_FLOOR)
+        v = fnp.maximum(fnp.mean(z * z, axis=0) - m * m, VAR_FLOOR)
         s = fnp.sqrt(v)
-        d2 = d * d
-        gam1 = fnp.mean(d2 * d, axis=0) / (v * s)
-        gam2 = fnp.mean(d2 * d2, axis=0) / (v * v) - 3.0
         a = m / s
         # norm.cdf/pdf promote float32 -> float64 to match scipy and float64
         # bills at 2x; cast straight back so nothing downstream inherits it.
         Ph = flops.stats.norm.cdf(a).astype(a.dtype)
         ph = flops.stats.norm.pdf(a).astype(a.dtype)
-        wl = mlp.weights[-1]
-        wn = fnp.sum(wl * wl, axis=0)
-        wl2 = wl * wl
         one = fnp.ones_like(a)
-        gap = (m * Ph + s * ph) - mu
         cv1, cv2 = cvs[0], cvs[1]
         mf = self._meanfield_cv(fnp.mean(h1, axis=0), mlp.weights,
                                 alpha, Ph)
@@ -364,18 +388,9 @@ class Estimator(BaseEstimator):
             one,
             cv1, cv1 * Ph, cv1 * a,
             cv2, cv2 * Ph, cv2 * a,
-            cvs[2],
             mf, mf * Ph, mf * a,
-            gap, gap * Ph, gap * a,
-            -(gam1 / 6.0) * s * a * ph,
-            (gam2 / 24.0) * s * (a * a - 1.0) * ph,
-            mu, mu * Ph,
             s, Ph, ph, a,
-            fnp.sqrt(vh / n_samples), mu - mean_h[-1],
-            wn - 1.0,
-            n * fnp.sum(wl2 * wl2, axis=0) / fnp.maximum(wn * wn, 1e-30) - 3.0,
-            one * (fnp.mean(vh) - 0.05),
-            one * (fnp.sqrt(fnp.mean(a * a)) - 3.4),
+            mu - mean_h[-1],
         ]
         corr = fnp.stack(cols, axis=1) @ self._beta
         if DAMP != 1.0:

@@ -219,13 +219,19 @@ def load_train() -> dict:
     return acc
 
 
-def design_from(d: dict, sl, cv_kmax: int = 2) -> np.ndarray:
+def design_from(d: dict, sl, cv_kmax: int = 2,
+                names: tuple[str, ...] | None = None) -> np.ndarray:
     """Stack the per-MLP design matrices for the MLPs selected by ``sl``.
+
+    ``names`` defaults to the FULL research design, so the group ablations
+    below see every column; the shipped subset is then selected from it, which
+    guarantees the two cannot disagree about a column's contents.
 
     ``cv_kmax`` zeroes the Hermite blocks the shipped kernel does not compute,
     so a fit made at ``cv_kmax = 2`` cannot put weight on a feature the
     submission would supply as zero.
     """
+    names = names or C.FEATURES_FULL
     out = []
     for i in np.arange(len(d["mlp_seeds"]))[sl]:
         f = {k: d[k][i] for k in C.PRIMITIVES}
@@ -235,7 +241,7 @@ def design_from(d: dict, sl, cv_kmax: int = 2) -> np.ndarray:
             f["cv3"] = np.zeros_like(f["cv3"])
         if cv_kmax < 2:
             f["cv2"] = np.zeros_like(f["cv2"])
-        out.append(C.build_design(f))
+        out.append(C.build_design(f, names))
     return np.stack(out, axis=0)
 
 
@@ -262,7 +268,8 @@ def mode_fit(val_frac: float, lam_grid, do_mlp: bool, hidden: int,
     xsel, vsel, tsel = perm[:n_val], perm[n_val:2 * n_val], perm[2 * n_val:]
     print(f"{n} MLPs: {len(tsel)} train / {len(vsel)} validation / "
           f"{len(xsel)} test ({len(tsel)*WIDTH:,} training rows, "
-          f"{C.N_FEATURES} features, cv_kmax={cv_kmax})")
+          f"{C.N_FEATURES_FULL} research features "
+          f"({C.N_FEATURES} of them shipped), cv_kmax={cv_kmax})")
 
     # ---- what the raw control variates buy with no head at all --------
     A0, B0, MU0 = d["gt_a"], d["gt_b"], d["mu"]
@@ -286,7 +293,7 @@ def mode_fit(val_frac: float, lam_grid, do_mlp: bool, hidden: int,
     print(f"baseline sparse-MC unbiased true MSE: train {base_t:.4e}  "
           f"val {base_v:.4e}")
 
-    Xt2 = Xt.reshape(-1, C.N_FEATURES)
+    Xt2 = Xt.reshape(-1, C.N_FEATURES_FULL)
     yt2 = yt.ravel()
     sc = C.design_scale(Xt2)
 
@@ -318,13 +325,13 @@ def mode_fit(val_frac: float, lam_grid, do_mlp: bool, hidden: int,
     }
     print("\n=== leave-one-group-out on the validation split ===")
     for name, cols in groups.items():
-        keep = np.array([f not in cols for f in C.FEATURES])
+        keep = np.array([f not in cols for f in C.FEATURES_FULL])
         bb = C.ridge_fit(Xt2[:, keep], yt2, lam, sc[keep])
         v = _umse(MU[vsel] + Xv[:, :, keep] @ bb, A[vsel], B[vsel])
         print(f"  without {name:<22} {v:11.4e}   {base_v/v:6.3f}x")
     print("\n=== only-one-group on the validation split ===")
     for name, cols in groups.items():
-        keep = np.array([(f in cols) or f == "one" for f in C.FEATURES])
+        keep = np.array([(f in cols) or f == "one" for f in C.FEATURES_FULL])
         bb = C.ridge_fit(Xt2[:, keep], yt2, lam, sc[keep])
         v = _umse(MU[vsel] + Xv[:, :, keep] @ bb, A[vsel], B[vsel])
         print(f"  only    {name:<22} {v:11.4e}   {base_v/v:6.3f}x")
@@ -348,7 +355,7 @@ def mode_fit(val_frac: float, lam_grid, do_mlp: bool, hidden: int,
         for b, nm in enumerate(names):
             if mask >> b & 1:
                 cols |= set(groups[nm])
-        keep = np.array([f in cols for f in C.FEATURES])
+        keep = np.array([f in cols for f in C.FEATURES_FULL])
         idx = np.flatnonzero(keep)
         Gk = Gfull[np.ix_(idx, idx)]
         for lm in lam_grid:
@@ -364,7 +371,7 @@ def mode_fit(val_frac: float, lam_grid, do_mlp: bool, hidden: int,
         print(f"  {g:6.3f}x  {v:11.4e}  lam {lm:7.1e}  {on}")
     if res[0][0] > gain * 1.002:
         gain, _, lam, _, keep, bb = res[0][:6]
-        beta = np.zeros(C.N_FEATURES)
+        beta = np.zeros(C.N_FEATURES_FULL)
         beta[keep] = bb
         print(f"\nsubset selection improves on the full design: "
               f"{gain:.3f}x at lambda {lam:.1e}; using it")
@@ -380,15 +387,50 @@ def mode_fit(val_frac: float, lam_grid, do_mlp: bool, hidden: int,
 
     print("\n=== coefficients (original units / scaled) ===")
     for i in np.argsort(-np.abs(beta * sc)):
-        print(f"  {C.FEATURES[i]:<10} {beta[i]:15.6g}   "
+        print(f"  {C.FEATURES_FULL[i]:<10} {beta[i]:15.6g}   "
               f"{beta[i]*sc[i]:11.4e}")
 
-    payload = {"beta": beta.astype(np.float32),
+    # ---- the SHIPPED design: the same columns, minus C.DROPPED ---------
+    # Every dropped group measures at exactly 1.000x above; three of the four
+    # cost passes over the (N, width) sample array, which is residual wall
+    # time.  The head is RE-FITTED on the reduced design rather than masked,
+    # so the ridge shrinkage is the right one for the columns that remain.
+    ship_keep = np.array([f in C.FEATURES for f in C.FEATURES_FULL])
+    ship_idx = np.flatnonzero(ship_keep)
+    assert [C.FEATURES_FULL[i] for i in ship_idx] == list(C.FEATURES)
+    St2 = Xt2[:, ship_idx]
+    ssc = C.design_scale(St2)
+    print(f"\n=== SHIPPED design ({C.N_FEATURES} of {C.N_FEATURES_FULL} "
+          f"columns; dropped {', '.join(C.DROPPED)}) ===")
+    print(f"{'lambda':>10} {'train':>12} {'val':>12} {'val x':>8}")
+    sbest = (None, -1.0, None)
+    for lm in lam_grid:
+        bb = C.ridge_fit(St2, yt2, lm, ssc)
+        v = _umse(MU[vsel] + Xv[:, :, ship_idx] @ bb, A[vsel], B[vsel])
+        t = _umse(MU[tsel] + Xt[:, :, ship_idx] @ bb, A[tsel], B[tsel])
+        print(f"{lm:10.1e} {t:12.4e} {v:12.4e} {base_v / v:8.3f}")
+        if base_v / v > sbest[1]:
+            sbest = (lm, base_v / v, bb)
+    slam, sgain, sbeta = sbest
+    svx = _umse(MU[xsel] + Xx[:, :, ship_idx] @ sbeta, A[xsel], B[xsel])
+    print(f"  selected lambda {slam:.1e}: validation {sgain:.3f}x  "
+          f"(full design {gain:.3f}x),  TEST {base_x / svx:.3f}x  "
+          f"(full design {base_x / vx:.3f}x)")
+    print("  coefficients (original units / scaled):")
+    for i in np.argsort(-np.abs(sbeta * ssc)):
+        print(f"    {C.FEATURES[i]:<10} {sbeta[i]:15.6g}   "
+              f"{sbeta[i] * ssc[i]:11.4e}")
+
+    payload = {"beta": sbeta.astype(np.float32),
                "features": np.array(C.FEATURES),
-               "lam": float(lam), "cv_kmax": cv_kmax,
+               "beta_full": beta.astype(np.float32),
+               "features_full": np.array(C.FEATURES_FULL),
+               "lam": float(slam), "lam_full": float(lam), "cv_kmax": cv_kmax,
                "n_train_mlps": len(tsel),
                "n_val_mlps": len(vsel), "n_test_mlps": len(xsel),
-               "val_gain": float(gain), "test_gain": float(base_x / vx)}
+               "val_gain": float(sgain), "test_gain": float(base_x / svx),
+               "val_gain_full": float(gain),
+               "test_gain_full": float(base_x / vx)}
 
     if do_mlp:
         print(f"\n=== MLP head ({hidden} hidden units) ===")
@@ -398,9 +440,9 @@ def mode_fit(val_frac: float, lam_grid, do_mlp: bool, hidden: int,
         best_m = (None, -1.0, None)
         for hs in (hidden,):
             for lr in (3e-2, 1e-2):
-                m = C.MLPHead(C.N_FEATURES, hs, seed=seed)
+                m = C.MLPHead(C.N_FEATURES_FULL, hs, seed=seed)
                 m.fit(Xs_t, yt2 / ys, epochs=epochs, lr=lr, seed=seed)
-                pv, _ = m.forward(Xs_v.reshape(-1, C.N_FEATURES))
+                pv, _ = m.forward(Xs_v.reshape(-1, C.N_FEATURES_FULL))
                 pred = MU[vsel] + (pv * ys).reshape(Xv.shape[:2])
                 v = _umse(pred, A[vsel], B[vsel])
                 print(f"  hidden {hs:3d} lr {lr:.0e}: val {v:11.4e}   "
@@ -408,7 +450,7 @@ def mode_fit(val_frac: float, lam_grid, do_mlp: bool, hidden: int,
                 if base_v / v > best_m[1]:
                     best_m = (m, base_v / v, hs)
         m, mg, hs = best_m
-        px, _ = m.forward((Xx / sc).reshape(-1, C.N_FEATURES))
+        px, _ = m.forward((Xx / sc).reshape(-1, C.N_FEATURES_FULL))
         vmx = _umse(MU[xsel] + (px * ys).reshape(Xx.shape[:2]),
                     A[xsel], B[xsel])
         print(f"  best MLP head {mg:.3f}x on validation, "
@@ -429,12 +471,16 @@ def mode_fit(val_frac: float, lam_grid, do_mlp: bool, hidden: int,
         # 228 bytes and pickle-free; ``fnp.load`` reads it at 0 FLOPs.
         ship = Path(__file__).resolve().parent.parent / "submission" / \
             "corrector.npz"
-        np.savez(ship, beta=beta.astype(np.float32))
+        np.savez(ship, beta=sbeta.astype(np.float32))
         print(f"installed {ship}  ({ship.stat().st_size} bytes)")
     (data_dir() / (out_name + ".json")).write_text(json.dumps(
-        {"lam": float(lam), "val_gain": float(gain),
-         "test_gain": float(base_x / vx), "cv_kmax": cv_kmax,
-         "beta": beta.tolist(), "features": list(C.FEATURES)}, indent=1))
+        {"lam": float(slam), "val_gain": float(sgain),
+         "test_gain": float(base_x / svx), "cv_kmax": cv_kmax,
+         "beta": sbeta.tolist(), "features": list(C.FEATURES),
+         "lam_full": float(lam), "val_gain_full": float(gain),
+         "test_gain_full": float(base_x / vx),
+         "beta_full": beta.tolist(),
+         "features_full": list(C.FEATURES_FULL)}, indent=1))
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +659,9 @@ def main() -> int:
     ap.add_argument("--mlp-head", action="store_true")
     ap.add_argument("--hidden", type=int, default=16)
     ap.add_argument("--epochs", type=int, default=300)
-    ap.add_argument("--coef", type=str, default="head_ridge.npz")
+    # head_lean.npz is the 15-column shipped head; head_ridge.npz is the
+    # 28-column predecessor, kept so its ablation table stays re-scoreable.
+    ap.add_argument("--coef", type=str, default="head_lean.npz")
     ap.add_argument("--cv-kmax", type=int, default=2)
     ap.add_argument("--install", action="store_true",
                     help="write submission/corrector.npz")

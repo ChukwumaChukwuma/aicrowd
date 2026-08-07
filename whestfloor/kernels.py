@@ -1161,11 +1161,17 @@ KERNELS["mlmc"] = mlmc_kernel
 #      self-term Cov(g' G^-1 g, y_j)/N which is a real bias, not noise, and
 #      at k=3 it reverses the sign of the correction.
 #
-#   2. AN OFFLINE-TRAINED LINEAR HEAD over those corrections and ~20 other
-#      predict-time features, fitted on 640 generated MLPs and loaded from an
-#      npz at 0 FLOPs.  It supplies the shrinkage each block needs (each block
-#      costs p/N = 3% of the residual in estimation noise) rather than
-#      assuming a coefficient of 1.
+#   2. AN OFFLINE-TRAINED LINEAR HEAD over those corrections and a handful of
+#      other predict-time features, fitted on 640 generated MLPs and loaded
+#      from an npz at 0 FLOPs.  It supplies the shrinkage each block needs
+#      (each block costs p/N = 3% of the residual in estimation noise) rather
+#      than assuming a coefficient of 1.
+#
+#      The design was 28 columns and is now 15 (``corrector.DROPPED``).  Every
+#      column removed measures at exactly 1.000x on validation, and between
+#      them they cost EIGHT passes over the (N, width) sample array -- d^3 and
+#      d^4 for the sample-Edgeworth terms and mean(x*x) for Var(relu z) --
+#      which is residual wall time billed at lambda = 1e11 FLOP/s.
 #
 # ``damp=0`` is the exact ablation: the identical code path with the head's
 # output scaled to zero, which reproduces ``sparse_mc_kernel`` bit for bit.
@@ -1237,7 +1243,7 @@ def _hermite_cv(x, z1, y, w1, kmax: int = 2):
         wb = g2 @ (u1 if sc is None else u1 * sc)
         wb = wb - fnp.mean(wb)
         out.append(0.5 * ((y[:h].T @ wa) / h + (y[h:].T @ wb) / (n - h)))
-    while len(out) < 3:
+    while len(out) < 2:
         out.append(fnp.zeros(w1.shape[0], dtype=x.dtype))
     return out
 
@@ -1270,24 +1276,23 @@ def _meanfield_cv(h1m, w1, weights, alpha, Ph):
 
 
 def corrector_design(prim):
-    """``(width, n_features)`` design matrix.  Mirrors ``corrector.build_design``."""
+    """``(width, n_features)`` design matrix.
+
+    Mirrors ``corrector.build_design`` restricted to ``corrector.FEATURES``:
+    the thirteen columns in ``corrector.DROPPED`` all measure at exactly
+    1.000x and three of the four groups cost passes over the ``(N, width)``
+    sample array, so they are not computed at all.
+    """
     a, Ph = prim["alpha"], prim["Phi"]
     one = fnp.ones_like(a)
-    cv1, cv2, gap = prim["cv1"], prim["cv2"], prim["gap"]
-    mf = prim["cv1mf"]
+    cv1, cv2, mf = prim["cv1"], prim["cv2"], prim["cv1mf"]
     cols = [
         one,
         cv1, cv1 * Ph, cv1 * a,
         cv2, cv2 * Ph, cv2 * a,
-        prim["cv3"],
         mf, mf * Ph, mf * a,
-        gap, gap * Ph, gap * a,
-        prim["sk"], prim["ku"],
-        prim["mu"], prim["mu"] * Ph,
         prim["s"], Ph, prim["phi"], a,
-        prim["sd_mc"], prim["dpilot"],
-        prim["wn"] - 1.0, prim["w4"] - 3.0,
-        one * (prim["vbar"] - 0.05), one * (prim["arms"] - 3.4),
+        prim["dpilot"],
     ]
     return fnp.stack(cols, axis=1)
 
@@ -1345,32 +1350,21 @@ def _corrected_sparse(weights, tau, n_samples, n_pilot, seed, beta, damp,
 
     cvs = _hermite_cv(x0, z1, x, weights[0], kmax=kmax)
 
-    ex2 = fnp.mean(x * x, axis=0)
-    vh = fnp.maximum(ex2 - mu * mu, 0.0)
+    # ``v`` from the raw second moment rather than from a centred copy of the
+    # (N, width) array: one pass fewer, and the pilot already uses this form.
+    # At rms|alpha| = 3.44, mean(z^2) ~ 12.8 v, so the cancellation costs one
+    # float32 digit -- 1e-6 relative on v, six orders under what the head sees.
     m = fnp.mean(z, axis=0)
-    d = z - m
-    v = fnp.maximum(fnp.mean(d * d, axis=0), 1e-12)
+    v = fnp.maximum(fnp.mean(z * z, axis=0) - m * m, 1e-12)
     s = fnp.sqrt(v)
-    d2 = d * d
-    gam1 = fnp.mean(d2 * d, axis=0) / (v * s)
-    gam2 = fnp.mean(d2 * d2, axis=0) / (v * v) - 3.0
     a = m / s
     Ph, ph = _norm01(a)
-    wl = weights[-1]
-    wn = fnp.sum(wl * wl, axis=0)
-    wl2 = wl * wl
     prim = {
-        "mu": mu, "cv1": cvs[0], "cv2": cvs[1], "cv3": cvs[2],
+        "mu": mu, "cv1": cvs[0], "cv2": cvs[1],
         "cv1mf": _meanfield_cv(fnp.mean(h1, axis=0), weights[0],
                                weights, alpha, Ph),
-        "gap": (m * Ph + s * ph) - mu,
-        "sk": -(gam1 / 6.0) * s * a * ph,
-        "ku": (gam2 / 24.0) * s * (a * a - 1.0) * ph,
         "alpha": a, "Phi": Ph, "phi": ph, "s": s,
-        "sd_mc": fnp.sqrt(vh / n_samples), "dpilot": mu - mean_h[-1],
-        "wn": wn, "w4": n * fnp.sum(wl2 * wl2, axis=0)
-        / fnp.maximum(wn * wn, 1e-30),
-        "vbar": fnp.mean(vh), "arms": fnp.sqrt(fnp.mean(a * a)),
+        "dpilot": mu - mean_h[-1],
     }
     corr = corrector_design(prim) @ beta
     if damp != 1.0:

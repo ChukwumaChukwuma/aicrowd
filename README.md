@@ -29,8 +29,15 @@ Two consequences set the whole design:
 Nothing reaches that floor: it needs a 154,000× variance reduction over plain
 sampling, and the public leaderboard leader is at 73× the floor. What this
 repository does reach is documented in `docs/state_of_play.md`, and the current
-estimator is **sparse Monte Carlo with layer-1 Hermite control variates and an
-offline-trained residual head** (`docs/learned_corrector.md`).
+estimator is **sparse Monte Carlo with layer-1 Hermite control variates and a
+15-feature offline-trained residual head** (`docs/learned_corrector.md`,
+trimmed in `docs/stein_cv.md`): raw **3.7157e-6**, adjusted **3.95e-7**,
+`F/B` **0.0919**, 0 raises in 100.
+
+The one surrogate family that provably escapes the low-order barrier — Stein
+control variates driven by the network's own gradient — was built, verified
+exactly unbiased, and measured at `R² = 11.5%` against a pre-registered bar of
+0.75 (`docs/stein_cv.md`). It is not shipped.
 
 ## Layout
 

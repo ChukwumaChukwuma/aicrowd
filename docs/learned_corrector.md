@@ -1,5 +1,12 @@
 # The offline-trained corrector, and the control variate it turned out to be
 
+> **Superseded in one respect.** The 28-column design described here is now 15
+> columns: `docs/stein_cv.md` §6 cashes in the dead weight §8 flagged, for
+> 1.016x adjusted (1.035x at 3x residual) at no cost in accuracy. Everything
+> else on this page — the mechanism, the ANOVA table, the split-sample
+> argument, and every ablation below — is unchanged and still reproducible,
+> because the full design survives as `corrector.FEATURES_FULL`.
+
 **Result: shipped. Raw final-layer MSE `3.7194e-6`, adjusted `3.99e-7`, 0
 raises in 100, on the official 100-MLP suite with the N=1e9 reference — against
 `5.8050e-6` / `6.05e-7` for the previous ship measured in the same run through
@@ -321,6 +328,12 @@ the early return and the ablation would no longer be exact.
   the budget is provably dead weight that a re-fit without it would recover.
   It was left in so the ablation table above is a measurement of the shipped
   code rather than of a variant.
+  **CASHED IN — see `docs/stein_cv.md` §6.** Thirteen of the 28 columns are
+  gone (RB/Edgeworth, the multiplicative shrink, the weight/suite scalars,
+  `cv3`, and `sd_mc`), the head is re-fitted on the 15 that remain, and the
+  untouched test split reads 1.353x against this design's 1.354x. The full
+  28-column design survives as `corrector.FEATURES_FULL` so every table on
+  this page is still reproducible by `scripts/28 --mode fit`.
 - **The control variates are unbiased; the head is not.** `E[He_k(t)] = 0` is
   exact and the split-sample coefficient estimate keeps the corrections
   mean-zero. The head then adds a fitted term with no such guarantee. Its

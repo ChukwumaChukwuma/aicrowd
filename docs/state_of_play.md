@@ -27,10 +27,11 @@ margin that matters is quoted in `F`.
 
 **The shipped estimator is sampling with the always-off neurons pruned out of
 every matmul** (`docs/sparse_sign_stable.md`), **plus layer-1 Hermite control
-variates and an offline-trained residual head** (`docs/learned_corrector.md`):
-raw **3.7194e-6**, adjusted **3.99e-7**, 0 raises in 100 — 1.56x raw / 1.52x
-adjusted over the same code path with the head switched off, and now 1.62x
-below the grader's own plain-MC constant `sampling_mse = 6.4695e-7`.
+variates and a 15-feature offline-trained residual head**
+(`docs/learned_corrector.md`, trimmed in `docs/stein_cv.md` §6): raw
+**3.7157e-6**, adjusted **3.95e-7**, `F/B` **0.0919**, 0 raises in 100 — 1.56x
+raw / 1.51x adjusted over the same code path with the head switched off, and
+1.64x below the grader's own plain-MC constant `sampling_mse = 6.4695e-7`.
 
 The whole analytic programme below is retained as research, not as ship:
 blending it back in *worsens* the score, because its 2.7e9 FLOPs push `C/B`
@@ -78,6 +79,8 @@ every sparse-correction scheme — see `docs/sparse_sign_stable.md`.
 | **layer-1 Hermite control variates, k ≤ 2** | **1.33×** at unit coefficient; k=3 is 1.20× | **shipped** | `28` |
 | **offline-trained ridge head** over both | **1.52× adjusted on the official suite** | **shipped** | `28` |
 | offline-trained **MLP** head, same features | 0.785× vs ridge (bar 1.5×) | **dead** | `28` |
+| **Stein CVs from the network's own gradient** | R² = 11.5% vs a 0.75 bar; +0.44 points on the shipped family; exact ceiling 1.8% | **dead** | `30` |
+| **dropping the 13 measured-1.000× head columns** | **1.016× adjusted** (1.035× at 3× residual), free | **shipped** | `28`, `30` |
 
 ### Why sign-stable sparsity mostly does not work (`docs/sparse_sign_stable.md`)
 
@@ -94,6 +97,28 @@ in setup. And the decided neurons carry **0.10% of the estimator variance at
 dumbest version — drop the rows and columns of neurons that never fire — worth
 **1.44× on the score, replicated across four independent seeds**, which shipped
 anyway despite the failed cost bar.
+
+### Why Stein control variates are dead (`docs/stein_cv.md`)
+
+The one construction that *provably* escapes the low-order barrier, and it is
+still worth nothing. `h = c·∇ψ − (c·x)ψ` is exactly mean-zero for any Lipschitz
+`ψ` and any fixed `c` — verified to Monte-Carlo error, worst rms z-score 1.278
+over 3,072 tests per `ψ` family — and `∇ψ` for a network internal is as
+high-order as the network. Measured span against `relu(z³²_j)`, held out:
+**11.5%** for the whole dictionary (four `ψ` families × two directions × 256
+source neurons), **+0.44 points** on top of the shipped layer-1 Hermite family,
+against a pre-registered bar of `R² > 0.75`.
+
+The reason is one line of operator algebra. `h = −a_c^†ψ` where `a_c^†` is the
+Hermite *raising* operator, so `Var(h) ≥ |c|²‖ψ‖²` while
+`Cov(h, ȳ) = −E[(c·∇y)ψ]` — a purely adjacent-degree pairing. Escaping the
+barrier is necessary and not sufficient. Worse, the `ψ` that would maximise the
+alignment is `c·∇y_j` itself, which for a ReLU net is discontinuous across the
+kinks, hence not weakly differentiable, hence exactly the function Stein's
+identity forbids: **the construction excludes its own optimum.** A second
+application of Stein's identity gives an exact, Jacobian-free ceiling for the
+whole 256-direction family on `ψ = y_j` — `R² ≤ |kⱼ|²/Var(yⱼ)²` with
+`kⱼ = ½E[x ȳⱼ²]` — measured at **1.8%**, i.e. 1.019×.
 
 ### Why multilevel Monte Carlo is dead (`docs/mlmc.md`)
 
@@ -187,10 +212,18 @@ stops.
 | proven noise floor (`docs/floor_theorem.md`) | 4.949e-12 | 1.0 |
 | leaderboard #1 (dpskv5) | 3.63e-10 | 73.3 |
 | the sign-stable family as a competitor ships it | 1.60e-7 | 32,300 |
-| **this repo, now** | **3.99e-7** | **80,600** |
-| this repo, previous ship (sparse MC) | 5.87e-7 | 118,600 |
+| **this repo, now** | **3.95e-7** | **79,900** |
+| this repo, previous ship (28-feature head) | 4.01e-7 | 81,100 |
+| this repo, two ships ago (sparse MC) | 5.87e-7 | 118,600 |
 | grader's plain-MC constant `sampling_mse` | 6.4695e-7 | 130,700 |
-| this repo, two ships ago (analytic blend) | 7.7791e-7 | 157,200 |
+| this repo, three ships ago (analytic blend) | 7.7791e-7 | 157,200 |
+
+The top two rows of this repo's block come from **one interleaved run** in
+which both estimators were scored per MLP in the same process, so the
+machine-dependent residual is measured under identical load; the previous
+ship's own published figure was 3.99e-7, and the 0.6% spread between the two
+is what run-to-run residual noise on this box looks like. Raw MSE, which is
+machine-independent, went 3.7194e-6 → 3.7157e-6.
 
 The entire remaining headroom in the benchmark is 73.3× and we are 1,100× behind
 the leader, so the gap is not a modelling gap — it is that nothing here yet

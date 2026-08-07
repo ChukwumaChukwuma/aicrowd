@@ -49,6 +49,19 @@ overfitting, so ``k <= 2`` is the optimum and ``k >= 3`` is not worth its own
 noise.  The offline head recovers part of that 3% by learning a shrinkage on
 each block -- a fitted James-Stein weight rather than an assumed one.
 
+The design was 28 columns and is now 15; see :data:`DROPPED`.  Everything
+removed measured at exactly 1.000x in the leave-one-group-out table and three
+of the four groups cost passes over the ``(N, width)`` sample array, which is
+participant wall time billed at ``lambda = 1e11`` FLOP/s.  The full 28-column
+design survives as :data:`FEATURES_FULL` so those ablations stay reproducible.
+
+What is NOT here, and was measured first: **Stein control variates built from
+the network's own gradient** (``docs/stein_cv.md``, ``scripts/30_stein_cv.py``).
+``h = c.grad psi - (c.x) psi`` is exactly mean-zero for any Lipschitz ``psi``
+-- verified to Monte-Carlo error -- but the whole family reaches R^2 = 11.5%
+against ``relu(z^32_j)`` and adds **+0.4 points** on top of the layer-1
+Hermite family, against a pre-registered bar of R^2 > 0.75.
+
 Nothing here is imported by ``submission/estimator.py``: the submission carries
 a flopscope-only copy, and ``tests/test_corrector_parity.py`` asserts the two
 agree bitwise.
@@ -88,7 +101,10 @@ def norm_pdf(x):
 # ---------------------------------------------------------------------------
 # Feature block.  Order is FROZEN: the shipped coefficient vector indexes it.
 # ---------------------------------------------------------------------------
-FEATURES: tuple[str, ...] = (
+#: The full RESEARCH design.  Every group ablation in ``scripts/28 --mode fit``
+#: indexes this tuple, so it must not be reordered or the published tables
+#: stop meaning what they say.
+FEATURES_FULL: tuple[str, ...] = (
     "one",          # intercept
     "cv1",          # layer-1 Hermite k=1 control variate (== input-linear CV)
     "cv1_Phi",
@@ -119,7 +135,38 @@ FEATURES: tuple[str, ...] = (
     "arms",         # per-MLP rms|alpha| - 3.4
 )
 
+#: Columns the SHIPPED kernel does not compute at all.
+#:
+#: Every one of them measures at **exactly 1.000x** in the leave-one-group-out
+#: table of ``docs/learned_corrector.md`` sec 5 -- removing the group leaves
+#: the validation gain at 1.504x, unchanged to three decimals -- while three of
+#: the four groups cost real passes over the ``(N, width)`` sample array, which
+#: is participant wall time billed at ``lambda = 1e11`` FLOP/s:
+#:
+#:   * ``gap``/``sk``/``ku`` need ``gamma_1`` and ``gamma_2``, i.e. ``d^3`` and
+#:     ``d^4`` over the whole final-layer sample: five passes;
+#:   * ``sd_mc`` and ``vbar`` both need ``vh = Var(relu z^32)``, i.e.
+#:     ``mean(x*x)``: two more passes;
+#:   * ``wn``/``w4`` are ``(width, width)`` reductions, cheap but worthless;
+#:   * ``mu``/``mu_Phi`` (the multiplicative shrink) and ``cv3`` (zero at
+#:     ``CV_KMAX = 2``) are free and worthless.
+#:
+#: Dropping them removes **eight** passes over the ``(8500, 256)`` array.  The
+#: fitted head is re-fitted on the reduced design, not merely masked, so the
+#: ridge shrinkage is the right one for the columns that remain.
+DROPPED: tuple[str, ...] = (
+    "cv3",
+    "gap", "gap_Phi", "gap_a", "sk", "ku",
+    "mu", "mu_Phi",
+    "sd_mc",
+    "wn", "w4", "vbar", "arms",
+)
+
+#: What the submission actually builds and what the shipped ``beta`` indexes.
+FEATURES: tuple[str, ...] = tuple(f for f in FEATURES_FULL if f not in DROPPED)
+
 N_FEATURES = len(FEATURES)
+N_FEATURES_FULL = len(FEATURES_FULL)
 
 #: Primitive arrays :func:`sparse_mc_features` returns per output neuron.
 PRIMITIVES: tuple[str, ...] = (
@@ -130,30 +177,37 @@ PRIMITIVES: tuple[str, ...] = (
 SCALARS: tuple[str, ...] = ("vbar", "arms", "keep_frac")
 
 
-def build_design(f) -> np.ndarray:
-    """``(width, N_FEATURES)`` design matrix from the primitives.
+def feature_columns(f) -> dict:
+    """Every named column, from the primitives.
 
     Single source of truth for the derived columns, so the research path and
-    the shipped path cannot drift.
+    the shipped path cannot drift.  Building all of them is free here (this is
+    the offline numpy path); the shipped kernel builds only ``FEATURES``.
     """
     a, Ph = f["alpha"], f["Phi"]
     one = np.ones_like(a)
-    cv1, cv2, gap = f["cv1"], f["cv2"], f["gap"]
-    cols = [
-        one,
-        cv1, cv1 * Ph, cv1 * a,
-        cv2, cv2 * Ph, cv2 * a,
-        f["cv3"],
-        f["cv1mf"], f["cv1mf"] * Ph, f["cv1mf"] * a,
-        gap, gap * Ph, gap * a,
-        f["sk"], f["ku"],
-        f["mu"], f["mu"] * Ph,
-        f["s"], Ph, f["phi"], a,
-        f["sd_mc"], f["dpilot"],
-        f["wn"] - 1.0, f["w4"] - 3.0,
-        one * (float(f["vbar"]) - 0.05), one * (float(f["arms"]) - 3.4),
-    ]
-    return np.stack(cols, axis=1)
+    cv1, cv2, gap, mf, mu = f["cv1"], f["cv2"], f["gap"], f["cv1mf"], f["mu"]
+    return {
+        "one": one,
+        "cv1": cv1, "cv1_Phi": cv1 * Ph, "cv1_a": cv1 * a,
+        "cv2": cv2, "cv2_Phi": cv2 * Ph, "cv2_a": cv2 * a,
+        "cv3": f["cv3"],
+        "cv1mf": mf, "cv1mf_Phi": mf * Ph, "cv1mf_a": mf * a,
+        "gap": gap, "gap_Phi": gap * Ph, "gap_a": gap * a,
+        "sk": f["sk"], "ku": f["ku"],
+        "mu": mu, "mu_Phi": mu * Ph,
+        "s": f["s"], "Phi": Ph, "phi": f["phi"], "a": a,
+        "sd_mc": f["sd_mc"], "dpilot": f["dpilot"],
+        "wn": f["wn"] - 1.0, "w4": f["w4"] - 3.0,
+        "vbar": one * (float(f["vbar"]) - 0.05),
+        "arms": one * (float(f["arms"]) - 3.4),
+    }
+
+
+def build_design(f, names: tuple[str, ...] | None = None) -> np.ndarray:
+    """``(width, len(names))`` design matrix; ``names`` defaults to what ships."""
+    cols = feature_columns(f)
+    return np.stack([cols[k] for k in (names or FEATURES)], axis=1)
 
 
 # ---------------------------------------------------------------------------
