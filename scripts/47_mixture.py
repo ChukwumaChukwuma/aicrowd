@@ -234,6 +234,16 @@ def mode_ceiling(args) -> int:
               f"streams {time.time() - t1:.0f}s   K=1 oracle "
               f"{base['gauss'][N][-1]:.4e}  chain {base['chain'][N][-1]:.4e}",
               flush=True)
+        # partial dump after every MLP: a 40-minute sweep should never be
+        # all-or-nothing.
+        (ART / f"ceiling{args.tag}_partial.json").write_text(json.dumps(
+            {"done": i + 1,
+             "table": {"|".join(map(str, k)):
+                       {str(sz): list(map(float, v)) for sz, v in dd.items()}
+                       for k, dd in acc_rows.items()},
+             "baselines": {k: {str(sz): list(map(float, v))
+                               for sz, v in dd.items()}
+                           for k, dd in base.items()}}, indent=1))
 
     def rich(d):
         """2 * MSE(N) - MSE(N/2): the 1/N term removed."""
@@ -491,17 +501,19 @@ def bill_kernel(args):
     W = make_mlp(256, 32, MLP_SEED_BASE)
     fw = [fnp.asarray(w) for w in W]
     out = {}
+    # Keyed by (K, split_at): a mixture that splits at layer 8 pays for K
+    # components on 24 layers, not 32, so K alone does not determine F.
     for nodes, r, split_at, _ in PROP_PLAN:
-        K = nodes ** r
-        if K in out:
+        key = (nodes ** r, split_at)
+        if key in out:
             continue
         with flops.BudgetContext(flop_budget=10 ** 13, quiet=True) as c:
             mixture_kernel(fw, nodes=nodes, r=r, kmax=args.kmax_bill,
                            split_at=split_at)
-        out[K] = int(c.flops_used)
+        out[key] = int(c.flops_used)
     with flops.BudgetContext(flop_budget=10 ** 13, quiet=True) as c:
         mixture_kernel(fw, nodes=1, r=1, kmax=args.kmax_bill, split_at=0)
-    out[1] = int(c.flops_used)
+    out[(1, 0)] = int(c.flops_used)
     return out
 
 
@@ -564,13 +576,13 @@ def mode_propagate(args) -> int:
     for cfg in PROP_PLAN:
         v = float(np.mean(rows[cfg]))
         K = cfg[0] ** cfg[1]
-        F = bill.get(K, 0)
+        F = bill.get((K, cfg[2]), 0)
         fb = F / 272_000_000_000
         print(f"  {cfg[0]:>5} {cfg[1]:>2} {cfg[2]:>5} {cfg[3]:>4} {K:>4} "
               f"{v:12.4e} {base / v:8.2f} {F:14,d} {fb:7.4f} "
               f"{v * max(0.1, fb):11.4e}")
     (ART / "propagate.json").write_text(json.dumps(
-        {"chain": base, "bill": {str(k): v for k, v in bill.items()},
+        {"chain": base, "bill": {f"{k[0]}|{k[1]}": v for k, v in bill.items()},
          "rows": {"|".join(map(str, k)): float(np.mean(v))
                   for k, v in rows.items()}}, indent=1))
     return 0

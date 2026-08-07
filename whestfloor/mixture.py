@@ -60,15 +60,27 @@ VAR_FLOOR = 1e-30
 # ---------------------------------------------------------------------------
 # Quantiser
 # ---------------------------------------------------------------------------
-def lloyd(T: np.ndarray, K: int, *, iters: int = 25, seed: int = 0,
-          tol: float = 1e-7) -> np.ndarray:
+def lloyd(T: np.ndarray, K: int, *, iters: int = 600, seed: int = 0,
+          tol: float = 1e-6) -> np.ndarray:
     """Lloyd (k-means) centroids of ``T`` (n, r) with k-means++ seeding.
 
-    For ``r = 1`` this is the Lloyd-Max scalar quantiser, i.e. exactly the
-    optimal ``K``-node placement along the conditioning direction, which is the
-    honest form of "Gauss-Hermite nodes along the top eigendirection": Lloyd
-    can only beat a fixed quadrature rule, so a ceiling measured with Lloyd
-    cells bounds one measured with GH nodes.
+    For ``r = 1`` this is the Lloyd-Max scalar quantiser, i.e. the optimal
+    ``K``-node placement along the conditioning direction, which is the honest
+    form of "Gauss-Hermite nodes along the top eigendirection": Lloyd can only
+    beat a fixed quadrature rule, so a ceiling measured with Lloyd cells bounds
+    one measured with GH nodes.
+
+    **Convergence is tested on centroid movement, not on the objective.**
+    Lloyd's objective is quadratically flat near its optimum, so an
+    objective-change rule stops while the centroids are still moving: measured
+    at ``K = 64`` on 20,000 standard normals, 25 iterations under a 1e-7
+    relative objective rule leave ``obj/N`` at **1.87e-3** against **1.04e-3**
+    converged, with centroids sitting 15.8% of a cell standard deviation from
+    their own cell means.  A ceiling measured on cells that coarse is
+    pessimistic exactly where the ``K`` curve is supposed to saturate, which is
+    the one place it must not be.  It takes 238 iterations to converge there.
+    ``tol`` is the largest centroid move, in units of the coordinate's own
+    standard deviation.
     """
     rng = np.random.default_rng(seed)
     #: 40 points per cell is far more than a centroid needs, and the pilot is
@@ -95,21 +107,20 @@ def lloyd(T: np.ndarray, K: int, *, iters: int = 25, seed: int = 0,
             else:
                 C[k] = T[np.searchsorted(np.cumsum(d2), rng.random() * tot)]
             np.minimum(d2, ((T - C[k]) ** 2).sum(axis=1), out=d2)
-    prev = np.inf
+    scale = float(np.sqrt(max(float(T.var(axis=0).mean()), 1e-30)))
     for _ in range(iters):
         lab = assign(T, C)
         cnt = np.bincount(lab, minlength=K).astype(np.float64)
         S = np.zeros_like(C)
         np.add.at(S, lab, T)
         live = cnt > 0
+        prev = C.copy()
         C[live] = S[live] / cnt[live, None]
         if not live.all():  # respawn empties on the worst-served point
             far = np.argsort(((T - C[lab]) ** 2).sum(axis=1))[::-1]
             C[~live] = T[far[: int((~live).sum())]]
-        obj = float(((T - C[lab]) ** 2).sum())
-        if abs(prev - obj) <= tol * max(obj, 1e-30):
+        if float(np.abs(C - prev).max()) <= tol * scale:
             break
-        prev = obj
     return C
 
 

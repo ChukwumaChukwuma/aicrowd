@@ -150,7 +150,7 @@ def record_propagate():
     best = rows[best_key]
     nodes, r, split_at, resplit = (int(v) for v in best_key.split("|"))
     K = nodes ** r
-    F = d["bill"][str(K)]
+    F = d["bill"][f"{K}|{split_at}"]
     fb = F / 272_000_000_000
     e = Experiment(
         name="mixture_propagation_deployable",
@@ -275,10 +275,16 @@ def frontier():
 
 
 def main() -> int:
-    print("# recording mixture results")
-    record_anatomy()
-    record_ceiling()
-    record_propagate()
+    #: The ledger is append-only by design -- a re-run appends, it never edits
+    #: -- so name the sections to record and do not re-append the others.
+    only = set(sys.argv[1:]) or {"anatomy", "ceiling", "propagate"}
+    print(f"# recording mixture results: {sorted(only)}")
+    if "anatomy" in only:
+        record_anatomy()
+    if "ceiling" in only:
+        record_ceiling()
+    if "propagate" in only:
+        record_propagate()
     fr = frontier()
     if fr is not None:
         (ART / "frontier.json").write_text(json.dumps(fr, indent=1))
