@@ -62,6 +62,21 @@ the network's own gradient** (``docs/stein_cv.md``, ``scripts/30_stein_cv.py``).
 against ``relu(z^32_j)`` and adds **+0.4 points** on top of the layer-1
 Hermite family, against a pre-registered bar of R^2 > 0.75.
 
+Also NOT here, and measured second: **high-degree Hermite CVs on
+network-adapted directions** (``docs/hermite_rank_ceiling.md``,
+``scripts/32_adapted_hermite.py``).  The ``p/N`` argument above says nothing
+about approximation power, and ``He_d`` of a layer-1 pre-activation is a
+degree-``d`` object, so the barrier's ``k <= 2`` instance never bounded
+``k >= 3``.  It is still dead, for a third reason: ``h_d(<a,x>)`` is exactly a
+unit RANK-ONE tensor of the degree-``d`` chaos, and past degree 2 the
+network's chaos content -- 54% of ``Var(y)``, mean Hermite degree 10.5 -- has
+no rank-one component.  Measured over 71 dictionaries and 2,494 features
+(degree <= 16, mean-field/mean-Jacobian/per-neuron/random direction frames,
+all cross products, held-out against an analytic Gram): the family caps at
+**43.2%**, ``CV_KMAX = 2`` on the coordinate basis already reaches **39.2%**,
+and the argmax of held-out R^2 net of ``p/N`` over the whole surface is
+exactly the basis below.
+
 Nothing here is imported by ``submission/estimator.py``: the submission carries
 a flopscope-only copy, and ``tests/test_corrector_parity.py`` asserts the two
 agree bitwise.

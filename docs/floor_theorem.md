@@ -200,3 +200,31 @@ The honest summary is that the barrier is a statement about **which orders you
 can reach**, and the layer-1 Hermite family reaches order 2 for free because
 the first layer of a ReLU MLP is exactly Gaussian in the input. Nothing
 comparable is available at layer 2 or beyond, which is where this line stops.
+
+### Second amendment: ANOVA order is not Hermite degree, and the family is now closed
+
+`docs/hermite_rank_ceiling.md` measures the **Hermite degree** spectrum
+directly, by the Ornstein-Uhlenbeck semigroup (`Cov(y(x), y(x_t)) = Σ_d f_d
+t^d` for the Mehler coupling `x_t = t x + √(1−t²) ξ`). Two corrections to how
+this page has been read:
+
+* **`d_M = 11.5` is the mean ANOVA (superposition) dimension, not the mean
+  degree.** `He_2(x_1)` involves one coordinate and has degree 2. The mean
+  *Hermite degree* is **10.5**, measured separately; the two agree in spirit
+  but they are different objects and only the degree one bounds a Hermite
+  dictionary.
+* **The degree spectrum is** `f = (26.7, 19.0, 11.2, 7.0, 4.7, 3.3, …)%`, and
+  the `f_1 = 26.7%` entry reproduces the `f_1 = 0.276 ± 0.016` above from a
+  seventh independent estimator. So 54% of `Var(y)` really does sit above
+  degree 2 — the barrier's `k ≤ 2` instance is *not* an approximation-power
+  statement about the target.
+
+It is a statement about what a Hermite dictionary can *reach*.
+`h_d(⟨a,x⟩) = Σ_{|α|=d} √(d!/α!) a^α H_α` is exactly a unit **rank-one**
+symmetric tensor of the degree-`d` chaos, so a dictionary on `m` directions
+lives in `Sym^d(span A)` and is capped by `Σ_j Var(E[y_j | Aᵀx])` at every
+degree at once. Measured: 2,494 features spanning degree ≤ 16 on every
+direction basis derivable from the network reach **43.2%**, against the
+shipped `k ≤ 2` basis's **39.2%** — i.e. `1.76×` against `1.65×`. The
+`1/(1 − 0.43) = 1.75×` quoted above is therefore not just the `k ≤ 2` ceiling;
+**it is the ceiling for the whole layer-1 Hermite family at any degree.**

@@ -39,6 +39,20 @@ control variates driven by the network's own gradient — was built, verified
 exactly unbiased, and measured at `R² = 11.5%` against a pre-registered bar of
 0.75 (`docs/stein_cv.md`). It is not shipped.
 
+**The layer-1 Hermite family is now closed too** (`docs/hermite_rank_ceiling.md`).
+`He_d` of a layer-1 pre-activation is a degree-`d` object, so the barrier's
+`k ≤ 2` instance never bounded it; the real obstruction is **rank**.
+`h_d(⟨a,x⟩)` is exactly a unit *rank-one* symmetric tensor of the degree-`d`
+Wiener chaos, so a Hermite dictionary on `m` directions lives in
+`Sym^d(span A)` and is capped by `Σ_j Var(E[y_j | Aᵀx])` — at every degree at
+once. Measured: the degree spectrum of `relu(z³²)` is
+`f = (26.7, 19.0, 11.2, 7.0, …)%` with **mean Hermite degree 10.5**, so 54% of
+the variance sits above degree 2 — and the largest dictionary the family can
+build (2,494 features, degree ≤ 16, every cross product) reaches
+**43.2%**, of which the shipped 512-feature `k ≤ 2` basis already realises
+**39.2%**. The argmax of held-out `R²` net of `p/N` over all 71 dictionaries
+measured *is* the shipped basis.
+
 ## Layout
 
 ```

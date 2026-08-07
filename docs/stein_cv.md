@@ -14,6 +14,16 @@ The trip was not wasted: the same algebra that kills it says exactly *why*,
 and the reason is a property of the Hermite ladder rather than of this
 network. Section 5 states it.
 
+> **Sequel.** `docs/hermite_rank_ceiling.md` closes the *other* half of the
+> board with the same kind of argument. Where §4 here bounds the Stein family
+> by the raising operator, that page bounds the whole **layer-1 Hermite**
+> family — every degree, every direction basis, every cross product — by the
+> fact that `h_d(⟨a,x⟩)` is exactly a unit **rank-one** tensor of the
+> degree-`d` chaos, hence `R² ≤ Σ_j Var(E[y_j | Aᵀx])`. Measured: 43.2%
+> (1.76×) for a 2,494-feature dictionary, of which the shipped `H1+H2` at
+> 39.03–39.24% already has almost all. The `39.03%` in §3 below is not a way
+> station; it is the family's answer.
+
 ---
 
 ## 1. The construction, and why it looked like the way out
