@@ -70,19 +70,31 @@ def lloyd(T: np.ndarray, K: int, *, iters: int = 25, seed: int = 0,
     can only beat a fixed quadrature rule, so a ceiling measured with Lloyd
     cells bounds one measured with GH nodes.
     """
-    n = T.shape[0]
     rng = np.random.default_rng(seed)
+    #: 40 points per cell is far more than a centroid needs, and the pilot is
+    #: not where the accuracy comes from -- the streams are.
+    cap = max(20_000, 40 * K)
+    if T.shape[0] > cap:
+        T = np.ascontiguousarray(T[rng.choice(T.shape[0], cap, replace=False)])
+    n = T.shape[0]
     K = min(K, n)
     C = np.empty((K, T.shape[1]), dtype=np.float64)
-    C[0] = T[rng.integers(n)]
-    d2 = ((T - C[0]) ** 2).sum(axis=1)
-    for k in range(1, K):
-        tot = float(d2.sum())
-        if not np.isfinite(tot) or tot <= 0.0:
-            C[k] = T[rng.integers(n)]
-        else:
-            C[k] = T[np.searchsorted(np.cumsum(d2), rng.random() * tot)]
-        np.minimum(d2, ((T - C[k]) ** 2).sum(axis=1), out=d2)
+    if T.shape[1] == 1:
+        # 1-D: quantile seeding reaches the same Lloyd-Max fixed point as
+        # k-means++ and skips K sequential passes over the pilot.
+        C[:, 0] = np.quantile(T[:, 0], (np.arange(K) + 0.5) / K)
+    elif K > 128:
+        C[...] = T[rng.choice(n, K, replace=False)]
+    else:
+        C[0] = T[rng.integers(n)]
+        d2 = ((T - C[0]) ** 2).sum(axis=1)
+        for k in range(1, K):
+            tot = float(d2.sum())
+            if not np.isfinite(tot) or tot <= 0.0:
+                C[k] = T[rng.integers(n)]
+            else:
+                C[k] = T[np.searchsorted(np.cumsum(d2), rng.random() * tot)]
+            np.minimum(d2, ((T - C[k]) ** 2).sum(axis=1), out=d2)
     prev = np.inf
     for _ in range(iters):
         lab = assign(T, C)
@@ -101,10 +113,26 @@ def lloyd(T: np.ndarray, K: int, *, iters: int = 25, seed: int = 0,
     return C
 
 
-def assign(T: np.ndarray, C: np.ndarray, chunk: int = 65_536) -> np.ndarray:
-    """Nearest-centroid labels, ``argmin_k |T_i - C_k|^2``, chunked."""
+#: Cap on the ``(chunk, K)`` distance block.  Without it a ``K = 256`` fit on a
+#: 150k pilot builds a 134 MB float64 temporary per block and the pilot, not
+#: the measurement, dominates the run: 388 ms per call against 12 ms.
+ASSIGN_BLOCK = 2_000_000
+
+
+def assign(T: np.ndarray, C: np.ndarray, chunk: int = 0) -> np.ndarray:
+    """Nearest-centroid labels, ``argmin_k |T_i - C_k|^2``, chunked.
+
+    ``r = 1`` takes a separate path: with one coordinate the Voronoi cells are
+    the intervals between consecutive midpoints, so a ``searchsorted`` answers
+    in ``O(n log K)`` and never forms the distance block at all.
+    """
     C = np.asarray(C, dtype=T.dtype)
+    if C.shape[1] == 1:
+        o = np.argsort(C[:, 0])
+        cut = 0.5 * (C[o[1:], 0] + C[o[:-1], 0])
+        return o[np.searchsorted(cut, T[:, 0])]
     cn = (C * C).sum(axis=1)
+    chunk = chunk or max(1024, ASSIGN_BLOCK // C.shape[0])
     out = np.empty(T.shape[0], dtype=np.int64)
     for lo in range(0, T.shape[0], chunk):
         hi = min(lo + chunk, T.shape[0])

@@ -58,6 +58,7 @@ from whestfloor.mixture import (  # noqa: E402
     frame_eig,
     frame_input,
     frame_kurt,
+    gauss_hermite,
     lloyd,
     pooled_moments,
     predict_state,
@@ -366,57 +367,183 @@ def mode_anatomy(args) -> int:
 
 
 # ---------------------------------------------------------------------------
-def mixture_predict(W, K, r=1, nodes=None, split_every=1, kmax=8,
-                    reduce_mode="runnalls"):
-    """The deployable propagator.  Pure NumPy; ``mode_propagate`` bills it."""
+def mixture_predict(W, nodes, r=1, split_at=0, resplit=0, kmax=8, K=None):
+    """The deployable propagator: no sampling anywhere, ``K = nodes^r``.
+
+    ``z^1 = x W^1`` is exactly Gaussian, so a split at ``split_at = 0`` splits
+    a law that is exactly right.  Splitting a Gaussian is a pure quadrature
+    identity and changes nothing on its own — the components only start to
+    matter once each has passed through its own rectification, after which the
+    mixture's mean and covariance still agree with the single-Gaussian chain's
+    at that layer but its *shape* does not, and from the next layer on the two
+    answers diverge.
+    """
     n = W[0].shape[1]
     W64 = [w.astype(np.float64) for w in W]
     st = MixtureState.gaussian(np.zeros(n), W64[0].T @ W64[0])
-    nodes = nodes or K
+    K = K or nodes ** r
     for l in range(len(W)):
-        if l % split_every == 0 and st.K * nodes <= K * nodes:
+        if l == split_at:
             for _ in range(r):
-                u = st.top_direction()
-                st = st.split(u, nodes)
-            if st.K > K:
-                st = st.reduce_to(K)
-        if l + 1 < len(W):
-            st = st.relu_step(W64[l + 1], kmax=kmax,
-                              exact_acos=(l == 0 and st.K == 1))
-        else:
+                st = st.split(st.top_direction(), nodes)
+        elif resplit and l > split_at and (l - split_at) % resplit == 0:
+            st = st.split(st.top_direction(), nodes).reduce_to(K)
+        if l + 1 == len(W):
             return st.relu_mean_mixture()
+        st = st.relu_step(W64[l + 1], kmax=kmax,
+                          exact_acos=(l == 0 and st.K == 1))
     raise AssertionError
 
 
-def mode_propagate(args) -> int:
+def mixture_kernel(weights, ctx=None, nodes=6, r=1, kmax=4, split_at=0):
+    """The propagator written directly against flopscope, so what is billed is
+    what is measured.  Mirrors ``kernels.cov_prop_mehler`` component by
+    component; the split uses power iteration rather than an eigensolver, which
+    costs ``~15 * 2n^2`` against the layer's ``n^3`` and is therefore free."""
     import flopscope as flops  # noqa: PLC0415
+    import flopscope.numpy as fnp  # noqa: PLC0415
 
-    ART.mkdir(parents=True, exist_ok=True)
+    from whestfloor.kernels import _hermite_coeffs, _relu_gauss  # noqa: PLC0415
+
+    n = weights[0].shape[0]
+    xq, wq = gauss_hermite(nodes)
+    mus = [fnp.zeros(n, dtype=fnp.float32)]
+    covs = [flops.as_symmetric(fnp.eye(n, dtype=fnp.float32), symmetry=(0, 1))]
+    ws = [1.0]
     rows = []
+    for li, w in enumerate(weights):
+        pre = [(w.T @ mu, fnp.einsum("ij,ia,jb->ab", cov, w, w))
+               for mu, cov in zip(mus, covs)]
+        if li == split_at:
+            for _ in range(r):
+                npre, nws = [], []
+                for (mu_pre, cov_pre), wk in zip(pre, ws):
+                    u = fnp.ones(n, dtype=fnp.float32) * fnp.float32(1.0 / n ** 0.5)
+                    for _ in range(15):
+                        u = cov_pre @ u
+                        u = u / fnp.sqrt(fnp.sum(u * u))
+                    cu = cov_pre @ u
+                    s2 = fnp.maximum(fnp.sum(cu * u), 1e-12)
+                    s = fnp.sqrt(s2)
+                    child = cov_pre - fnp.outer(cu, cu) / s2
+                    child = flops.symmetrize(child, symmetry=(0, 1))
+                    for q in range(nodes):
+                        npre.append((mu_pre + cu * fnp.float32(xq[q]) / s, child))
+                        nws.append(wk * float(wq[q]))
+                pre, ws = npre, nws
+        mus, covs, acc = [], [], None
+        for (mu_pre, cov_pre), wk in zip(pre, ws):
+            var_pre = fnp.maximum(fnp.diag(cov_pre), 1e-12)
+            sig = fnp.sqrt(var_pre)
+            mu, var_post, alpha, ph, Ph = _relu_gauss(mu_pre, var_pre, sig)
+            acc = mu * wk if acc is None else acc + mu * wk
+            inv = 1.0 / sig
+            rho = fnp.maximum(fnp.minimum(cov_pre * fnp.outer(inv, inv), 1.0), -1.0)
+            a = _hermite_coeffs(alpha, sig, ph, Ph, kmax)
+            rho_k = rho
+            cv = fnp.outer(a[1], a[1]) * rho
+            fact = 1.0
+            for k in range(2, kmax + 1):
+                rho_k = rho_k * rho
+                fact *= k
+                cv = cv + fnp.outer(a[k], a[k]) * (rho_k * (1.0 / fact))
+            fnp.fill_diagonal(cv, var_post)
+            mus.append(mu)
+            covs.append(flops.symmetrize(cv, symmetry=(0, 1)))
+        rows.append(acc)
+    return fnp.stack(rows, axis=0)
+
+
+def bill_kernel(args):
+    """Billed ``F`` for each mixture size, in a real ``BudgetContext``."""
+    import flopscope as flops  # noqa: PLC0415
+    import flopscope.numpy as fnp  # noqa: PLC0415
+
+    W = make_mlp(256, 32, MLP_SEED_BASE)
+    fw = [fnp.asarray(w) for w in W]
+    out = {}
+    for nodes, r, split_at, _ in PROP_PLAN:
+        K = nodes ** r
+        if K in out:
+            continue
+        with flops.BudgetContext(flop_budget=10 ** 13, quiet=True) as c:
+            mixture_kernel(fw, nodes=nodes, r=r, kmax=args.kmax_bill,
+                           split_at=split_at)
+        out[K] = int(c.flops_used)
+    with flops.BudgetContext(flop_budget=10 ** 13, quiet=True) as c:
+        mixture_kernel(fw, nodes=1, r=1, kmax=args.kmax_bill, split_at=0)
+    out[1] = int(c.flops_used)
+    return out
+
+
+def cached_truth(W, i, n_half, chunk):
+    """Two independent reference halves per MLP, cached on disk."""
+    ART.mkdir(parents=True, exist_ok=True)
+    p = ART / f"truth_{MLP_SEED_BASE + i}_{n_half}.npz"
+    if p.exists():
+        d = np.load(p)
+        return d["a"], d["b"]
+    a = truth_mean(W, n_half, seed=8_000_000 + 2 * i, chunk=chunk)
+    b = truth_mean(W, n_half, seed=8_000_000 + 2 * i + 1, chunk=chunk)
+    np.savez(p, a=a, b=b)
+    return a, b
+
+
+#: ``(nodes, r, split_at, resplit)``.  A split at layer 1 is nearly worthless
+#: and the reason is measurable: the closure covariance has participation ratio
+#: 127 at ``L = 1`` with the top eigendirection carrying **1.5%** of the trace,
+#: falling to 6.5 and 34% by ``L = 32``.  There is no dominant direction to
+#: condition on until the network has made one, so the sweep walks the split
+#: point down the depth.
+PROP_PLAN = [
+    (6, 1, 0, 0),
+    (2, 1, 8, 0), (4, 1, 8, 0), (6, 1, 8, 0), (12, 1, 8, 0),
+    (6, 1, 16, 0), (6, 1, 24, 0), (6, 1, 28, 0), (6, 1, 31, 0),
+    (3, 2, 16, 0),
+    (2, 1, 0, 8), (2, 1, 0, 4), (2, 1, 0, 1), (3, 1, 0, 4),
+]
+
+
+def mode_propagate(args) -> int:
+    ART.mkdir(parents=True, exist_ok=True)
+    rows: dict[tuple, list] = {}
+    base_l: list[float] = []
     for i in range(args.mlps):
         seed = MLP_SEED_BASE + i
         W = make_mlp(256, 32, seed)
-        a = truth_mean(W, args.n_truth, seed=8_000_000 + 2 * i, chunk=args.chunk)
-        b = truth_mean(W, args.n_truth, seed=8_000_000 + 2 * i + 1, chunk=args.chunk)
-        base = umse(chain_run(W)[-1], a, b)
-        for K in [int(v) for v in args.k.split(",")]:
+        a, b = cached_truth(W, i, args.n_truth, args.chunk)
+        base_l.append(umse(chain_run(W)[-1], a, b))
+        for cfg in PROP_PLAN:
             t0 = time.time()
-            p = mixture_predict(W, K, r=args.rsplit, split_every=args.split_every)
-            rows.append({"seed": seed, "K": K, "raw": umse(p, a, b),
-                         "base": base, "wall": time.time() - t0})
-            print(f"  seed {seed} K={K:3d}  raw={rows[-1]['raw']:.4e}  "
-                  f"chain={base:.4e}  {rows[-1]['wall']:.1f}s", flush=True)
+            p = mixture_predict(W, cfg[0], r=cfg[1], split_at=cfg[2],
+                                resplit=cfg[3])
+            rows.setdefault(cfg, []).append(umse(p, a, b))
+            print(f"  seed {seed} nodes={cfg[0]:2d} r={cfg[1]} "
+                  f"split@{cfg[2]:2d} resplit={cfg[3]}  "
+                  f"raw={rows[cfg][-1]:.4e}  chain={base_l[-1]:.4e}  "
+                  f"{time.time() - t0:.1f}s", flush=True)
+
+    bill = bill_kernel(args)
+    base = float(np.mean(base_l))
     print()
-    print(f"  {'K':>4} {'raw MSE':>12} {'x chain':>9} {'F (flopscope)':>15} "
-          f"{'x fwd pass':>11}")
-    fwd = forward_pass_flops()
-    for K in sorted({r["K"] for r in rows}):
-        v = float(np.mean([r["raw"] for r in rows if r["K"] == K]))
-        bv = float(np.mean([r["base"] for r in rows if r["K"] == K]))
-        rows_f = [r for r in rows if r["K"] == K]
-        F = rows_f[0].get("F", 0)
-        print(f"  {K:>4} {v:12.4e} {bv / v:9.2f} {F:15,d} {F / fwd:11.0f}")
-    (ART / "propagate.json").write_text(json.dumps(rows, indent=1))
+    print(f"  analytic Gaussian chain (K = 1): raw {base:.4e}")
+    print()
+    hdr = (f"  {'nodes':>5} {'r':>2} {'split':>5} {'resp':>4} {'K':>4} "
+           f"{'raw MSE':>12} {'x chain':>8} {'F':>14} {'F/B':>7} {'adjusted':>11}")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for cfg in PROP_PLAN:
+        v = float(np.mean(rows[cfg]))
+        K = cfg[0] ** cfg[1]
+        F = bill.get(K, 0)
+        fb = F / 272_000_000_000
+        print(f"  {cfg[0]:>5} {cfg[1]:>2} {cfg[2]:>5} {cfg[3]:>4} {K:>4} "
+              f"{v:12.4e} {base / v:8.2f} {F:14,d} {fb:7.4f} "
+              f"{v * max(0.1, fb):11.4e}")
+    (ART / "propagate.json").write_text(json.dumps(
+        {"chain": base, "bill": {str(k): v for k, v in bill.items()},
+         "rows": {"|".join(map(str, k)): float(np.mean(v))
+                  for k, v in rows.items()}}, indent=1))
     return 0
 
 
@@ -433,8 +560,8 @@ def main() -> int:
     ap.add_argument("--k", default="2,4,6,8")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--tag", default="")
-    ap.add_argument("--rsplit", type=int, default=1)
-    ap.add_argument("--split-every", type=int, default=1)
+    ap.add_argument("--kmax-bill", type=int, default=4)
+    ap.add_argument("--verify", action="store_true")
     args = ap.parse_args()
     return {"ceiling": mode_ceiling, "anatomy": mode_anatomy,
             "propagate": mode_propagate}[args.mode](args)
