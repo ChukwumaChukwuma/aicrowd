@@ -81,6 +81,8 @@ every sparse-correction scheme — see `docs/sparse_sign_stable.md`.
 | offline-trained **MLP** head, same features | 0.785× vs ridge (bar 1.5×) | **dead** | `28` |
 | **Stein CVs from the network's own gradient** | R² = 11.5% vs a 0.75 bar; +0.44 points on the shipped family; exact ceiling 1.8% | **dead** | `30` |
 | **dropping the 13 measured-1.000× head columns** | **1.016× adjusted** (1.035× at 3× residual), free | **shipped** | `28`, `30` |
+| **high-degree Hermite CVs on adapted directions** | whole family `R² = 43.2%` vs a 0.75 bar; shipped `k ≤ 2` already has 39.2% | **dead** | `32` |
+| **adapted degree-1 CV** (24–48 mean-field directions) | 1.371× at unit coefficient vs 1.328× — but +0.002× inside the head, and 0.945× adjusted | **dead** | `28`, `32` |
 
 ### Why sign-stable sparsity mostly does not work (`docs/sparse_sign_stable.md`)
 
@@ -119,6 +121,46 @@ identity forbids: **the construction excludes its own optimum.** A second
 application of Stein's identity gives an exact, Jacobian-free ceiling for the
 whole 256-direction family on `ψ = y_j` — `R² ≤ |kⱼ|²/Var(yⱼ)²` with
 `kⱼ = ½E[x ȳⱼ²]` — measured at **1.8%**, i.e. 1.019×.
+
+### Why the layer-1 Hermite family is closed (`docs/hermite_rank_ceiling.md`)
+
+`He_d` of a layer-1 pre-activation is a degree-`d` object, so the barrier's
+`k ≤ 2` instance never bounded `k ≥ 3`, and what killed `k = 3` in the ship was
+`p/N`. Both true, and neither is the obstruction.
+`h_d(⟨a,x⟩) = Σ_{|α|=d} √(d!/α!) a^α H_α` is **exactly a unit rank-one
+symmetric tensor** of the degree-`d` Wiener chaos, so a Hermite dictionary on
+`m` directions lives in `Sym^d(span A)` and is bounded by
+`Σ_j Var(E[y_j | Aᵀx])` — at every degree at once, with no truncation.
+
+Measured. The degree spectrum of `relu(z³²)`, read off the OU/Mehler semigroup
+(`C(t) = Σ_j Cov(y_j(x), y_j(x_t)) = Σ_d f_d t^d`, one extra forward pass per
+coupling, no curse of dimensionality), is
+`f = (26.7, 19.0, 11.2, 7.0, 4.7, 3.3, …)%` with **mean Hermite degree 10.5** —
+`f_1` reproduces `floor_theorem.md`'s `0.276 ± 0.016` from a seventh
+independent estimator. So 54% of the variance genuinely sits above degree 2.
+And the family sees **1.9 points** of it: a 2,494-feature dictionary spanning
+degree ≤ 8 on all 256 coordinate directions and degree ≤ 16 on a 24-direction
+adapted frame with every cross product reaches **43.2%**, of which the shipped
+512-feature `k ≤ 2` basis already has **39.2%**. The argmax of held-out `R²`
+net of `p/N` over all 71 dictionaries measured *is* the shipped basis, on local
+MLPs (27.20%) and on official ones (27.64%).
+
+The degree-2 reachability spectrum says why the coordinate basis is not
+arbitrary: a ReLU net's only *fixed* kink normals are the columns of `W¹`, and
+they reach 73% of `f_2` with 256 rank-one features, where a shared-direction
+tensor basis needs `m ≈ 55` — ~1,500 features — to match it.
+`1/(1 − 0.432) = 1.76×` is within half a percent of `floor_theorem.md`'s
+`k ≤ 2` bound of 1.75×, from an unrelated argument.
+
+The one combination that beat the ship on paper — swap the 256-feature `k = 1`
+block for 24 mean-field directions — was built, the training set regenerated
+and the head re-fitted. It delivers **exactly the predicted 3%** at the level
+of the raw control variate (1.371× against 1.328× at unit coefficient) and
+**+0.002× inside the head**, because `cv1mf` is the same channel with analytic
+coefficients and the ridge already fits a shrinkage: the `p/N` it removes was
+already insured. On the official suite it is 1.0032× on raw and **0.945× on
+the adjusted score**, because extracting the directions costs 62 flopscope
+dispatches that nothing amortises. Not shipped.
 
 ### Why multilevel Monte Carlo is dead (`docs/mlmc.md`)
 
@@ -205,6 +247,10 @@ stops.
    `z¹` is exactly Gaussian and its Mehler Gram is analytic. The label-noise
    argument held: 640 MLPs at N_gt = 2×10⁵ each was enough.
 
+4. ~~**High-degree Hermite CVs on network-adapted directions.**~~ **Closed** —
+   `docs/hermite_rank_ceiling.md`. The family is at 94% of a proved ceiling
+   and the ceiling is 1.76×.
+
 ## Where this leaves the board
 
 | | adjusted | × floor |
@@ -224,6 +270,13 @@ machine-dependent residual is measured under identical load; the previous
 ship's own published figure was 3.99e-7, and the 0.6% spread between the two
 is what run-to-run residual noise on this box looks like. Raw MSE, which is
 machine-independent, went 3.7194e-6 → 3.7157e-6.
+
+**Round 9 moved no row.** The adapted degree-1 arm reaches raw 3.7039e-6 —
+0.32% better, and machine-independent — for an adjusted 4.2494e-7, which is
+0.945× the shipped score and 0.894× at three times this box's residual. The
+shipped files are byte-identical to the previous ship and
+`submission/corrector.npz` regenerates byte-identically
+(sha256 `eff7515db0c1b0a2…`).
 
 The entire remaining headroom in the benchmark is 73.3× and we are 1,100× behind
 the leader, so the gap is not a modelling gap — it is that nothing here yet

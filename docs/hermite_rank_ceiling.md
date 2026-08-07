@@ -8,9 +8,12 @@ against a pre-registered bar of 75%. The shipped 512-feature `k <= 2` basis
 already reaches `39.2%`, so the entire remaining family is worth **4.0
 points** and costs 1,982 features (`p/N = 0.23`) to get them. None of the 71
 dictionaries measured beats the shipped one once `p/N` is charged; the shipped
-basis is the argmax of the surface (§8 records the one derived combination
-that does beat it, by 5% of the sampling residual, and why it is not cashed
-here).** Reproducible from
+basis is the argmax of the surface. The one derived combination that does
+beat it on paper was built, fitted and scored (§9): it delivers exactly the
+3% of raw MSE the surface predicted at the level of the raw control variate,
+the shipped head had already bought that 3% by other means, and on the
+official suite it is 1.0032x on raw and **0.945x on the adjusted score**.
+Nothing shipped.** Reproducible from
 `scripts/32_adapted_hermite.py` (`--mode dirs|span|chaos|ceiling`), with every
 load-bearing identity asserted in `tests/test_adapted_hermite.py`.
 
@@ -330,6 +333,8 @@ reach at degree 2.
 | 2 | some dictionary in the surface beats the shipped basis on `eff R^2` | argmax over all 71 dictionaries measured is `coord d<=2`, the shipped one, at 27.20% (official 27.64%); §8 records a derived degree-block swap at 31.0% that is not one of the 71 | **FAIL** |
 | 3 | the ceiling of §5 is stated quantitatively and validated against the surface | §5.2's rank bound predicts <=6.2 / <=3.6 / <=2.0 degree-2 points at m=16/8/4 and the surface measures 4.3 / 2.4 / 1.2 | **PASS** |
 | 4 | shipped estimator untouched: 0 raises on 100 official MLPs, `damp=0` bitwise | see §7 | **PASS** |
+| 5 | the adapted degree-1 block beats the shipped **raw** 3.7157e-06 on the official suite | **3.7039e-06**, 1.0032x | **PASS** |
+| 6 | ...and beats the shipped **adjusted** 4.0142e-07 | 4.2494e-07, 0.945x (0.894x at 3x residual) | **FAIL — not integrated** |
 
 ## 7. The official suite
 
@@ -399,17 +404,129 @@ three decimals at every coupling: `0.0284 / 0.1006 / 0.2009 / 0.3496 / 0.6097
   random) and the two that matter agree to `|cos| = 0.93`. No projection
   pursuit was run. §5.1's degree-free measurement and §5.2's
   every-subspace-at-once bound are what cover the directions not tried.
-- **One thing did measure better than the ship, and it is small.** Degrees
-  are exactly orthogonal, so span `R^2` is additive across degree blocks:
-  replacing the 256-feature `H1` block with 24 mean-field directions
-  (`23.53%` at `p = 24`) or with one per-neuron direction (`23.17%` at
-  `p = 1`) and keeping the coordinate `d = 2` block gives `37.0-37.4%` at
-  `p = 257-280`, i.e. **eff `R^2` 31.0% against the shipped 27.2%**, a 5%
-  smaller sampling residual. It is not shipped here: the mean-field path
-  matrix costs ~1.0e9 FLOPs and the per-sample projection ~1.1e9, together
-  1.2% of the free budget, against a predicted ~3% on `raw_mse` once the
-  sparse mask's `N`-independent bias is accounted for — and cashing it needs a
-  full 640-MLP regeneration and a re-fit of the head. It is the one live
-  follow-up, with the number attached.
+- **The one thing that measured better than the ship was cashed, and it
+  still loses.** See §9: the mechanism delivers exactly the 3% the surface
+  predicted, and the shipped head had already bought that 3% by other means.
 - **`tau = 2.5`, `N = 8500`, `P = 150` are still inherited.** Unchanged, and
-  unchanged by this round.
+  unchanged by this round. The `N` sweep in `docs/stein_cv.md` §7 (`N = 9000`
+  at 0.996x, `N = 9500` at 0.964x of this configuration) still applies
+  verbatim, because §9 freed no budget: nothing shipped.
+
+## 9. Cashing the follow-up: the mechanism is real and the head already had it
+
+§8 of the first draft of this page said the adapted degree-1 block was worth
+**eff `R^2` 31.0% against the shipped 27.2%**, i.e. ~3% on `raw_mse`, and
+called it the one live follow-up. It was built, the 640-MLP training set was
+regenerated, the head was re-fitted on generated data only, and it was scored
+once on the official suite. **The prediction was right about the mechanism and
+wrong about the estimator, and the net is a loss.**
+
+### 9.1 What was built
+
+`cva`: a degree-1 Hermite control variate on `m` directions spanning the
+mean-field input-space Jacobian `J = W^1 diag(Phi(a^1)) ... W^32`. Only
+`J[:, :m]` is formed, right to left, so the cost is 31 matmuls of
+`(width, width) @ (width, m)` rather than 31 of `(width, width)^2` — 9.8e7
+FLOPs at `m = 24` against 1.0e9 for the whole Jacobian. §2's measurement is
+what licenses that shortcut: `J` is nearly rank one, so its first `m` columns
+span what its top-`m` singular vectors do (23.42% against 23.49% of population
+span at `m = 24`, four MLPs, `scripts/32`-style cross-half estimate). A QR
+makes the frame orthonormal, so `s = x @ Q` has population Gram exactly `I`:
+no solve, and no exposure to the condition number ~1e4 that the raw
+near-parallel columns carry. Coefficients come from the same two-half split
+as the shipped blocks.
+
+### 9.2 The mechanism delivers exactly what was predicted
+
+`scripts/28 --mode fit`, 640 generated MLPs, unbiased true MSE against two
+independent 100k references, **coefficient fixed at 1, no fitting at all** —
+the same table `docs/learned_corrector.md` §3.3 uses:
+
+| arm | unbiased true MSE | |
+|---|---|---|
+| sparse MC | 6.0107e-06 | 1.000x |
+| `- cv1` (256 features) | 4.7972e-06 | 1.253x |
+| `- cva24` (24 features) | 4.6711e-06 | **1.287x** |
+| `- cv1 - cv2` (the shipped mechanism) | 4.5255e-06 | 1.328x |
+| **`- cva24 - cv2`** | **4.3841e-06** | **1.371x** |
+| `- cv1mf` (mean-field, analytic coefficients) | 4.2034e-06 | 1.430x |
+
+`1.371 / 1.328 = 1.032` — **3.2% better MSE, against a prediction of ~3%.**
+The `R^2(p, d)` surface was right: 24 directions really do beat 256 once
+`p/N` is charged, and the effect size is the one §3 computed.
+
+`m` was selected on the validation split of the generated data (the official
+suite is never read for it) and the curve is flat: `m = 8/16/24/32/48` give
+1.501 / 1.503 / 1.505 / 1.505 / **1.506x**.
+
+### 9.3 The head had already bought it
+
+| design | validation | TEST (read once) |
+|---|---|---|
+| 15 columns (shipped) | 1.504x | **1.353x** |
+| 18 columns (+ `cva`) | 1.506x | **1.354x** |
+| 31-column research design | 1.506x | 1.355x |
+
+Leave-one-group-out on the 18-column design: **without `cva`, 1.504x** — the
+whole arm is worth **+0.002x**. Only-one-group says the mechanism is real
+(`only cva` 1.301x against `only cv1` 1.257x), and leave-one-out says `cv1`
+cannot simply be deleted either (without it, 1.499x).
+
+The reason is the thing the surface could not see. **The shipped estimator is
+not a bare control variate.** It carries `cv1mf` — the *same* first-order
+channel with analytic coefficients and therefore zero estimation noise, worth
+1.430x alone — and a ridge head that fits a shrinkage on every arm. The `p/N`
+that `cva` removes is precisely what `cv1mf` plus shrinkage were already
+insuring against. `cv1`, `cv1mf` and `cva` are three estimates of one channel;
+the head needs two.
+
+> **An effective-`R^2` gain that comes from removing estimation noise is not
+> additive with a fitted shrinkage head that was already absorbing it.**
+> That is the error in §8's prediction, and it is now measured rather than
+> argued.
+
+### 9.4 The official suite, and the cost that decides it
+
+`scripts/28 --mode score`, all 100 official MLPs, N=1e9 reference. `raw_mse`
+and `F/B` are machine-independent; `C/B` is not.
+
+| variant | raw_mse | F/B | C/B | adj@1x | adj@2x | adj@3x | raises |
+|---|---|---|---|---|---|---|---|
+| **shipped (15 columns)** | 3.7157e-06 | **0.0919** | **0.1080** | **4.0142e-07** | **4.6140e-07** | **5.2138e-07** | 0 |
+| + `cva` (18 columns, m=48) | **3.7039e-06** | 0.0934 | 0.1147 | 4.2494e-07 | 5.0393e-07 | 5.8292e-07 | 0 |
+| `damp=0` ablation (both) | 5.8050e-06 | 0.0915 | — | — | — | — | 0 |
+| ratio, `cva` against ship | **1.0032x** | | | **0.945x** | 0.916x | 0.894x | |
+
+**Raw improves by 0.32% and the adjusted score gets 5.9% worse**, degrading
+to 0.894x at three times this box's residual. The pre-registered bar for the
+round was the shipped adjusted score; it is missed by a factor the direction
+of which is not in doubt.
+
+**The cost is structural, not an implementation detail.** Extracting the
+directions is `J[:, :m]` computed right to left: 31 layers x 2 flopscope
+operations = **62 dispatches** on `(width, width) @ (width, m)` arrays. In
+FLOPs that is only 0.4-0.7% of the free budget; in participant Python it is
+~15 ms, and at `lambda = 1e11` that is 1.5e9 effective FLOPs — **5.5% of the
+free budget**, against a 0.32% gain. Nothing amortises it: `cv1mf` propagates
+a *vector forward* through the same chain while a range finder must go
+*backward*, so the two cannot be fused, and halving `m` halves only the
+per-sample projection, not the 62 dispatches. `C/B` at `m = 24` with `cv1`
+also dropped is ~0.109 on this box, still above the shipped 0.1080 and now
+with a worse raw.
+
+### 9.5 What was left in, and what was reverted
+
+`submission/estimator.py` and `whestfloor/kernels.py` are **byte-identical to
+the previous ship** (`git diff` is empty), and
+`submission/corrector.npz` regenerates **byte-identically** from
+`scripts/28_learned_corrector.py --mode fit --val-frac 0.2 --install`
+(sha256 `eff7515db0c1b0a2...`, the value `docs/stein_cv.md` §7 published) —
+which also proves the regenerated training shards left every shipped
+primitive bit-identical: only the `cva*` keys were added.
+
+What stays is the research path: `corrector.meanfield_dirs`,
+`corrector.adapted_cv`, the `cva8..cva48` primitives on the 640-MLP training
+set, `FEATURES_V2`, and the `m` sweep in `--mode fit`. `FEATURES_FULL` is
+untouched at 28 columns and is a prefix of `FEATURES_V2`, so every ablation
+table in `docs/learned_corrector.md` still means what it says
+(`tests/test_stein.py::test_shipped_feature_order_is_one_object` pins it).

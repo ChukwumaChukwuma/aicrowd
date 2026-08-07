@@ -189,5 +189,58 @@
       0.7301,
       0.8439
     ]
+  },
+  "cva": {
+    "_note": "Inputs to the round-9b rows of scripts/33_record_adapted_hermite.py.  Printed by scripts/28_learned_corrector.py --mode refresh / --mode fit / --mode score.  The 640-MLP training set was regenerated with the new feature block (every pre-existing primitive bit-identical; only cva* keys added), the head was re-fitted on generated data ONLY, and m and lambda were selected on its validation split.",
+    "n_train_mlps": 640,
+    "unit_coef_sparse_mc": 6.0107e-06,
+    "unit_coef_cv1": 4.7972e-06,
+    "unit_coef_cv1_cv2": 4.5255e-06,
+    "unit_coef_cv1mf": 4.2034e-06,
+    "unit_coef_cva24": 4.6711e-06,
+    "unit_coef_cva48": 4.6689e-06,
+    "unit_coef_cva24_cv2": 4.3841e-06,
+    "mechanism_gain_over_shipped_arm": 1.0322529139390069,
+    "m_grid": [
+      8,
+      16,
+      24,
+      32,
+      48
+    ],
+    "m_validation_gain": [
+      1.501,
+      1.503,
+      1.505,
+      1.505,
+      1.506
+    ],
+    "m_selected": 48,
+    "val_gain_15col": 1.504,
+    "val_gain_18col": 1.506,
+    "test_gain_15col": 1.353,
+    "test_gain_18col": 1.354,
+    "loo_without_cva": 1.504,
+    "loo_without_cv1": 1.499,
+    "only_cva": 1.301,
+    "only_cv1": 1.257,
+    "official_raw": 3.7039e-06,
+    "official_fb": 0.0934,
+    "official_cb": 0.1147,
+    "official_adj1": 4.2494e-07,
+    "official_adj2": 5.0393e-07,
+    "official_adj3": 5.8292e-07,
+    "official_raises": 0,
+    "official_worst": 3.2064e-05,
+    "ship_raw": 3.7157e-06,
+    "ship_adj1": 4.0142e-07,
+    "ship_adj2": 4.614e-07,
+    "ship_adj3": 5.2138e-07,
+    "ship_cb": 0.108,
+    "abl_raw": 5.805e-06,
+    "raw_ratio": 1.003185831150949,
+    "adj_ratio": 0.94465100955429,
+    "corrector_npz_sha256": "eff7515db0c1b0a24e8bf50b90202ddfdb8e4df741cdd396c1e1e74c3a33a481",
+    "notes": "The mechanism is real and delivers exactly the predicted 3%: at unit coefficient over 640 generated MLPs, -cva24 -cv2 is 1.371x against -cv1 -cv2's 1.328x.  The head had already bought it -- cv1mf is the SAME first-order channel with analytic coefficients and no estimation noise, and the ridge fits a shrinkage on every arm, so the p/N that cva removes is what cv1mf plus shrinkage were already insuring against.  Leave-one-group-out on the 18-column design: 1.506x with cva, 1.504x without.  On the official suite raw improves 0.32% (3.7039e-6 against 3.7157e-6, both machine-independent) and the adjusted score degrades 5.9% (0.945x, and 0.894x at three times this box's residual), because extracting the directions is 62 flopscope dispatches -- ~15 ms, i.e. 5.5% of the free budget at lambda = 1e11 -- that nothing else amortises: cv1mf propagates a vector FORWARD through the same chain while a range finder must go BACKWARD.  Reverted: submission/estimator.py and whestfloor/kernels.py are byte-identical to the previous ship and submission/corrector.npz regenerates byte-identically (sha256 eff7515db0c1b0a2...)."
   }
 }

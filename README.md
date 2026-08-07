@@ -53,6 +53,15 @@ build (2,494 features, degree ≤ 16, every cross product) reaches
 **39.2%**. The argmax of held-out `R²` net of `p/N` over all 71 dictionaries
 measured *is* the shipped basis.
 
+The one combination that beat it on paper — swap the 256-feature `k = 1` block
+for 24 mean-field-Jacobian directions — was built, the 640-MLP training set
+regenerated and the head re-fitted. It delivers **exactly the predicted 3%**
+at the level of the raw control variate (1.371× against 1.328× at unit
+coefficient) and **+0.002×** inside the fitted head, which was already
+insuring against the very `p/N` it removes. On the official suite: raw
+3.7039e-6 (0.32% better, machine-independent), adjusted 4.2494e-7 (**0.945×**,
+worse). Not shipped.
+
 ## Layout
 
 ```

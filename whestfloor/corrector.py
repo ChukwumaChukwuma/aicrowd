@@ -101,6 +101,18 @@ VAR_FLOOR = 1e-12
 #: basis where the Gram is the identity (see :func:`hermite_cv`).
 GRAM_JITTER = 1e-6
 
+#: Direction counts offered to the offline head for the adapted degree-1
+#: block.  ``qr`` is column-nested, so ``Q[:, :m]`` for the largest entry
+#: supplies every smaller one at no extra cost and the head picks ``m`` on a
+#: validation split of GENERATED data.
+CVA_GRID: tuple[int, ...] = (8, 16, 24, 32, 48)
+
+#: Direction count the research feature block reports as plain ``cva``.
+#: Selected on the validation split of the generated data by
+#: ``scripts/28 --mode fit``; the official suite was never consulted for it.
+#: NOT shipped -- see :data:`DROPPED`.
+CVA_M: int = 48
+
 
 def norm_cdf(x):
     """``Phi``, bit-identical to ``flopscope.stats.norm.cdf``."""
@@ -175,10 +187,29 @@ DROPPED: tuple[str, ...] = (
     "mu", "mu_Phi",
     "sd_mc",
     "wn", "w4", "vbar", "arms",
+    # ROUND 9: the adapted degree-1 block.  It is a real mechanism -- at unit
+    # coefficient over 640 generated MLPs ``-cva24 -cv2`` is 1.371x against
+    # ``-cv1 -cv2``'s 1.328x, exactly the 3% the R^2 surface predicted -- and
+    # it is still not worth shipping, because the head was ALREADY insuring
+    # against the p/N it removes.  Leave-one-group-out on the 18-column
+    # design: 1.506x with ``cva``, 1.504x without.  On the official suite it
+    # buys 0.32% of raw MSE (3.7039e-6 against 3.7157e-6) and costs 6.2% of
+    # C/B, because extracting the directions is 62 flopscope dispatches that
+    # nothing else amortises.  ``docs/hermite_rank_ceiling.md`` sec 9.
+    "cva", "cva_Phi", "cva_a",
 )
 
+#: The round-9 extension.  ``FEATURES_FULL`` is frozen at 28 columns so every
+#: ablation table in ``docs/learned_corrector.md`` still reproduces; the
+#: adapted degree-1 block is appended here instead.  ``cva`` is the same
+#: first-order channel as ``cv1`` and ``cv1mf``, reached a third way: exact
+#: split-sample coefficients like ``cv1``, but on ``m`` directions taken from
+#: the network instead of all 256, so it pays ``m/N`` of estimation noise
+#: rather than ``256/N``.  See ``docs/hermite_rank_ceiling.md`` sec 8.
+FEATURES_V2: tuple[str, ...] = FEATURES_FULL + ("cva", "cva_Phi", "cva_a")
+
 #: What the submission actually builds and what the shipped ``beta`` indexes.
-FEATURES: tuple[str, ...] = tuple(f for f in FEATURES_FULL if f not in DROPPED)
+FEATURES: tuple[str, ...] = tuple(f for f in FEATURES_V2 if f not in DROPPED)
 
 N_FEATURES = len(FEATURES)
 N_FEATURES_FULL = len(FEATURES_FULL)
@@ -187,9 +218,68 @@ N_FEATURES_FULL = len(FEATURES_FULL)
 PRIMITIVES: tuple[str, ...] = (
     "mu", "cv1", "cv2", "cv3", "cv1mf", "gap", "sk", "ku", "alpha", "Phi",
     "phi", "s", "vh", "sd_mc", "dpilot", "wn", "w4", "gam1", "gam2",
+    "cva", *(f"cva{m}" for m in CVA_GRID),
 )
 #: Per-MLP scalars.
 SCALARS: tuple[str, ...] = ("vbar", "arms", "keep_frac")
+
+
+def meanfield_dirs(weights, gates, m: int):
+    """Orthonormal ``(width, m)`` frame spanning the mean-field Jacobian.
+
+    The mean-field input-space Jacobian of ``z^32`` is
+
+        J = W^1 D^1 W^2 D^2 ... D^31 W^32 ,   D^l = diag(Phi(alpha^l))
+
+    and it is very nearly rank one: measured, the top left singular direction
+    carries 79-91% of ``||J||_F^2`` and the top 16 carry 99.8%
+    (``scripts/32 --mode dirs``).  So a *randomised range finder* recovers its
+    column space from a handful of columns, and ``J[:, :m]`` -- the first ``m``
+    output neurons' Jacobians, which are generic -- does as well as the exact
+    SVD: 23.42% against 23.49% of population span at ``m = 24``, four MLPs.
+
+    Only ``J[:, :m]`` is formed, right to left, so the cost is 31 matmuls of
+    ``(width, width) @ (width, m)`` rather than 31 of ``(width, width)^2`` --
+    9.8e7 FLOPs at ``m = 24`` instead of 1.0e9.
+
+    A QR then makes the frame orthonormal, which matters twice: the columns of
+    ``J`` are nearly parallel (that is the same near-rank-one fact) so their
+    Gram has condition ~1e4 and a float32 solve against it would lose most of
+    the answer, while an orthonormal frame has population Gram exactly ``I``
+    and needs no solve at all.  QR is column-nested, so ``Q[:, :k]`` is the
+    frame for ``J[:, :k]`` and one factorisation serves every ``m`` in
+    :data:`CVA_GRID`.
+    """
+    M = weights[-1][:, :m]
+    for l in range(len(weights) - 1, 0, -1):
+        M = weights[l - 1] @ (gates[l - 1][:, None] * M)
+    return np.linalg.qr(M)[0]
+
+
+def adapted_cv(x, y, Q, split: bool = True):
+    """Degree-1 Hermite CV on the orthonormal adapted frame ``Q``.
+
+    ``s = x @ Q`` is exactly standard normal in each coordinate and exactly
+    uncorrelated across them, so ``E[s] = 0`` and ``Cov(s) = I`` -- the same
+    two facts the layer-1 family rests on, with an analytic Gram that is the
+    identity rather than ``rho``.  The correction contracts to two length-N
+    matvecs exactly as in :func:`hermite_cv`, and ``split`` uses two halves so
+    the ``Cov(g' G^-1 g, y)/N`` self-term of the one-pass form is absent.
+    """
+    n = x.shape[0]
+    s = x @ Q
+    if not split:
+        d = np.mean(s, axis=0)
+        w = s @ d
+        return (y.T @ (w - np.mean(w))) / n
+    h = n // 2
+    s1, s2 = s[:h], s[h:]
+    d1, d2 = np.mean(s1, axis=0), np.mean(s2, axis=0)
+    wa = s1 @ d2
+    wa = wa - np.mean(wa)
+    wb = s2 @ d1
+    wb = wb - np.mean(wb)
+    return 0.5 * ((y[:h].T @ wa) / h + (y[h:].T @ wb) / (n - h))
 
 
 def feature_columns(f) -> dict:
@@ -216,6 +306,7 @@ def feature_columns(f) -> dict:
         "wn": f["wn"] - 1.0, "w4": f["w4"] - 3.0,
         "vbar": one * (float(f["vbar"]) - 0.05),
         "arms": one * (float(f["arms"]) - 3.4),
+        "cva": f["cva"], "cva_Phi": f["cva"] * Ph, "cva_a": f["cva"] * a,
     }
 
 
@@ -369,6 +460,12 @@ def sparse_mc_features(weights, seed: int, *, tau: float | None = 2.5,
     while len(cvs) < 3:
         cvs.append(np.zeros(n, dtype=np.float32))
 
+    # ---- adapted degree-1 block, every m in the grid from one QR ---------
+    gates = [norm_cdf(a_).astype(np.float32) for a_ in alpha]
+    Qmax = meanfield_dirs(weights, gates, max(CVA_GRID))
+    cva = {f"cva{m}": adapted_cv(x0, x, Qmax[:, :m], split=split)
+           for m in CVA_GRID}
+
     # ---- final-layer sample moments ------------------------------------
     ex2 = np.mean(x * x, axis=0)
     vh = np.maximum(ex2 - mu * mu, 0.0)
@@ -388,7 +485,6 @@ def sparse_mc_features(weights, seed: int, *, tau: float | None = 2.5,
     # ---- mean-field propagation of the layer-1 mean gap (comparison arm)
     sig1 = np.sqrt(np.sum(weights[0] * weights[0], axis=0))
     d1 = h1m - sig1 * np.float32(INV_SQRT_2PI)
-    gates = [norm_cdf(alpha[l]).astype(np.float32) for l in range(depth)]
     prop = d1
     for l in range(1, depth):
         prop = prop @ weights[l]
@@ -405,6 +501,10 @@ def sparse_mc_features(weights, seed: int, *, tau: float | None = 2.5,
         "sd_mc": np.sqrt(vh / n_samples), "dpilot": mu - mean_h[-1],
         "wn": wn, "w4": n * np.sum(wl ** 4, axis=0) / np.maximum(wn * wn, 1e-30),
         "gam1": gam1, "gam2": gam2,
+        # ``cva`` is the grid member the SHIPPED kernel computes; the rest are
+        # carried so the head can pick ``m`` on a validation split without a
+        # second pass over the training set.
+        "cva": cva[f"cva{CVA_M}"], **cva,
     }
     prim = {k: np.asarray(v, dtype=np.float64) for k, v in prim.items()}
     prim["vbar"] = float(np.mean(vh))

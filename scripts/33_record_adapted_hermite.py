@@ -191,3 +191,77 @@ Experiment(
 )
 
 print("recorded 4 rows")
+
+# ---------------------------------------------------------------------------
+# Round 9b: cashing the follow-up sec 8 quantified.
+# ---------------------------------------------------------------------------
+V = R["cva"]
+Experiment(
+    name="adapted_degree1_cv_mechanism",
+    script=SCRIPT28,
+    hypothesis="Degrees are exactly orthogonal, so span R^2 is additive "
+               "across degree blocks: replacing the 256-feature input-basis "
+               "k=1 control variate with m ~ 24 directions spanning the "
+               "mean-field Jacobian, and keeping the coordinate k=2 block, "
+               "raises effective R^2 from 27.2% to 31.0% and must therefore "
+               "cut the unbiased true MSE of the raw (unit-coefficient) "
+               "control-variate arm by about 3%.",
+    acceptance_bar=1.02,
+    bar_metric="mechanism_gain_over_shipped_arm",
+    bar_direction="higher_is_better",
+).record(
+    seed=0, n_mlps=V["n_train_mlps"], gt_samples=200_000,
+    estimator="sparse MC - cva24 - cv2, coefficient fixed at 1, no head",
+    compute_ratio=0.0,
+    raw_final_layer_mse=V["unit_coef_cva24_cv2"],
+    mechanism_gain_over_shipped_arm=V["mechanism_gain_over_shipped_arm"],
+    unit_coef_sparse_mc=V["unit_coef_sparse_mc"],
+    unit_coef_cv1=V["unit_coef_cv1"],
+    unit_coef_cv1_cv2=V["unit_coef_cv1_cv2"],
+    unit_coef_cv1mf=V["unit_coef_cv1mf"],
+    unit_coef_cva24=V["unit_coef_cva24"],
+    unit_coef_cva24_cv2=V["unit_coef_cva24_cv2"],
+    m_grid=V["m_grid"], m_validation_gain=V["m_validation_gain"],
+    m_selected=V["m_selected"],
+    notes=V["notes"],
+)
+
+Experiment(
+    name="adapted_degree1_cv_end_to_end",
+    script=SCRIPT28,
+    hypothesis="That 3% survives the offline head and the cost of extracting "
+               "the directions, so the adapted degree-1 block beats the "
+               "shipped adjusted score of 4.0142e-07 on the official suite.",
+    acceptance_bar=4.0142e-07,
+    bar_metric="adjusted_final_layer_score",
+    bar_direction="lower_is_better",
+).record(
+    seed=0, n_mlps=100, gt_samples=1_000_000_000,
+    estimator="sparse MC + layer-1 Hermite k<=2 + adapted degree-1 block "
+              "(m=48) + 18-column offline ridge head",
+    adjusted_final_layer_score=V["official_adj1"],
+    adjusted_at_2x_residual=V["official_adj2"],
+    adjusted_at_3x_residual=V["official_adj3"],
+    raw_final_layer_mse=V["official_raw"],
+    compute_ratio=V["official_cb"],
+    flop_ratio=V["official_fb"],
+    same_run_shipped_raw=V["ship_raw"],
+    same_run_shipped_adjusted=V["ship_adj1"],
+    same_run_shipped_compute_ratio=V["ship_cb"],
+    raw_ratio_against_ship=V["raw_ratio"],
+    adjusted_ratio_against_ship=V["adj_ratio"],
+    ablation_damp0_raw=V["abl_raw"],
+    n_raises=V["official_raises"],
+    worst_single_mlp_mse=V["official_worst"],
+    validation_gain=V["val_gain_18col"],
+    validation_gain_previous_design=V["val_gain_15col"],
+    test_split_gain=V["test_gain_18col"],
+    test_split_gain_previous_design=V["test_gain_15col"],
+    leave_out_cva_validation=V["loo_without_cva"],
+    only_cva_validation=V["only_cva"],
+    only_cv1_validation=V["only_cv1"],
+    shipped_corrector_sha256=V["corrector_npz_sha256"],
+    notes=V["notes"],
+)
+
+print("recorded 2 more rows (round 9b)")

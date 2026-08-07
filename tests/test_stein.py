@@ -115,7 +115,12 @@ def test_shipped_feature_order_is_one_object():
     spec.loader.exec_module(sub)
 
     assert tuple(sub.FEATURES) == tuple(C.FEATURES)
-    assert set(C.FEATURES) | set(C.DROPPED) == set(C.FEATURES_FULL)
+    # FEATURES_FULL is the frozen 28-column research design that every
+    # ablation table in docs/learned_corrector.md indexes; round 9 appended
+    # the adapted degree-1 block as FEATURES_V2 rather than reordering it, so
+    # the old tables still mean what they say.
+    assert tuple(C.FEATURES_V2[:len(C.FEATURES_FULL)]) == tuple(C.FEATURES_FULL)
+    assert set(C.FEATURES) | set(C.DROPPED) == set(C.FEATURES_V2)
     assert not set(C.FEATURES) & set(C.DROPPED)
     beta = np.load(ROOT / "submission" / "corrector.npz")["beta"]
     assert beta.shape == (C.N_FEATURES,), (beta.shape, C.N_FEATURES)
