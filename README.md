@@ -117,6 +117,29 @@ that would separate them costs 44% of `N`. Same shape as `cva`, a different
 reason — hence the standing rule this round adds: **quote every new dictionary
 twice, jointly fitted and at deployable block weights on unbiased true MSE.**
 
+**The offline-trained corrector has now been scaled, and it saturates**
+(`docs/big_corrector.md`). 475 freshly generated MLPs × 4 estimator seeds at
+the *deployed* `(τ, N, P) = (2.5, 25000, 225)`, split by MLP seed, gives
+**1.286× on the held-out test split over the shipped 15-float head** — a
+projected graded **1.9707e-07** against the graded 2.4646e-07 — from a
+**390-byte, 32-coefficient** artifact that `fnp.load` reads at **0 FLOPs in
+1.0 ms**. What carries it is one new channel: the layer-1 covariance gap
+contracted through the *exactly known* `Cov(z²)`, for one elementwise square of
+an array the pass already made. **Everything else about the scaling premise is
+refuted.** Capacity is worthless — 8,305 → 131,185 parameters is monotonically
+*worse* at every training-set size, and a trained numpy MLP is worse still,
+because validation raises the penalty until the added features are shrunk to
+zero. Data is worthless — the shipped design is saturated at **eight** training
+MLPs and the 83-column one by 120. Label precision is worthless — at 16× less
+reference the training labels are 3× noisier than the signal they label and the
+held-out gain moves under 1%. And per-MLP-optimal coefficients, which bound
+every head at once, are **0.84×/0.94×** of one shared vector. The binding
+constraint is the supply of exactly-mean-zero statistics, and the network has
+exactly two sources: `z¹` is exactly Gaussian and `E[z²]`/`Cov(z²)` follow from
+the arc-cosine kernel. That page also adds the closed-form graded optimum
+`adjusted(N*) = (√(b²F₀) + √(vc))² / B`, which reproduces the graded score to
+0.2% and the graded argmin `N` to 3%.
+
 **The bit-packing lane is open, priced, and still loses** (`docs/bitslice.md`).
 Forum 18125 has the AIcrowd team treating bit-packing as a legitimate
 optimisation — a `uint32` `bitwise_and` bills 1 FLOP for 32 boolean lanes — so
