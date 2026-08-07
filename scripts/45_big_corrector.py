@@ -98,7 +98,6 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "relu1": ("relu1",),
     "q2": ("q2",),
     "dpilot": ("dpilot",),
-    "pooled_u1u2": tuple(f"<{u},{k}>" for u in ("u1", "u2") for k in ()),
 }
 
 
@@ -240,8 +239,8 @@ def primitives(d: dict, rows) -> dict:
     p["one"] = one
     for k in BC.PER_SEED_SCALAR:
         p[k] = d[k][rows].astype(np.float64)[:, None] * one
-    p["lam1"] = p["lam1"] * 30.0 - 1.0
-    p["lam2"] = p["lam2"] * 100.0 - 1.0
+    p["lam1"] = p["lam1"] - 4.0
+    p["lam2"] = p["lam2"] - 0.4
     p["vbar"] = p["vbar"] - 0.025
     p["arms"] = p["arms"] - 3.1
     p["keep_frac"] = p["keep_frac"] - 0.83
@@ -259,22 +258,24 @@ def primitives(d: dict, rows) -> dict:
 
 
 def design(p: dict, ch: tuple[str, ...], sh: tuple[str, ...],
-           mod: tuple[str, ...]) -> tuple[np.ndarray, list[str]]:
-    cols, names = [], []
+           mod: tuple[str, ...], pool: tuple[str, ...] = ()):
+    """``(X, names, tags)``; ``tags[i] = (channel_or_None, "point"|"pool")``."""
+    cols, names, tags = [], [], []
     for k in sh:
         cols.append(p[k])
         names.append(k)
+        tags.append((None, "shape"))
     for k in ch:
         for m in mod:
             cols.append(p[k] if m == "one" else p[k] * p[m])
             names.append(k if m == "one" else f"{k}*{m}")
-    for u in POOL:
-        if u not in p:
-            continue
+            tags.append((k, "point"))
+    for u in pool:
         for k in ch:
             cols.append(p[u] * np.sum(p[u] * p[k], axis=-1, keepdims=True))
             names.append(f"<{u},{k}>{u}")
-    return np.stack(cols, axis=-1), names
+            tags.append((k, "pool"))
+    return np.stack(cols, axis=-1), names, tags
 
 
 def umse(pred, a, b) -> float:
@@ -376,9 +377,9 @@ def mode_fit(lams, limit_mlps, rf_feats, rf_scale, rf_seed, out_name,
 
     # ---- 3. the rich design ----------------------------------------------
     ch = tuple(k for k in CH if float(np.abs(pt[k]).max()) > 0)
-    Xt, names = design(pt, ch, SH, MOD)
-    Xv, _ = design(pv, ch, SH, MOD)
-    Xx, _ = design(px, ch, SH, MOD)
+    Xt, names, tags = design(pt, ch, SH, MOD, POOL)
+    Xv, _, _ = design(pv, ch, SH, MOD, POOL)
+    Xx, _, _ = design(px, ch, SH, MOD, POOL)
     nf = Xt.shape[-1]
     print(f"\n=== 3. rich linear design, {nf} columns "
           f"({len(ch)} correction channels x {len(MOD)} modulators "
@@ -394,20 +395,24 @@ def mode_fit(lams, limit_mlps, rf_feats, rf_scale, rf_seed, out_name,
     if do_groups:
         print("\n=== 4. leave-one-group-out / only-one-group, on validation ===")
         print(f"  {'group':<12} {'without':>11} {'x':>8} {'only':>11} {'x':>8}")
-        for gname, gcols in GROUPS.items():
-            if not any(g in ch for g in gcols):
+        sel = dict(GROUPS)
+        sel["POOLED (all)"] = None
+        for gname, gcols in sel.items():
+            if gcols is not None and not any(g in ch for g in gcols):
                 continue
-            drop = [i for i, n_ in enumerate(names)
-                    if n_.split("*")[0] in gcols]
-            keep = np.setdiff1d(np.arange(nf), drop)
+            if gcols is None:
+                inn = np.array([t[1] == "pool" for t in tags])
+            else:
+                inn = np.array([t[0] in gcols for t in tags])
+            keep = np.flatnonzero(~inn)
             _, v1, _ = fit_eval(Xt2[:, keep], yt, Xv[:, :, keep], MU[val],
                                 A[val], B[val], lams, scale[keep])
-            only = np.array([i for i, n_ in enumerate(names)
-                             if n_.split("*")[0] in gcols or n_ in SH])
+            only = np.flatnonzero(inn | np.array([t[1] == "shape"
+                                                  for t in tags]))
             _, v2, _ = fit_eval(Xt2[:, only], yt, Xv[:, :, only], MU[val],
                                 A[val], B[val], lams, scale[only])
-            print(f"  {gname:<12} {v1:11.4e} {base['v'] / v1:8.3f} "
-                  f"{v2:11.4e} {base['v'] / v2:8.3f}")
+            print(f"  {gname:<13} {v1:11.4e} {base['v'] / v1:8.3f} "
+                  f"{v2:11.4e} {base['v'] / v2:8.3f}", flush=True)
 
     # ---- 5. the random-feature head ---------------------------------------
     # Inputs are made SCALE-FREE first: every correction column is divided by
@@ -526,15 +531,16 @@ def mode_curve(lams, rf_feats, rf_scale, rf_seed, grid) -> None:
         yt = (0.5 * (A[trn] + B[trn]) - MU[trn]).ravel()
         out = []
         cols15 = ("cv1", "cv2", "cv1mf")
-        X15t, _ = design(pt, cols15, ("one", "s", "Phi", "phi", "alpha"), MOD)
-        X15v, _ = design(pv, cols15, ("one", "s", "Phi", "phi", "alpha"), MOD)
-        X15x, _ = design(px, cols15, ("one", "s", "Phi", "phi", "alpha"), MOD)
+        SH15 = ("one", "s", "Phi", "phi", "alpha")
+        X15t, _, _ = design(pt, cols15, SH15, MOD)
+        X15v, _, _ = design(pv, cols15, SH15, MOD)
+        X15x, _, _ = design(px, cols15, SH15, MOD)
         _, _, b = fit_eval(X15t.reshape(-1, X15t.shape[-1]), yt, X15v,
                            MU[val], A[val], B[val], lams)
         out.append(base_x / umse(MU[tst] + X15x @ b, A[tst], B[tst]))
-        Xt, _ = design(pt, ch, SH, MOD)
-        Xv, _ = design(pv, ch, SH, MOD)
-        Xx, _ = design(px, ch, SH, MOD)
+        Xt, _, _ = design(pt, ch, SH, MOD, POOL)
+        Xv, _, _ = design(pv, ch, SH, MOD, POOL)
+        Xx, _, _ = design(px, ch, SH, MOD, POOL)
         _, _, b = fit_eval(Xt.reshape(-1, Xt.shape[-1]), yt, Xv, MU[val],
                            A[val], B[val], lams)
         out.append(base_x / umse(MU[tst] + Xx @ b, A[tst], B[tst]))
@@ -589,8 +595,8 @@ def mode_noise(lams, grid_mlps, infl) -> None:
     trn_m = np.unique(d["mlp_seeds"][trn_all])
     pv, px = primitives(d, val), primitives(d, tst)
     ch = tuple(k for k in CH if float(np.abs(pv[k]).max()) > 0)
-    Xv, _ = design(pv, ch, SH, MOD)
-    Xx, _ = design(px, ch, SH, MOD)
+    Xv, _, _ = design(pv, ch, SH, MOD, POOL)
+    Xx, _, _ = design(px, ch, SH, MOD, POOL)
     print(f"# held-out TEST gain: training MLPs x simulated reference size\n"
           f"# base n_gt = {n_gt:,} per half (x2 halves), rms label noise "
           f"{np.sqrt(np.mean(lab_var)):.3e}\n")
@@ -604,7 +610,7 @@ def mode_noise(lams, grid_mlps, infl) -> None:
             continue
         trn = np.flatnonzero(np.isin(d["mlp_seeds"], trn_m[:g]))
         pt = primitives(d, trn)
-        Xt, _ = design(pt, ch, SH, MOD)
+        Xt, _, _ = design(pt, ch, SH, MOD, POOL)
         Xt2 = Xt.reshape(-1, Xt.shape[-1])
         row = []
         for f in infl:
