@@ -10,6 +10,11 @@ _artifacts/
 # --mode fit --install).
 !submission/corrector.npz
 
+# ...and the scaled successor head from scripts/45_big_corrector.py, which
+# is 5.9 KB and regenerable bit-for-bit by --mode data then --mode export.
+# NOT yet wired into submission/estimator.py; see docs/big_corrector.md sec 9.
+!submission/bigcorr_head.npz
+
 # Local environment
 .venv/
 venv/

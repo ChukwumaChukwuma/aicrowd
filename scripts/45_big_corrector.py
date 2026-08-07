@@ -873,16 +873,23 @@ def mode_export(lams, out_name: str, pool=POOL, drop=()) -> None:
     Xs = Xtv.reshape(-1, len(names)) / sc
     beta_ship = (BC.ridge_solve(Xs.T @ Xs, Xs.T @ ytv, lam, len(Xs)) / sc)
 
+    # NUMERIC ONLY.  ``fnp.load`` refuses any non-numeric dtype outright
+    # ("object dtype would require pickle"), so a string column-name array in
+    # the shipped npz is a hard failure at setup, not a warning.  The names go
+    # in a sidecar JSON that the submission never reads.
     p = data_dir() / out_name
-    np.savez(p, beta=beta_ship.astype(np.float32),
-             features=np.array(names), channels=np.array(ch),
-             shape_cols=np.array(sh), modulators=np.array(MOD),
-             pool=np.array(pool if pool else [""]), lam=float(lam),
-             n_train_mlps=len(np.unique(d["mlp_seeds"][trn])),
-             n_fit_mlps=len(np.unique(d["mlp_seeds"][tv])),
-             test_gain=float(base_x / xx), val_gain=float(base_v / vv),
-             tau=SHIP_TAU, n_samples=SHIP_N, n_pilot=SHIP_P)
-    print(f"wrote {p}  ({p.stat().st_size} bytes, {len(names)} coefficients)")
+    np.savez(p, beta=beta_ship.astype(np.float32))
+    meta = {"features": list(names), "channels": list(ch),
+            "shape_cols": list(sh), "modulators": list(MOD),
+            "pool": list(pool), "lam": float(lam),
+            "n_train_mlps": int(len(np.unique(d["mlp_seeds"][trn]))),
+            "n_fit_mlps": int(len(np.unique(d["mlp_seeds"][tv]))),
+            "test_gain": float(base_x / xx), "val_gain": float(base_v / vv),
+            "tau": SHIP_TAU, "n_samples": SHIP_N, "n_pilot": SHIP_P,
+            "beta": beta_ship.tolist()}
+    (data_dir() / (out_name + ".json")).write_text(json.dumps(meta, indent=1))
+    print(f"wrote {p}  ({p.stat().st_size} bytes, {len(names)} coefficients) "
+          f"+ {out_name}.json")
     print(f"  penalty {lam:.0e} selected on validation; TEST gain of the "
           f"train-only fit {base_x / xx:.3f}x")
     sp = Path(__file__).resolve().parent.parent / "submission" / "corrector.npz"
