@@ -271,8 +271,9 @@ def mode_sweep(seeds, n, n_stat, reps, tau, grid) -> None:
     print(f"# ship: v_eff={SHIP_V_EFF}, c={SHIP_C:,.0f}, product={SHIP_PRODUCT:,.0f}")
     print(f"# a config wins if (v_eff + v_q) * c(b) < {SHIP_PRODUCT / 1.15:,.0f}\n")
 
-    hdr = (f"{'config':<26}{'v_nat':>9}{'v_q':>10}{'v_q/v_nat':>11}"
-           f"{'c/samp':>10}{'x c':>7}{'v*c':>11}{'x ship':>8}{'rms bias':>10}")
+    hdr = (f"{'config':<24}{'v_q':>9}{'c/samp':>10}{'x c':>6}{'v*c':>10}"
+           f"{'x ship':>7}{'rms bias':>10}{'0.1b^2':>10}{'adjusted':>11}"
+           f"{'x ship adj':>11}")
     print(hdr)
     print("-" * len(hdr))
     out = []
@@ -293,15 +294,23 @@ def mode_sweep(seeds, n, n_stat, reps, tau, grid) -> None:
         c = float(np.mean(cost))
         v_eff = SHIP_V_EFF + vq_
         prod = v_eff * c
-        rb = float(np.sqrt(np.mean(np.concatenate(bias) ** 2)))
-        print(f"{cfg.label():<26}{vn_:>9.4f}{vq_:>10.4f}{vq_ / vn_:>11.3f}"
-              f"{c:>10,.0f}{SHIP_C / c:>7.2f}{prod:>11,.0f}"
-              f"{SHIP_PRODUCT / prod:>8.3f}{rb:>10.2e}")
+        B, S = np.concatenate(bias), np.concatenate(se)
+        rb = float(np.sqrt(np.mean(B ** 2)))
+        b2 = max(float(np.mean(B ** 2) - np.mean(S ** 2)), 0.0)
+        # the score in full: adjusted = 0.1 b^2 + v_eff c / B  (docs/graded.md
+        # sec 3).  Reporting v_eff*c alone is only honest for an UNBIASED
+        # estimator, and part B of --mode bias shows this one is not.
+        adj = 0.1 * b2 + prod / FLOP_BUDGET
+        print(f"{cfg.label():<24}{vq_:>9.4f}{c:>10,.0f}{SHIP_C / c:>6.2f}"
+              f"{prod:>10,.0f}{SHIP_PRODUCT / prod:>7.3f}{rb:>10.2e}"
+              f"{0.1 * b2:>10.2e}{adj:>11.3e}{2.4646e-07 / adj:>11.4f}")
         out.append({"config": cfg.label(), "ba": cfg.ba, "bw": cfg.bw,
                     "kappa": cfg.kappa, "groups": cfg.groups, "anti": cfg.anti,
                     "wmeanfix": cfg.wmeanfix, "v_nat": vn_, "v_q": vq_,
                     "v_eff": v_eff, "c": c, "v_eff_times_c": prod,
-                    "gain_vs_ship": SHIP_PRODUCT / prod, "rms_bias": rb})
+                    "gain_vs_ship": SHIP_PRODUCT / prod, "rms_bias": rb,
+                    "bias_sq_unbiased": b2, "adjusted": adj,
+                    "gain_vs_ship_adjusted": 2.4646e-07 / adj})
     (artifacts() / "sweep.json").write_text(json.dumps(
         {"n": n, "reps": reps, "seeds": seeds, "rows": out}, indent=1))
     best = min(out, key=lambda r: r["v_eff_times_c"])
@@ -423,6 +432,7 @@ def _cost_of(cfg, alpha, tau):
     k_prev = WIDTH
     for l in range(DEPTH):
         k_out = WIDTH if l == DEPTH - 1 else int(keep[l].sum())
+        k_out = -(-k_out // 32) * 32        # whole uint32 words, as the kernel
         total += packed_layer_cost(k_prev, k_out, cfg.ba_at(l), cfg.bw_at(l))
         k_prev = k_out
     return total
@@ -430,46 +440,89 @@ def _cost_of(cfg, alpha, tau):
 
 # ---------------------------------------------------------------------------
 def mode_bias(seeds, n, n_stat, reps, cfgs) -> None:
-    """Is the stochastic rounding unbiased?  The whole lane depends on it.
+    """Is the stochastic rounding unbiased?  Yes -- and it does not matter.
 
-    A biased quantiser enters the score as ``0.1 * b^2`` and does NOT divide by
-    ``N``; an unbiased one enters as variance and does.  ``reps`` independent
-    rounding draws share ONE input stream and one exact reference, so the
-    difference of the means is an estimate of the bias whose standard error is
-    the across-replicate spread -- no reference-noise term at all.
+    The brief's premise was that stochastic rounding is unbiased, so
+    quantisation error is variance, and variance divides by N.  The first half
+    is true and is proved here directly.  The second half does not follow, and
+    the reason is the only interesting thing in this file.
+
+    PART A runs the quantiser through ONE contraction and no relu.  There the
+    rounding is exactly unbiased and the measurement says so: the bias sits
+    inside its own standard error at every precision.
+
+    PART B runs the same quantiser through 1, 2, 4, ... 32 relu layers.  relu
+    is CONVEX, so E[relu(z + eps)] > E[relu(z)] whenever eps has any variance
+    at all: an unbiased perturbation of the pre-activation is a BIASED
+    perturbation of the activation, by (1/2) v phi(alpha)/s to leading order,
+    and that shift then propagates and compounds.  Unbiasedness of the
+    ROUNDING is not unbiasedness of the ESTIMATOR, and only the latter is what
+    ``0.1 b^2`` charges for.
     """
-    print(f"# unbiasedness: {reps} independent rounding draws on ONE fixed\n"
-          f"# input stream of N={n}, vs the exact float pass on the same stream.\n")
-    hdr = (f"{'config':<26}{'rms bias':>11}{'rms se':>11}{'bias/se':>9}"
-           f"{'max |t|':>9}{'0.1*b^2':>11}{'vs score':>10}")
+    from whestfloor.bitslice import np_quant_act, np_quant_weight  # noqa: PLC0415
+
+    print("# PART A -- one contraction, NO relu.  Is the rounding unbiased?")
+    print(f"# {reps} independent rounding draws, N={n} fixed inputs, paired.\n")
+    hdr = (f"{'b_a':>5}{'b_w':>5}{'rms bias':>12}{'rms se':>11}"
+           f"{'|bias|/se':>11}{'max |t|':>10}{'verdict':>12}")
     print(hdr)
     print("-" * len(hdr))
-    rows = []
+    rowsA = []
+    W = make_mlp(WIDTH, DEPTH, seeds[0])[0]
+    rx = np.random.default_rng(4242)
+    h = np.maximum(rx.standard_normal((n, WIDTH), dtype=np.float32), 0.0)
+    exact = (h @ W).mean(axis=0, dtype=np.float64)
+    for ba, bw in ((2, 4), (4, 6), (6, 8)):
+        lo = np.zeros(WIDTH, dtype=np.float32)
+        step = np.full(WIDTH, float(h.max()) / (2 ** ba - 1), dtype=np.float32)
+        qw, ws = np_quant_weight(W, bw, np.random.default_rng(9), stochastic=True)
+        what = qw * ws[None, :]
+        D = []
+        for r in range(reps):
+            q = np_quant_act(h, lo, step, float(2 ** ba - 1),
+                             np.random.default_rng(600 + r))
+            hq = lo[None, :] + q * step[None, :]
+            z = hq @ what
+            z = z + hq.mean(axis=0, dtype=np.float64).astype(np.float32) @ (W - what)
+            D.append(z.mean(axis=0, dtype=np.float64) - exact)
+        D = np.asarray(D)
+        bi, se = D.mean(0), D.std(0, ddof=1) / math.sqrt(reps)
+        rb, rs = float(np.sqrt(np.mean(bi ** 2))), float(np.sqrt(np.mean(se ** 2)))
+        t = np.abs(bi) / np.maximum(se, 1e-300)
+        v = "UNBIASED" if rb < 2 * rs else "biased"
+        print(f"{ba:>5}{bw:>5}{rb:>12.3e}{rs:>11.3e}{rb / rs:>11.2f}"
+              f"{t.max():>10.2f}{v:>12}")
+        rowsA.append({"ba": ba, "bw": bw, "rms_bias": rb, "rms_se": rs,
+                      "ratio": rb / rs, "max_t": float(t.max())})
+
+    print("\n# PART B -- the SAME quantiser through d relu layers.")
+    print(f"# bias of the layer-d mean, {reps} rounding draws, N={n}.\n")
+    hdr = (f"{'config':<18}{'depth':>6}{'v_q':>10}{'rms bias':>11}"
+           f"{'rms se':>10}{'b/se':>8}{'0.1b^2':>11}{'x score':>9}")
+    print(hdr)
+    print("-" * len(hdr))
+    rowsB = []
     for cfg in cfgs:
-        B, S = [], []
-        for s in seeds:
-            W = make_mlp(WIDTH, DEPTH, s)
-            m_z, s_z = oracle_stats(W, n_stat, s + 7)
-            _, _, bi, e, _ = _v_and_bias(W, (m_z, s_z), cfg, n, s + 11, reps)
-            B.append(bi)
-            S.append(e)
-        B, S = np.concatenate(B), np.concatenate(S)
-        rb, rs = float(np.sqrt(np.mean(B ** 2))), float(np.sqrt(np.mean(S ** 2)))
-        t = np.abs(B) / np.maximum(S, 1e-30)
-        # the bias estimate is itself noisy; the UNBIASED estimate of the
-        # squared bias removes the estimator's own variance
-        b2 = max(float(np.mean(B ** 2) - np.mean(S ** 2)), 0.0)
-        print(f"{cfg.label():<26}{rb:>11.3e}{rs:>11.3e}{rb / rs:>9.2f}"
-              f"{t.max():>9.2f}{0.1 * b2:>11.3e}{0.1 * b2 / 2.4646e-07:>10.3f}")
-        rows.append({"config": cfg.label(), "rms_bias": rb, "rms_se": rs,
-                     "unbiased_b2": b2, "adjusted_cost_of_bias": 0.1 * b2,
-                     "fraction_of_shipped_score": 0.1 * b2 / 2.4646e-07})
-    print("\n'0.1*b^2' is what a bias of this size would ADD to the adjusted")
-    print("score; 'vs score' expresses it as a fraction of the shipped")
-    print("2.4646e-07.  A value well under 1 means the rounding is unbiased")
-    print("enough that the lane lives or dies on variance alone.")
+        for d in (1, 2, 4, 8, 16, 32):
+            for s in seeds[:1]:
+                Wd = make_mlp(WIDTH, DEPTH, s)[:d]
+                m_z, s_z = oracle_stats(Wd, n_stat, s + 7)
+                _, vq, bi, se, _ = _v_and_bias(Wd, (m_z, s_z), cfg, n, s + 11, reps)
+                rb = float(np.sqrt(np.mean(bi ** 2)))
+                rs = float(np.sqrt(np.mean(se ** 2)))
+                b2 = max(float(np.mean(bi ** 2) - np.mean(se ** 2)), 0.0)
+                print(f"{cfg.label():<18}{d:>6}{vq:>10.5f}{rb:>11.3e}"
+                      f"{rs:>10.2e}{rb / rs:>8.1f}{0.1 * b2:>11.3e}"
+                      f"{0.1 * b2 / 2.4646e-07:>9.1f}")
+                rowsB.append({"config": cfg.label(), "depth": d, "v_q": vq,
+                              "rms_bias": rb, "rms_se": rs,
+                              "adjusted_cost_of_bias": 0.1 * b2,
+                              "x_shipped_score": 0.1 * b2 / 2.4646e-07})
+    print("\nPART A says the rounding is unbiased.  PART B says the ESTIMATOR")
+    print("is not, and that the bias appears the moment a relu is in the path")
+    print("and then grows with depth.  ``0.1 b^2`` is charged on the second.")
     (artifacts() / "bias.json").write_text(json.dumps(
-        {"n": n, "reps": reps, "rows": rows}, indent=1))
+        {"n": n, "reps": reps, "linear": rowsA, "relu": rowsB}, indent=1))
 
 
 # ---------------------------------------------------------------------------
@@ -504,9 +557,10 @@ def main() -> int:
         mode_price(seeds, a.tau, 225, grid)
     elif a.mode in ("sweep", "bias"):
         grid = build_grid(a.grid)
-        (mode_sweep if a.mode == "sweep" else mode_bias)(
-            seeds, a.n, a.n_stat, a.reps,
-            *( (a.tau, grid) if a.mode == "sweep" else (grid,) ))
+        if a.mode == "sweep":
+            mode_sweep(seeds, a.n, a.n_stat, a.reps, a.tau, grid)
+        else:
+            mode_bias(seeds, a.n, a.n_stat, a.reps, grid)
     else:
         print(f"mode {a.mode} not implemented")
         return 1
@@ -534,10 +588,12 @@ def build_grid(name):
                 for ba in (3, 4, 5, 6)
                 for k in (1.75, 2.0, 2.25, 2.5, 2.75, 3.0)]
     if name == "final":
+        # kappa is the per-b_a argmin of the k-sweep; b_w spans the range over
+        # which the weight term goes from dominant to negligible.
         return [Cfg(ba=ba, bw=bw, kappa=k, groups=6, anti=True)
                 for (ba, k) in ((2, 1.5), (3, 1.9), (4, 2.2), (5, 2.5),
                                 (6, 2.8), (7, 3.0))
-                for bw in (4, 5, 6, 7)]
+                for bw in (4, 5, 6)]
     if name == "groups2":
         return [Cfg(ba=4, bw=5, kappa=2.0, groups=G, anti=True)
                 for G in (1, 2, 4, 6, 8, 12)]
@@ -554,6 +610,10 @@ def build_grid(name):
                 Cfg(**base, wmeanfix=False), Cfg(**base, stoch_w=False),
                 Cfg(**base, stoch_w=False, wmeanfix=False),
                 Cfg(**base, stochastic=False)]
+    if name == "biasproof":
+        return [Cfg(ba=2, bw=4, kappa=1.5, groups=6, anti=True),
+                Cfg(ba=4, bw=6, kappa=2.2, groups=6, anti=True),
+                Cfg(ba=6, bw=6, kappa=2.8, groups=6, anti=True)]
     if name == "wbits":
         return [Cfg(ba=4, bw=bw, kappa=3.0, groups=6) for bw in (3, 4, 5, 6, 8, 32)]
     raise SystemExit(f"unknown grid {name!r}")
