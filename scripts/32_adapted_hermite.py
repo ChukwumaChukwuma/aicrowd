@@ -216,16 +216,23 @@ PURE_DMAX, PURE_M = 16, 8
 COORD_DMAX = 8
 
 
-def tensor_indices():
-    """Multi-indices over the adapted frame, as tuples of (coord, degree)."""
+def tensor_indices(nmax: int = 10 ** 9):
+    """Multi-indices over the adapted frame, as tuples of (coord, degree).
+
+    ``nmax`` clamps every entry of :data:`TENS_PLAN` and :data:`PURE_M` to the
+    number of directions actually available, so a smaller ``--n-dirs`` degrades
+    the plan instead of indexing past the frame.  At the published
+    ``--n-dirs 24`` every clamp is a no-op and the layout is unchanged.
+    """
     seen, out = set(), []
     for deg, m in TENS_PLAN:
-        for comb in itertools.combinations_with_replacement(range(m), deg):
+        for comb in itertools.combinations_with_replacement(
+                range(min(m, nmax)), deg):
             a = tuple(sorted((r, comb.count(r)) for r in set(comb)))
             if a not in seen:
                 seen.add(a)
                 out.append(a)
-    for r in range(PURE_M):
+    for r in range(min(PURE_M, nmax)):
         for d in range(5, PURE_DMAX + 1):
             a = ((r, d),)
             if a not in seen:
@@ -251,7 +258,7 @@ class Design:
         self.Wn = Wn                    # (n, 256) unit layer-1 directions
         self.M = A.shape[1]
         n = Wn.shape[0]
-        self.tens = tensor_indices()
+        self.tens = tensor_indices(self.M)
         self.blocks = {}
         p = 0
         self.blocks["IN1"] = (p, p + n)          # x_i  (== coordinate deg 1)
