@@ -82,6 +82,29 @@ improve by **4.2–4.6×** to break even, and past that the payoff is 1.9× at
 `r = 4.4`, 5.4× at `r = 10`, 25× at `r = 30`. So the control-variate question
 reduces to the closure-accuracy question — the basis is not the lever.
 
+**That scalar has now been measured, and the answer is `r = 2.0`**
+(`docs/traj_closure.md`). The best published method for it — @jamesrahenry's
+trajectory-calibrated moment chain, per-layer linear corrections fitted
+DAgger-style on the chain's own rolled-forward states (AIcrowd discourse 18097,
+submission #314695) — is implemented here probe-free and reaches
+`r = 2.07 / 2.03 / 1.95 / 2.08` at `L = 8/16/24/32`, against the `κ₃` arm's
+1.41 and a break-even of 4.4. **His headline "8.4×" is on MSE and `r` is on
+rms, so it transfers as `r = 2.9`** — exactly where `scripts/11`'s
+exact-cumulant oracle already sat. The plateau is flat against every knob
+tried (3/8/12 features, star or the complete tree catalogue, cumulant transport
+at any gain, 7 or 11 training nets). Fed the *exact* per-neuron `κ₃`, `κ₄` and
+pair field the same chain reaches `r = 5.0–6.7` and **would** clear the bar —
+but that input is a Monte-Carlo probe of the target net, and at the `N = 4096`
+its author used it bills **63% of our entire clamp budget** for `r = 2.9`,
+while an affordable `N = 1024` (16%) gives `r = 1.5`, worse than free. What
+separates 2.0 from 5.0 is one object, and how accurately it is needed is now
+measured: the per-neuron cumulant field has to be known to **`R² > 0.99`**
+(below 0.95 it buys nothing) and the best available predictors reach 0.87
+(a polynomial in `α`), 0.81 (a 3-factor model) and ≤ 0.12 (the analytic
+diagrams). That is `docs/cumulant_expansion.md` §11 item 8 — cumulant
+*transport* — restated as a measurement. Priced: the deployable arm is
+**1.12×** after its own FLOPs; the prize behind the cumulant field is 2.3×.
+
 What survives is exact and small: `relu(z¹)` in place of `He₂` — 256 features
 instead of 512, exact mean `σ_i/√(2π)`, **1.014×** on unbiased true MSE over 48
 generated MLPs against a 1.020× prediction. The one dictionary that looked like
