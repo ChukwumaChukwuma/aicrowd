@@ -821,6 +821,7 @@ def mode_export(lams, out_name: str, pool=POOL, drop=()) -> None:
     print(f"# greedy forward selection over {len(avail)} channels, on "
           f"validation ({len(np.unique(d['mlp_seeds'][val]))} MLPs)")
     cur: tuple[str, ...] = ()
+    path: list = []
     best_v = umse(MU[val] + design(pv, (), SH, MOD, ())[0]
                   @ try_set((), SH, ())[2], A[val], B[val])
     while True:
@@ -829,10 +830,18 @@ def mode_export(lams, out_name: str, pool=POOL, drop=()) -> None:
         if not cands:
             break
         v_, k_ = min(cands)
-        if v_ > best_v * 0.998:
+        # Add while the step helps AT ALL, and pick the best PREFIX at the
+        # end.  A per-step improvement threshold stops far too early here:
+        # after two channels every single addition is worth under 0.2% and
+        # the next four together are worth 4%, because the channels are
+        # strongly collinear and each one only frees part of the next.
+        if v_ >= best_v:
             break
         cur, best_v = cur + (k_,), v_
+        path.append((v_, cur))
         print(f"  + {k_:<8} val {best_v:11.4e}  {base_v / best_v:6.3f}x")
+    best_v, cur = min(path, key=lambda t: t[0])
+    print(f"  best prefix: {len(cur)} channels at val {best_v:11.4e}")
     sh, pool = SH, ()
     SH_NOEIG = tuple(k for k in SH
                      if k not in ("u1", "u2", "lam1", "lam2"))
