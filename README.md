@@ -117,6 +117,29 @@ that would separate them costs 44% of `N`. Same shape as `cva`, a different
 reason — hence the standing rule this round adds: **quote every new dictionary
 twice, jointly fitted and at deployable block weights on unbiased true MSE.**
 
+**The bit-packing lane is open, priced, and still loses** (`docs/bitslice.md`).
+Forum 18125 has the AIcrowd team treating bit-packing as a legitimate
+optimisation — a `uint32` `bitwise_and` bills 1 FLOP for 32 boolean lanes — so
+a bit-sliced forward pass is the largest cost lever this repository has found:
+`dF/dN` **1,421,780 against 2,847,132, i.e. 2.00x**, measured in a real
+`BudgetContext` on a complete packed kernel, against Strassen's 1.13x. Two
+corrections to the premise came out of measuring it. The ceiling is
+**22.4x/(b_a b_w), not 32x** — a packed dot needs AND, popcount *and* a
+reduction over the `w` words, so break-even against float32 is at `b_a b_w =
+22`. And stochastic rounding's unbiasedness does not survive the network:
+proved unbiased through a bare contraction (rms bias / rms se = 0.97 / 1.11 /
+0.91 at three precisions), it acquires a bias at **17 sigma with one relu in
+the path**, because relu is convex and `E[relu(z+eps)] - E[relu(z)] = v
+phi(alpha)/2s > 0` turns injected VARIANCE into a MEAN shift that does not
+divide by `N`. The best `v_eff*c` over `(b_a, b_w, kappa, groups, antithetic,
+depth schedule)` is **116,358 = 0.587x the shipped 68,400**, and the best
+honest `adjusted` is **9.6x worse**, at `b_a = 7` where the packed pass already
+bills 2.4x MORE than float32. Correcting the bias by direct calibration works
+and prices the obstruction: the residual falls as `0.195/sqrt(n_cal)`, so
+reaching 0.1 of the score's bias budget needs **1.5e5 exact forward passes =
+2.3x the entire budget**. The 32x lane opens exactly where the network stops
+being locally linear.
+
 ## Layout
 
 ```
@@ -127,6 +150,7 @@ whestfloor/               research library
   kernels.py              estimator variants, flopscope-only — same code that ships
   corrector.py            control-variate features, ridge/MLP heads, numpy generator
   relu_moments.py         exact rectified-Gaussian moments and Hermite coefficients
+  bitslice.py             packed bit-sliced forward pass + its NumPy simulator
   mc.py                   raw-NumPy Monte Carlo (ground truth); never shipped
   suite.py                evaluation suites: seeds + two independent GT halves
   harness.py              scoring, including the unbiased true-MSE estimator
