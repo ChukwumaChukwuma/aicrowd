@@ -260,21 +260,33 @@ that makes it worth more.
 `--mode score`, official 100-MLP suite, `N = 27000`, `P = 600`, `N=1e9`
 reference so `raw_mse` is leaderboard-comparable:
 
-| variant | `raw_mse` | `F/B` | `C/B` | adj@1x | raises |
-|---|---|---|---|---|---|
-| ship: direct, mask as shipped | 1.1810e-06 | 0.2936 | 0.3078 | 3.6345e-07 | 0 |
-| direct, kept sets rounded to even | 1.1873e-06 | 0.2948 | 0.3095 | 3.6745e-07 | 0 |
+| variant | `raw_mse` | `F/B` | `C/B` | adj@1x | adj@2x | adj@3x | raises |
+|---|---|---|---|---|---|---|---|
+| ship: direct, mask as shipped | 1.1810e-06 | 0.2936 | 0.3078 | 3.6345e-07 | 3.8019e-07 | 3.9693e-07 | 0 |
+| direct, kept sets rounded to even | 1.1873e-06 | 0.2948 | 0.3095 | 3.6745e-07 | 3.8486e-07 | 4.0227e-07 | 0 |
+| **STRASSEN depth 1 (+ even sets)** | 1.1873e-06 | **0.2612** | 0.3025 | **3.5909e-07** | 4.0803e-07 | 4.5697e-07 | 0 |
+| gain over the ship | | **1.124x** | | **1.0121x** | 0.932x | 0.868x | |
 
-Rounding the kept sets up to even is **0.989x** on its own: +0.34% of `F` and
-+0.5% of raw. The +0.5% is not a real accuracy loss — un-pruning the least-dead
-neuron is a strictly weaker approximation — it is realisation noise of exactly
-the size the change makes (the paired rms move is 5.4e-05, i.e. 2.9e-09 of MSE
-against a raw of 1.18e-06, 0.25%). But it is a real 1.1% off the top of
-Strassen's 1.13%, and it is **avoidable**: instead of un-pruning a neuron, pad
-the sliced weight with a zero column and the next layer's slice with a zero
-row. That gives an even contraction at the same FLOP cost with no mask change
-at all, so the only remaining perturbation is Strassen's own 3.0e-07 rms. That
-is the first thing to do before this is wired into `submission/estimator.py`.
+Paired on the identical stream, the answer moves by **2.6e-07 rms** from
+Strassen and **4.2e-05 rms** from the even mask.
+
+So the machine-independent 1.124x on `F/B` survives intact and everything else
+eats it. **Rounding the kept sets up to even is 0.989x on its own**: +0.34% of
+`F` and +0.5% of raw. The +0.5% is not a real accuracy loss — un-pruning the
+least-dead neuron is a strictly weaker approximation — it is realisation noise
+of exactly the size the change makes (4.2e-05 rms is 1.8e-09 of MSE against a
+raw of 1.18e-06, 0.15%). But it is a real 1.1% off the top, and it is
+**avoidable**: instead of un-pruning a neuron, pad the sliced weight with a
+zero column and the next layer's slice with a zero row. That gives an even
+contraction at the same FLOP cost with no mask change at all, so the only
+remaining perturbation is Strassen's own 2.6e-07 rms.
+
+The rest is residual, and the adj@2x/adj@3x columns are the honest warning:
+this box's residual is what turns 1.124x of `F` into 1.0121x of `C`, and at
+twice it Strassen is a **loss**. That is why it is not shipped yet. Both fixes
+are known and both point the same way — remove the even-mask tax, and run at
+the larger `N` the pilot work has unlocked, where the fixed dispatch cost
+amortises (1.132x at `N = 90000`).
 
 Until then Strassen is **default-off in the research kernel** and the shipped
 estimator is untouched: `corrected_sparse_kernel(strassen=False)` is bitwise
