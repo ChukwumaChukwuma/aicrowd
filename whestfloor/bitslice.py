@@ -440,6 +440,87 @@ class Cfg:
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# The real flopscope path.  Everything below this line is BILLED.
+# --------------------------------------------------------------------------
+
+
+def _fnp():
+    import flopscope.numpy as fnp  # noqa: PLC0415
+    return fnp
+
+
+def bs_pack_rows(qi, ba):
+    """``(N, K)`` uint8 codes -> ``ba`` packed ``(N, K/32)`` uint32 planes.
+
+    ``packbits`` reads its input as boolean, so the bit-plane extraction is a
+    single ``bitwise_and`` with ``1 << p`` -- no shift and no cast, 1 FLOP an
+    element instead of 3.  ``fnp.view`` does not exist, so the uint8 output has
+    to be gathered into uint32 words by hand: 4 astype + 3 shift + 3 or on
+    ``(N, K/32)`` arrays, i.e. 10/32 = 0.3125 FLOPs per input element.  The
+    strided slices ``p8[:, j::4]`` are free (measured: 0 FLOPs, 0 dispatches).
+    """
+    fnp = _fnp()
+    out = []
+    for p in range(ba):
+        p8 = fnp.packbits(fnp.bitwise_and(qi, 1 << p), axis=1)
+        acc = p8[:, 0::4].astype(fnp.uint32)
+        for j in (1, 2, 3):
+            acc = fnp.bitwise_or(
+                acc, fnp.left_shift(p8[:, j::4].astype(fnp.uint32), 8 * j))
+        out.append(acc)
+    return out
+
+
+def bs_pack_cols(qw, bw):
+    """``(K, M)`` uint8 codes -> ``bw`` packed ``(K/32, M)`` uint32 planes.
+
+    Identical lane order to :func:`bs_pack_rows` -- that is the only property
+    that has to hold, since a bit-sliced product is invariant to WHICH
+    permutation of the contraction axis the lanes are in as long as both sides
+    agree.  Built once per MLP, so its cost is amortised over all N samples.
+    """
+    fnp = _fnp()
+    out = []
+    for q in range(bw):
+        p8 = fnp.packbits(fnp.bitwise_and(qw, 1 << q), axis=0)
+        acc = p8[0::4, :].astype(fnp.uint32)
+        for j in (1, 2, 3):
+            acc = fnp.bitwise_or(
+                acc, fnp.left_shift(p8[j::4, :].astype(fnp.uint32), 8 * j))
+        out.append(acc)
+    return out
+
+
+def bs_matmul(aplanes, wplanes, rowsum, bw):
+    """``sum_i q_a[i] q_w[i,j]`` from packed planes.  The whole point.
+
+    For each activation plane ``p`` and weight plane ``q``:
+
+        AND      (N, w, M) uint32   w M   FLOPs a sample   (32 lanes each)
+        popcount (N, w, M) uint8    w M
+        reduce   over the w words   (w-1) M   at an int32 accumulator
+        shift+add into the total    2 M
+
+    The weights are carried in OFFSET BINARY (``q_w + 2^(bw-1)``, all planes
+    non-negative) rather than two's complement, so every plane's coefficient is
+    a positive ``2^(p+q)`` and there is no signed plane to special-case.  The
+    offset is undone by ONE per-sample scalar, ``rowsum = sum_i q_a[i]``, which
+    is a reduction over the codes -- ``K`` FLOPs a sample, independent of the
+    number of outputs.
+    """
+    fnp = _fnp()
+    acc = None
+    for p, a in enumerate(aplanes):
+        a3 = a[:, :, None]
+        for q, wv in enumerate(wplanes):
+            s = fnp.sum(fnp.bitwise_count(fnp.bitwise_and(a3, wv[None, :, :])),
+                        axis=1, dtype=fnp.int32)
+            s = s if (p + q) == 0 else fnp.left_shift(s, p + q)
+            acc = s if acc is None else acc + s
+    return acc - fnp.left_shift(rowsum, bw - 1)
+
+
 def packed_layer_cost(k_in, k_out, ba, bw, lanes=32):
     """Billed FLOPs per SAMPLE for one bit-sliced layer.
 
@@ -462,11 +543,152 @@ def packed_layer_cost(k_in, k_out, ba, bw, lanes=32):
     # quantise: (h-lo)*inv_step, +u, floor, clip(2) = 5; pack: per plane an
     # AND (packbits reads nonzero) + packbits = 2, plus the uint8->uint32
     # gather at 5/16 of a word per plane.
-    quant = k_in * (5.0 + ba * (2.0 + 5.0 / 16.0))
-    rng = k_in                       # one uniform per input element
-    deq = 3.0 * k_out                # scale, bias, relu
-    return core + comb + quant + rng + deq
+    # measured, op by op: sub+mul 2, random 1, add+floor 2, clip 2, astype 1,
+    # rowsum 1  = 9; then per plane an AND + packbits (2) and the uint8 ->
+    # uint32 gather (10 ops on K/32 words = 0.3125).
+    quant = k_in * (9.0 + ba * (2.0 + 10.0 / 32.0))
+    deq = 5.0 * k_out                # astype, scale, offset, bias, relu
+    return core + comb + quant + deq
 
 
 def dense_layer_cost(k_in, k_out):
     return 2.0 * k_in * k_out - k_out
+
+
+# --------------------------------------------------------------------------
+# End-to-end billed kernel
+# --------------------------------------------------------------------------
+
+
+def bs_pilot(weights, rng, n_pilot):
+    """Short dense pass -> ``(m, s, mean_h)``, all ``(depth, width)``."""
+    fnp = _fnp()
+    x = rng.standard_normal((n_pilot, weights[0].shape[0]), dtype=fnp.float32)
+    ms, e2, mh = [], [], []
+    for w in weights:
+        z = x @ w
+        ms.append(fnp.mean(z, axis=0))
+        e2.append(fnp.mean(z * z, axis=0))
+        x = fnp.maximum(z, 0.0)
+        mh.append(fnp.mean(x, axis=0))
+    m = fnp.stack(ms, axis=0)
+    v = fnp.maximum(fnp.stack(e2, axis=0) - m * m, 1e-12)
+    return m, fnp.sqrt(v), fnp.stack(mh, axis=0)
+
+
+def bs_plan(weights, m, s, mean_h, tau, ba, bw, kappa, kappa0, lanes=32):
+    """Per-MLP plan.  None of this is per sample, so none of it is in dF/dN.
+
+    Kept sets are rounded UP to a multiple of ``lanes`` (32) so the contraction
+    axis packs into whole uint32 words.  Rounding up puts the least-dead pruned
+    neurons back, so the mask is a SUPERSET of the ``tau`` mask and the
+    approximation is strictly weaker -- the same device
+    ``docs/cost_floor.md`` sec 5.1 uses to make Strassen's split legal.
+    """
+    fnp = _fnp()
+    depth = len(weights)
+    alpha = m / s
+    keeps = None if tau is None else (alpha > -tau)
+    out = []
+    keep_prev = None
+    for l, w in enumerate(weights):
+        keep = None if (keeps is None or l == depth - 1) else keeps[l]
+        if keep is not None:
+            k = int(fnp.sum(keep.astype(fnp.int32)))
+            need = -(-k // lanes) * lanes
+            if need != k:
+                thr = fnp.sort(fnp.where(keep, -3.0e38, alpha[l]))[-(need - k)]
+                keep = fnp.logical_or(keep, alpha[l] >= thr)
+        wc = w if keep is None else w[:, keep]
+        sub = wc if keep_prev is None else wc[keep_prev, :]
+        # the frozen dead neurons contract against the EXACT column-sliced
+        # matrix (full width): they are a per-MLP constant, so quantising
+        # them would buy nothing and cost accuracy
+        frozen = (None if keep_prev is None
+                  else fnp.where(keep_prev, 0.0, mean_h[l - 1]) @ wc)
+        # ---- activation window for THIS layer's input -----------------
+        if l == 0:
+            k0 = kappa0 or kappa
+            lo = fnp.full((sub.shape[0],), -float(k0), dtype=fnp.float32)
+            hi = fnp.full((sub.shape[0],), float(k0), dtype=fnp.float32)
+        else:
+            mp, sp = m[l - 1][keep_prev], s[l - 1][keep_prev]
+            lo = fnp.maximum(mp - kappa * sp, 0.0)
+            hi = fnp.maximum(mp + kappa * sp, 0.0)
+        lv = float(2 ** ba - 1)
+        step = float(fnp.max(hi - lo)) / lv          # G = 1: one scale a layer
+        # ---- weight quantiser, offset binary ---------------------------
+        lvw = float(2 ** (bw - 1) - 1)
+        wstep = fnp.maximum(fnp.max(fnp.abs(sub), axis=0), 1e-30) / lvw
+        qw = fnp.minimum(fnp.maximum(fnp.rint(sub / wstep), -lvw - 1.0), lvw)
+        what = qw * wstep
+        qwu = (qw + (lvw + 1.0)).astype(fnp.uint8)
+        planes = bs_pack_cols(qwu, bw)
+        bias = lo @ what
+        if frozen is not None:
+            bias = bias + frozen
+        out.append({"keep": keep, "keep_prev": keep_prev, "w": sub,
+                    "what": what, "resid": sub - what, "wplanes": planes,
+                    "wstep": wstep, "lo": lo, "step": step, "lv": lv,
+                    "bias": bias, "k_in": sub.shape[0], "k_out": sub.shape[1]})
+        keep_prev = keep
+    return out
+
+
+def bs_forward(x0, plan, rng, bw, wmeanfix=True):
+    """The scored pass, packed.  Everything here is per sample and billed."""
+    fnp = _fnp()
+    h = x0
+    for p in plan:
+        lo, step, lv = p["lo"], p["step"], p["lv"]
+        t = (h - lo) * (1.0 / step)
+        u = rng.random(t.shape, dtype=fnp.float32)
+        q = fnp.minimum(fnp.maximum(fnp.floor(t + u), 0.0), lv)
+        qi = q.astype(fnp.uint8)
+        rowsum = fnp.sum(qi, axis=1, dtype=fnp.int32)[:, None]
+        acc = bs_matmul(bs_pack_rows(qi, int(lv).bit_length()),
+                        p["wplanes"], rowsum, bw)
+        z = acc.astype(fnp.float32) * (step * p["wstep"]) + p["bias"]
+        if wmeanfix:
+            # hbar @ (W - What), the batch mean of the weight-quantisation
+            # residual: a quantised weight is fixed for the whole run so its
+            # error is BIAS and does not divide by N.  2 K^2 / N a sample.
+            hb = lo + fnp.mean(q, axis=0) * step
+            z = z + hb @ p["resid"]
+        h = fnp.maximum(z, 0.0)
+    return h
+
+
+def bitsliced_sparse_kernel(weights, ctx=None, tau: float | None = 2.5,
+                            n_samples: int = 22000, n_pilot: int = 225,
+                            seed: int = 0, ba: int = 4, bw: int = 6,
+                            kappa: float = 2.2, kappa0: float | None = 4.0,
+                            wmeanfix: bool = True, chunk: int | None = 8192,
+                            safe: bool = True):
+    """Sparse Monte Carlo with every scored contraction bit-sliced.
+
+    Research kernel: this is what ``scripts/44 --mode price`` bills, and its
+    answer is asserted against the NumPy simulator in
+    ``tests/test_bitslice.py``, so the variance sweeps and the FLOP counts
+    describe the same object.  It is **not** shipped -- see
+    ``docs/bitslice.md`` for why the family loses.
+    """
+    fnp = _fnp()
+    try:
+        rng = fnp.random.default_rng(seed)
+        m, s, mean_h = bs_pilot(weights, rng, n_pilot)
+        plan = bs_plan(weights, m, s, mean_h, tau, ba, bw, kappa, kappa0)
+        x0 = rng.standard_normal((n_samples, weights[0].shape[0]),
+                                 dtype=fnp.float32)
+        outs = []
+        step = chunk or n_samples
+        for lo in range(0, n_samples, step):
+            outs.append(bs_forward(x0[lo:lo + step], plan, rng, bw, wmeanfix))
+        x = outs[0] if len(outs) == 1 else fnp.concatenate(outs, axis=0)
+        return fnp.concatenate([mean_h[:-1], fnp.mean(x, axis=0)[None, :]],
+                               axis=0)
+    except Exception:                                    # noqa: BLE001
+        if not safe:
+            raise
+        from .kernels import _dense_rows                 # noqa: PLC0415
+        return _dense_rows(weights, 6000, seed)

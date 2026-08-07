@@ -350,6 +350,72 @@ def mode_layers(seeds, n, n_stat, reps, tau, ba, bw, kappa, groups) -> None:
          "v_q_per_layer": per.tolist(), "bias_per_layer": bia.tolist()}, indent=1))
 
 
+def mode_price(seeds, tau, n_pilot, grid) -> None:
+    """``dF/dN`` of the REAL packed kernel, in a real ``BudgetContext``.
+
+    Never inferred: a two-point difference in ``N`` on the same MLP, which
+    cancels the per-MLP plan (packing the weights, the masks, the pilot) and
+    leaves exactly the per-sample cost the score charges.
+    """
+    import flopscope as flops  # noqa: PLC0415
+    import flopscope.numpy as fnp  # noqa: PLC0415
+
+    from whestfloor import kernels  # noqa: PLC0415
+    from whestfloor.bitslice import bitsliced_sparse_kernel  # noqa: PLC0415
+
+    W = [fnp.asarray(w) for w in make_mlp(WIDTH, DEPTH, seeds[0])]
+
+    def run(fn, N):
+        with flops.BudgetContext(flop_budget=int(1e13), quiet=True) as c:
+            fn(N)
+        return int(c.flops_used), float(c.residual_wall_time_s)
+
+    n1, n2 = 3000, 7000
+    print(f"# dF/dN from N={n1} -> {n2}, one LOCAL MLP (seed {seeds[0]}), "
+          f"tau={tau}, P={n_pilot}\n")
+    hdr = (f"{'variant':<22}{'dF/dN':>12}{'model':>12}{'model/meas':>12}"
+           f"{'x ship c':>10}{'resid ms':>10}")
+    print(hdr)
+    print("-" * len(hdr))
+    f1, r1 = run(lambda N: kernels.sparse_mc_kernel(
+        W, tau=tau, n_samples=N, n_pilot=n_pilot, seed=1, safe=False), n1)
+    f2, _ = run(lambda N: kernels.sparse_mc_kernel(
+        W, tau=tau, n_samples=N, n_pilot=n_pilot, seed=1, safe=False), n2)
+    ship = (f2 - f1) / (n2 - n1)
+    print(f"{'ship: float32 sparse':<22}{ship:>12,.0f}{'':>12}{'':>12}"
+          f"{1.0:>10.3f}{r1 * 1e3:>10.1f}")
+    rows = [{"variant": "ship", "dFdN": ship}]
+    for ba, bw, kap in grid:
+        def mk(N, ba=ba, bw=bw, kap=kap):
+            return bitsliced_sparse_kernel(
+                W, tau=tau, n_samples=N, n_pilot=n_pilot, seed=1, ba=ba,
+                bw=bw, kappa=kap, safe=False, chunk=None)
+        f1b, r1b = run(mk, n1)
+        f2b, _ = run(mk, n2)
+        c = (f2b - f1b) / (n2 - n1)
+        mdl = _model_cost(ba, bw, tau, seeds[0])
+        print(f"{f'packed a{ba} w{bw}':<22}{c:>12,.0f}{mdl:>12,.0f}"
+              f"{mdl / c:>12.3f}{ship / c:>10.3f}{r1b * 1e3:>10.1f}")
+        rows.append({"variant": f"a{ba}w{bw}", "ba": ba, "bw": bw, "dFdN": c,
+                     "model": mdl, "gain_vs_ship": ship / c})
+    (artifacts() / "price.json").write_text(json.dumps(
+        {"tau": tau, "n_pilot": n_pilot, "rows": rows}, indent=1))
+
+
+def _model_cost(ba, bw, tau, seed, lanes=32):
+    """The cost model, on the same mask the kernel would build."""
+    W = make_mlp(WIDTH, DEPTH, seed)
+    m, s = oracle_stats(W, 8192, seed + 7)
+    keep = (m / s) > -tau
+    total, k_prev = 0.0, WIDTH
+    for l in range(DEPTH):
+        k = WIDTH if l == DEPTH - 1 else int(keep[l].sum())
+        k = -(-k // lanes) * lanes
+        total += packed_layer_cost(k_prev, k, ba, bw)
+        k_prev = k
+    return total
+
+
 def _cost_of(cfg, alpha, tau):
     """Billed FLOPs per sample for this schedule, on this MLP's mask."""
     keep = alpha > -tau
@@ -433,13 +499,16 @@ def main() -> int:
     elif a.mode == "layers":
         mode_layers(seeds, a.n, a.n_stat, a.reps, a.tau,
                     a.ba, a.bw, a.kappa, a.groups)
+    elif a.mode == "price":
+        grid = [(2, 4, 1.5), (3, 5, 1.9), (4, 6, 2.2), (5, 6, 2.5), (6, 6, 2.8)]
+        mode_price(seeds, a.tau, 225, grid)
     elif a.mode in ("sweep", "bias"):
         grid = build_grid(a.grid)
         (mode_sweep if a.mode == "sweep" else mode_bias)(
             seeds, a.n, a.n_stat, a.reps,
             *( (a.tau, grid) if a.mode == "sweep" else (grid,) ))
     else:
-        print(f"mode {a.mode} not implemented yet")
+        print(f"mode {a.mode} not implemented")
         return 1
     print(f"\n[{time.time() - t0:.1f}s]")
     return 0
@@ -458,6 +527,17 @@ def build_grid(name):
     if name == "kappa2":
         return [Cfg(ba=4, bw=5, kappa=k, groups=6, anti=True)
                 for k in (1.0, 1.25, 1.5, 1.75, 2.0, 2.5)]
+    if name == "bakappa":
+        # kappa MUST be co-optimised with b_a: the injected variance is
+        # step^2/6 + the clipped tail, and only the first term falls with b.
+        return [Cfg(ba=ba, bw=6, kappa=k, groups=6, anti=True)
+                for ba in (3, 4, 5, 6)
+                for k in (1.75, 2.0, 2.25, 2.5, 2.75, 3.0)]
+    if name == "final":
+        return [Cfg(ba=ba, bw=bw, kappa=k, groups=6, anti=True)
+                for (ba, k) in ((2, 1.5), (3, 1.9), (4, 2.2), (5, 2.5),
+                                (6, 2.8), (7, 3.0))
+                for bw in (4, 5, 6, 7)]
     if name == "groups2":
         return [Cfg(ba=4, bw=5, kappa=2.0, groups=G, anti=True)
                 for G in (1, 2, 4, 6, 8, 12)]
