@@ -103,7 +103,21 @@ def artifacts() -> Path:
 # ---------------------------------------------------------------------------
 # Numpy mirror of whestfloor.kernels._pilot_stats / _sparse_plan.
 # ---------------------------------------------------------------------------
-def pilot_stats(weights, rng, n_pilot, n):
+def pilot_stats(weights, rng, n_pilot, n, closure=False):
+    """``(alpha, mean_h)``; with ``closure``, ``mean_h`` is the RECTIFIED
+    GAUSSIAN mean ``m Phi(a) + s phi(a)`` instead of the pilot's sample mean.
+
+    Why that can matter enormously for the frozen dead-neuron constants: a
+    neuron with ``alpha < -2.5`` fires on ~0.6% of draws, so the P = 150
+    sample mean of ``relu(z)`` is a mean over ~1 nonzero observation and its
+    relative error is of order 100%.  ``m`` and ``s`` are estimated from all P
+    draws at ~6% relative error, and ``E[relu] = m Phi(a) + s phi(a)`` is
+    exact for a Gaussian marginal, so the closure trades a huge sampling error
+    for a small non-Gaussianity error -- on quantities that are tiny to begin
+    with.
+    """
+    from whestfloor import corrector as C  # noqa: PLC0415
+
     x = rng.standard_normal((n_pilot, n), dtype=np.float32)
     ms, e2s, mhs = [], [], []
     for w in weights:
@@ -114,7 +128,11 @@ def pilot_stats(weights, rng, n_pilot, n):
         mhs.append(np.mean(x, axis=0))
     m = np.stack(ms, axis=0)
     v = np.maximum(np.stack(e2s, axis=0) - m * m, VAR_FLOOR)
-    return m / np.sqrt(v), np.stack(mhs, axis=0)
+    sig = np.sqrt(v)
+    a = m / sig
+    if closure:
+        return a, (m * C.norm_cdf(a) + sig * C.norm_pdf(a)).astype(np.float32)
+    return a, np.stack(mhs, axis=0)
 
 
 def sparse_plan(weights, alpha, mean_h, tau):
@@ -318,10 +336,191 @@ def mode_check(taus, seed: int, n_pilot: int) -> None:
         print(f"       F_fix = F - 8500*dF = {F - 8500*dF:,.0f}")
 
 
+# ---------------------------------------------------------------------------
+# mode: head -- what pins N, and what it costs to unpin it
+# ---------------------------------------------------------------------------
+CLOSURE = [False]
+SHIP_FEATURES = ("one", "cv1", "cv1_Phi", "cv1_a", "cv2", "cv2_Phi", "cv2_a",
+                 "cv1mf", "cv1mf_Phi", "cv1mf_a", "s", "Phi", "phi", "a",
+                 "dpilot")
+INV_SQRT_2PI = 0.3989422804014327
+
+
+def shipped_features(W, seed, n_samples, n_pilot):
+    """``(mu, design)`` -- the numpy mirror of what ``predict`` builds.
+
+    Same generator order, same pilot, same mask, same sliced matmuls, so the
+    design here is the design the grader would see at this ``n_samples``.
+    """
+    from whestfloor import corrector as C  # noqa: PLC0415
+
+    depth, n = len(W), W[0].shape[0]
+    rng = np.random.default_rng(seed)
+    alpha, mean_h = pilot_stats(W, rng, n_pilot, n, CLOSURE[0])
+    subs, biases, _ = sparse_plan(W, alpha, mean_h, 2.5)
+
+    x0 = rng.standard_normal((n_samples, n), dtype=np.float32)
+    x, z1, h1m = x0, None, None
+    for l in range(depth):
+        z = x @ subs[l]
+        if biases[l] is not None:
+            z = z + biases[l]
+        if l == 0:
+            z1 = z
+        x = np.maximum(z, 0.0)
+        if l == 0:
+            h1m = np.mean(x, axis=0)
+    mu = np.mean(x, axis=0, dtype=np.float64)
+
+    cvs = C.hermite_cv(x0, z1, x, W[0], kmax=2, split=True)
+    cv1, cv2 = cvs[0], cvs[1]
+    m = np.mean(z, axis=0)
+    v = np.maximum(np.mean(z * z, axis=0) - m * m, VAR_FLOOR)
+    s = np.sqrt(v)
+    a = m / s
+    Ph = C.norm_cdf(a).astype(np.float32)
+    ph = C.norm_pdf(a).astype(np.float32)
+    gates = C.norm_cdf(alpha).astype(np.float32)
+    sig1 = np.sqrt(np.maximum(np.sum(W[0] * W[0], axis=0), VAR_FLOOR))
+    prop = h1m - sig1 * np.float32(INV_SQRT_2PI)
+    for l in range(1, depth):
+        prop = prop @ W[l]
+        if l < depth - 1:
+            prop = prop * gates[l]
+    mf = prop * Ph
+    one = np.ones_like(a)
+    cols = [one, cv1, cv1 * Ph, cv1 * a, cv2, cv2 * Ph, cv2 * a,
+            mf, mf * Ph, mf * a, s, Ph, ph, a, mu - mean_h[-1]]
+    return mu, np.stack([np.asarray(c, dtype=np.float64) for c in cols],
+                        axis=1)
+
+
+def _umse(pred, a, b):
+    return float(np.mean((pred - a) * (pred - b)))
+
+
+def mode_head(n_mlps: int, n_list, n_pilot: int, f0: float, c_ref: float,
+              out: str) -> None:
+    """Is ``dpilot`` the thing pinning N, and what does removing it cost?
+
+    ``dpilot = mu - mean_h[-1]`` is an inverse-variance blend with a SECOND,
+    independent estimate of the same quantity -- the pilot's own final-layer
+    mean.  The blend is unbiased for any coefficient, so with the OPTIMAL
+    coefficient it can only help; the trouble is that the shipped coefficient
+    is frozen at its N = 8500 value while the pilot's variance ``v/P`` does
+    not shrink with N.  Frozen, it injects ``beta^2 v / P`` of N-INDEPENDENT
+    error -- and that is what stops N going past ~20k.
+
+    Everything here is fitted and selected on the GENERATED training MLPs
+    (their own two independent Monte-Carlo reference halves), split by MLP.
+    """
+    from whestfloor import corrector as C  # noqa: PLC0415
+
+    src = (Path(os.environ.get("WHEST_ARTIFACTS", "_artifacts")).resolve()
+           / "corrector")
+    parts = [np.load(f) for f in sorted(src.glob("train_s*.npz"))]
+    seeds = np.concatenate([p["mlp_seeds"] for p in parts])
+    A = np.concatenate([p["gt_a"] for p in parts])
+    Bg = np.concatenate([p["gt_b"] for p in parts])
+    o = np.argsort(seeds)
+    seeds, A, Bg = seeds[o], A[o], Bg[o]
+    sel = np.linspace(0, len(seeds) - 1, n_mlps).astype(int)
+    seeds, A, Bg = seeds[sel], A[sel], Bg[sel]
+
+    rng = np.random.default_rng(20260807)
+    perm = rng.permutation(n_mlps)
+    tr, te = perm[: n_mlps // 2], perm[n_mlps // 2:]
+    beta_ship = np.load(Path(__file__).resolve().parent.parent / "submission"
+                        / "corrector.npz")["beta"].astype(np.float64)
+    keep14 = [i for i, f in enumerate(SHIP_FEATURES) if f != "dpilot"]
+
+    res = {}
+    for N in n_list:
+        t0 = time.time()
+        MU, X = [], []
+        for k, sd in enumerate(seeds):
+            W = make_mlp(WIDTH, DEPTH, int(sd))
+            mu, d = shipped_features(W, int(sd) + 1, N, n_pilot)
+            MU.append(mu)
+            X.append(d)
+            del W
+        MU, X = np.asarray(MU), np.asarray(X)
+        base = _umse(MU[te], A[te], Bg[te])
+        # Zero-refit-noise variants of the SHIPPED head: the only thing
+        # that changes is the dpilot coefficient, whose N-dependence is
+        # analytic (an inverse-variance blend of two independent unbiased
+        # estimates weights the pilot at -P/(P+N)).  Rescaling it is not a
+        # re-fit, it is applying the known law.
+        b_zero = beta_ship.copy()
+        b_zero[14] = 0.0
+        b_scale = beta_ship.copy()
+        b_scale[14] *= (n_pilot + 8500.0) / (n_pilot + N)
+        rows = [("no head at all", MU[te], None)]
+        rows.append(("shipped beta (frozen at N=8500)",
+                     MU[te] + X[te] @ beta_ship, beta_ship))
+        rows.append(("shipped, dpilot ZEROED",
+                     MU[te] + X[te] @ b_zero, b_zero))
+        rows.append(("shipped, dpilot rescaled -P/(P+N)",
+                     MU[te] + X[te] @ b_scale, b_scale))
+        for lbl, idx in (("refit 15 col at this N", list(range(15))),
+                         ("refit 14 col, dpilot DROPPED", keep14)):
+            Xt = X[tr][:, :, idx].reshape(-1, len(idx))
+            yt = (0.5 * (A[tr] + Bg[tr]) - MU[tr]).reshape(-1)
+            sc = C.design_scale(Xt)
+            best = (None, np.inf)
+            for lm in (1e-8, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2):
+                bb = C.ridge_fit(Xt, yt, lm, sc)
+                q = _umse(MU[tr] + X[tr][:, :, idx] @ bb, A[tr], Bg[tr])
+                if q < best[1]:
+                    best = (bb, q)
+            bb = best[0]
+            full = np.zeros(15)
+            full[idx] = bb
+            rows.append((lbl, MU[te] + X[te][:, :, idx] @ bb, full))
+        print(f"\n=== N = {N:,}  ({n_mlps} generated MLPs, "
+              f"{len(te)} held out, {time.time()-t0:.0f}s) ===")
+        print(f"{'head':<34}{'held-out umse':>14}{'x no-head':>10}"
+              f"{'beta_dpilot':>13}")
+        for lbl, pred, bb in rows:
+            q = _umse(pred, A[te], Bg[te])
+            bd = "-" if bb is None else f"{bb[14]:.5f}"
+            print(f"{lbl:<34}{q:14.4e}{base/q:10.3f}{bd:>13}")
+            res.setdefault(lbl, {})[N] = q
+        print(f"  optimal dpilot weight -P/(P+N) = "
+              f"{-n_pilot/(n_pilot+N):.5f}")
+
+    # ---- what each variant implies for the optimal N -------------------
+    print("\n=== implied bias floor and re-optimised N ===")
+    ns = np.asarray(sorted(n_list), dtype=float)
+    grid = np.geomspace(4e3, 4e5, 1500)
+    print(f"{'head':<34}{'b^2':>11}{'v_eff':>9}{'N*':>8}{'C/B':>7}"
+          f"{'adjusted':>12}")
+    out_rows = []
+    for lbl, dd in res.items():
+        y = np.asarray([dd[int(n)] for n in ns])
+        M = np.stack([np.ones_like(ns), 1.0 / ns], 1)
+        w = 1.0 / y
+        (b2, v), *_ = np.linalg.lstsq(M * w[:, None], y * w, rcond=None)
+        raw = max(b2, 0.0) + v / grid
+        mult = np.maximum(MULTIPLIER_FLOOR, (f0 + c_ref * grid) / FLOP_BUDGET)
+        adj = raw * mult
+        i = int(np.argmin(adj))
+        print(f"{lbl:<34}{b2:11.3e}{v:9.5f}{grid[i]:8.0f}{mult[i]:7.4f}"
+              f"{adj[i]:12.4e}")
+        out_rows.append({"head": lbl, "b2": float(b2), "v_eff": float(v),
+                         "N_star": float(grid[i]), "cb": float(mult[i]),
+                         "adjusted": float(adj[i]),
+                         "umse": {int(n): dd[int(n)] for n in ns}})
+    (artifacts() / out).write_text(json.dumps(
+        {"n_mlps": n_mlps, "n_list": list(n_list), "n_pilot": n_pilot,
+         "rows": out_rows}, indent=1))
+    print(f"\nwrote {artifacts() / out}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", required=True,
-                    choices=("sweep", "objective", "check"))
+                    choices=("sweep", "objective", "check", "head"))
     ap.add_argument("--taus", default="3.0,2.5,2.0,1.5,1.25,1.0,0.75,0.5")
     ap.add_argument("--n-mlps", type=int, default=48)
     ap.add_argument("--seed-base", type=int, default=700_000)
@@ -335,9 +534,19 @@ def main() -> int:
     ap.add_argument("--c-ref", type=float, default=2.790e6)
     ap.add_argument("--head-gain", type=float, default=1.60)
     ap.add_argument("--b2-head", type=float, default=1.029e-7)
+    ap.add_argument("--n-grid", default="8500,22000,45000")
+    ap.add_argument("--closure", action="store_true",
+                    help="frozen dead-neuron constants from the "
+                         "rectified-Gaussian closure, not the "
+                         "pilot sample mean")
     args = ap.parse_args()
 
     taus = [float(x) for x in args.taus.split(",") if x]
+    CLOSURE[0] = args.closure
+    if args.mode == "head":
+        mode_head(args.n_mlps, [int(v) for v in args.n_grid.split(",")],
+                  args.n_pilot, args.f0, args.c_ref, args.out)
+        return 0
     if args.mode == "sweep":
         mode_sweep(taus, args.n_mlps, args.seed_base, args.n_samples,
                    args.n_pilot, args.out)
