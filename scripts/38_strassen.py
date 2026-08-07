@@ -77,11 +77,6 @@ def artifacts() -> Path:
     return p
 
 
-def data_dir() -> Path:
-    return (Path(os.environ.get("WHEST_ARTIFACTS", "_artifacts")).resolve()
-            / "corrector")
-
-
 # ---------------------------------------------------------------------------
 def mode_price(n_list, tau, n_pilot, seed, coef) -> None:
     import flopscope as flops  # noqa: PLC0415
@@ -141,7 +136,8 @@ def mode_score(suite, n_mlps, n_samples, tau, n_pilot, coef) -> None:
     from whestfloor import kernels  # noqa: PLC0415
     from whestfloor.harness import run_billed  # noqa: PLC0415
 
-    beta = np.load(data_dir() / coef)["beta"]
+    beta = np.load(Path(__file__).resolve().parent.parent / "submission"
+                   / coef)["beta"]
     gt = suite.gt[:, -1, :]
     print(f"# official suite, {n_mlps} MLPs, N=1e9 reference -> raw_mse is "
           f"leaderboard-comparable.  n_samples={n_samples}\n")

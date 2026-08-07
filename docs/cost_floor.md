@@ -231,9 +231,55 @@ overhead`, charged at 1e11 FLOP/s. Depth 2 bills 1.2699x but adds ~216 ms of
 residual and is a net **1.00x**: measured and rejected.
 
 Because the extra residual is a fixed per-predict cost while the 1.1296x is per
-sample, **the trade improves with `N`** and tends to the full 1.1296x in the
-large-`N` limit — which is the direction `scripts/35 --mode head` is pushing
-the operating point.
+sample, **the trade improves with `N`**. Medians of 5 interleaved repeats, one
+thread, `tau = 2.5`, whole `predict`:
+
+| `N` | ship `C/B` | ship + chunk16k | **strassen `C/B`** | x C vs ship | x C vs best direct |
+|---|---|---|---|---|---|
+| 8,500 | 0.0985 | 0.0985 | 0.1017 | **0.968** | 0.968 |
+| 22,000 | 0.2431 | 0.2447 | 0.2317 | **1.049** | 1.049 |
+| 45,000 | 0.5295 | 0.4925 | 0.4751 | **1.115** | 1.037 |
+| 90,000 | 1.0639 | 0.9802 | 0.9401 | **1.132** | 1.043 |
+
+Read two things off it. Strassen **loses at `N = 8500`** — 800 extra dispatches
+against too few samples to amortise them — and the gain rises monotonically to
+the full billed 1.13x by `N = 90000`. And past `N ~ 35000` the *direct* path
+hits its own cache cliff, which chunking fixes for free (`ship+chunk16k`,
+1.075x at 45,000); against that repaired baseline Strassen is 1.037-1.043x. So
+the two devices overlap and should be combined, not compared: chunking is
+wired into the Strassen path too (answer-invariant to 3e-6, because chunking
+changes which rows are paired in `(A11 + A22)` and therefore the rounding, not
+the arithmetic), and pricing that combination is the open follow-up.
+
+The shipped operating point is `N = 27000`, where this table puts Strassen at
+~1.06x, and `scripts/35 --mode head` is pushing `N` up — which is the direction
+that makes it worth more.
+
+### 5.1 The even-mask tax, and how to remove it
+
+`--mode score`, official 100-MLP suite, `N = 27000`, `P = 600`, `N=1e9`
+reference so `raw_mse` is leaderboard-comparable:
+
+| variant | `raw_mse` | `F/B` | `C/B` | adj@1x | raises |
+|---|---|---|---|---|---|
+| ship: direct, mask as shipped | 1.1810e-06 | 0.2936 | 0.3078 | 3.6345e-07 | 0 |
+| direct, kept sets rounded to even | 1.1873e-06 | 0.2948 | 0.3095 | 3.6745e-07 | 0 |
+
+Rounding the kept sets up to even is **0.989x** on its own: +0.34% of `F` and
++0.5% of raw. The +0.5% is not a real accuracy loss — un-pruning the least-dead
+neuron is a strictly weaker approximation — it is realisation noise of exactly
+the size the change makes (the paired rms move is 5.4e-05, i.e. 2.9e-09 of MSE
+against a raw of 1.18e-06, 0.25%). But it is a real 1.1% off the top of
+Strassen's 1.13%, and it is **avoidable**: instead of un-pruning a neuron, pad
+the sliced weight with a zero column and the next layer's slice with a zero
+row. That gives an even contraction at the same FLOP cost with no mask change
+at all, so the only remaining perturbation is Strassen's own 3.0e-07 rms. That
+is the first thing to do before this is wired into `submission/estimator.py`.
+
+Until then Strassen is **default-off in the research kernel** and the shipped
+estimator is untouched: `corrected_sparse_kernel(strassen=False)` is bitwise
+and FLOP-for-FLOP the previous ship (asserted against the untouched
+`sparse_mc_kernel`).
 
 ## 6. Where this leaves the effort
 

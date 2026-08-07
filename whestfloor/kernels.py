@@ -796,7 +796,8 @@ def _sparse_plan(weights, alpha, mean_h, tau, even: bool = False):
 # EQUIVALENT contraction bills the same ``n w (2w-1)``.  Strassen is not an
 # equivalent contraction: it is a different algorithm that returns the same
 # matrix from 7 half-size products instead of 8.  Billed, one level of it takes
-# the scored pass from 2,845,682 to 2,508,045 FLOPs/sample -- 1.1346x -- and the
+# the whole predict from 2,841,232 to 2,515,251 billed FLOPs/sample -- 1.1296x
+# on dF/dN, measured on the real kernel -- and the
 # answer moves by 3.5e-06 absolute against activations of order 2.5, i.e. 1.4e-6
 # relative, six orders under the ~1.7e-3 residual the head is predicting.
 #
@@ -810,8 +811,10 @@ def _sparse_plan(weights, alpha, mean_h, tau, even: bool = False):
 # dispatches plus 13 elementwise ones per layer instead of 3, and a flopscope
 # dispatch costs ~26 us (elementwise) to ~106 us (matmul) of billed residual on
 # this box.  Measured, that is +26 ms = 2.6e9 effective FLOPs, a FIXED cost
-# that amortises over N while the 1.1346x is per sample -- so the gain grows
-# with N and is the full 1.1346x in the large-N limit.
+# that amortises over N while the 1.1296x is per sample.  Measured end to end
+# (medians of 5 interleaved repeats, one thread), the EFFECTIVE gain is
+# 0.968x at N=8500, 1.049x at 22000, 1.115x at 45000 and 1.132x at 90000, so
+# this is a large-N device.  See docs/cost_floor.md sec 5 for the grid.
 # --------------------------------------------------------------------------
 
 
@@ -1458,7 +1461,7 @@ def _corrected_sparse(weights, tau, n_samples, n_pilot, seed, beta, damp,
 
     if strassen:
         # Same mask (rounded up to even), same frozen constants, same answer
-        # to 1.4e-6 relative, 1.1346x fewer billed FLOPs a sample.
+        # to 3.0e-7 rms, 1.1296x fewer billed FLOPs a sample.
         # ``strassen=False`` runs the loop below and is the exact ablation.
         plan = _strassen_plan(subs, biases)
         # The row half is a plain batch split, so an odd N just drops one
