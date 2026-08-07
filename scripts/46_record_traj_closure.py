@@ -132,7 +132,11 @@ def record_ceiling():
             f"{by['mean']['r']['32']:.2f}.  The covariance error is what "
             "compensates the mean error downstream; fixing it destroys the "
             "compensation.  His numbers on the official nets: plain chain "
-            "6.0e-5, mean-only reset 1.64e-6 (r = 6.05) -- we measure 5.85."),
+            "6.0e-5, mean-only reset 1.64e-6 (r = 6.05) -- we measure "
+            f"{by['mean']['r']['32']:.2f}; his one-step-with-true-inputs "
+            "1.16e-6 (r = 7.2) -- we measure "
+            + (f"{by['mean+postcov']['r']['32']:.2f}."
+               if "mean+postcov" in by else "(not in this run).")),
     )
 
 

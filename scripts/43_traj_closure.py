@@ -642,10 +642,265 @@ def mode_fit(train_seeds, eval_seeds, official, pack_name, src, lam,
     return rows
 
 
+# ---------------------------------------------------------------------------
+# mode: stepfit -- the ceiling of the WHOLE programme
+#
+# Anchor the state to truth at every layer (so the chain contributes nothing),
+# then fit the richest per-neuron mean correction the family allows, pooled
+# across the train MLPs, and read it out on held-out ones.  Nothing a
+# trajectory-calibrated closure can do beats "perfect state tracking + the best
+# per-layer per-neuron correction", so this row bounds the programme.
+# ---------------------------------------------------------------------------
+def rich_mean_basis(sig, alpha, pa, Pa, extra=()):
+    cols = [sig * pa * alpha ** k for k in range(6)]
+    cols += [sig * Pa, sig, np.ones_like(sig)]
+    cols += list(extra)
+    return np.stack(cols, axis=1)
+
+
+def mode_stepfit(train_seeds, eval_seeds, official, layers, use_oracle_cum):
+    from whestfloor import trajclosure as tc  # noqa: PLC0415
+    print("# THE CEILING OF THE PROGRAMME.  The chain's state is overwritten\n"
+          "# with truth at every layer, so only the one-step closure error is\n"
+          "# left; then the richest per-neuron mean correction the family\n"
+          "# allows is fitted, pooled over the train MLPs, and read out on\n"
+          "# held-out ones.  No trajectory calibration can beat this.\n"
+          f"# oracle cumulants in the basis: {use_oracle_cum}\n")
+    nets = {s: load_net(s, official, True) for s in train_seeds + eval_seeds}
+
+    def states(seed):
+        """(mu0, residual, basis) at every layer, at the exact input state."""
+        _, W, ref, aux = nets[seed]
+        n = WIDTH
+        m = np.zeros(n)
+        C = W[0].T @ W[0]
+        out = []
+        for l in range(DEPTH):
+            mu0, Ch0, sig, al, pa, Pa, rho, ac = tc.closure_step(
+                m, C, exact_acos=(l == 0))
+            extra = ()
+            if use_oracle_cum:
+                k3, k4 = aux["k3"][l], aux["k4"][l]
+                var = sig * sig
+                extra = (-(k3 / 6.0) * (al * pa / var),
+                         (k4 / 24.0) * (pa * (al * al - 1.0) / (sig * var)),
+                         -(k3 / 6.0) * (al * al * pa / var),
+                         (k4 / 24.0) * (pa * al * (al * al - 1.0) / (sig * var)))
+            B = rich_mean_basis(sig, al, pa, Pa, extra)
+            out.append((mu0, ref["mean_true"][l] - mu0, B))
+            if l + 1 < DEPTH:
+                Wn = W[l + 1]
+                mt = ref["mean_true"][l]
+                Cht = aux["HH"][l].astype(np.float64) - np.outer(mt, mt)
+                m = Wn.T @ mt
+                C = Wn.T @ Cht @ Wn
+        return out
+
+    tr = {s: states(s) for s in train_seeds}
+    ev = {s: states(s) for s in eval_seeds}
+    res = {L: [] for L in layers}
+    raw = {L: [] for L in layers}
+    nai = {L: [] for L in layers}
+    noise = []
+    for l in range(DEPTH):
+        X = np.concatenate([tr[s][l][2] for s in train_seeds])
+        y = np.concatenate([tr[s][l][1] for s in train_seeds])
+        beta = solve(X, y)
+        if l + 1 in res:
+            L = l + 1
+            for s in eval_seeds:
+                ref = nets[s][2]
+                mu0, r0, B = ev[s][l]
+                res[L].append(unbiased_mse(mu0 + B @ beta, ref, L))
+                raw[L].append(unbiased_mse(mu0, ref, L))
+                nai[L].append(naive_mse(mu0 + B @ beta, ref, L))
+                noise.append(float(np.mean((ref["mA"][L - 1]
+                                            - ref["mB"][L - 1]) ** 2)) / 8.0)
+    nz = float(np.mean(noise))
+    print(f"  {'L':>4} {'one-step rms':>13} {'+ fitted corr':>14} "
+          f"{'step gain':>10}   {'(naive rms)':>12}")
+    for L in layers:
+        a0 = float(np.mean(raw[L]))
+        a1 = float(np.mean(res[L]))
+        an = float(np.mean(nai[L])) - nz
+        if a1 > nz:
+            cell = f"{math.sqrt(a0 / a1):10.3f}        "
+            val = math.sqrt(a1)
+        elif an > nz:
+            cell = f"{math.sqrt(a0 / an):10.3f} (floor)"
+            val = math.sqrt(an)
+        else:
+            cell = f"{'>' + '%.1f' % math.sqrt(a0 / nz):>10} (floor)"
+            val = math.sqrt(nz)
+        print(f"  {L:>4} {math.sqrt(max(a0,0)):13.4e} {val:14.4e} {cell}   "
+              f"{math.sqrt(max(float(np.mean(nai[L])),0)):12.4e}")
+    print(f"  reference noise on the averaged mean: {math.sqrt(nz):.2e} rms")
+    return raw, res
+
+
+# ---------------------------------------------------------------------------
+# mode: fidelity -- how accurately would the cumulant field have to be known?
+#
+# The one-step ceiling of sec 5 is unlocked by the per-neuron kappa_3/kappa_4
+# field and by nothing else.  Degrade the TRUE field to a controlled R^2 and
+# read the one-step gain back.  This converts "we cannot predict the cumulants"
+# into a number a future scheme can be held to.
+# ---------------------------------------------------------------------------
+def mode_fidelity(train_seeds, eval_seeds, official, layers, r2_grid):
+    from whestfloor import trajclosure as tc  # noqa: PLC0415
+    print("# One-step closure error at the EXACT second-order state, corrected\n"
+          "# by the Edgeworth terms of a kappa_3/kappa_4 field known to a\n"
+          "# controlled fraction R2 of its own variance (the rest is replaced\n"
+          "# by an independent draw with the matched spectrum).\n"
+          f"# per-layer coefficients fitted on {len(train_seeds)} MLPs, read "
+          f"out on {len(eval_seeds)} held out.\n")
+    rng = np.random.default_rng(20260807)
+
+    def collect(seed):
+        _, W, ref, aux = load_net(seed, official, True)
+        m = np.zeros(WIDTH)
+        C = W[0].T @ W[0]
+        rows = {}
+        for l in range(DEPTH):
+            mu0, Ch0, sig, al, pa, Pa, rho, ac = tc.closure_step(
+                m, C, exact_acos=(l == 0))
+            L = l + 1
+            if L in layers:
+                var = sig * sig
+                B0 = rich_mean_basis(sig, al, pa, Pa)
+                per_q = {}
+                for q in r2_grid:
+                    kk = []
+                    for k in (aux["k3"][l], aux["k4"][l]):
+                        z = rng.standard_normal(WIDTH)
+                        z = z / max(np.std(z), 1e-30) * np.std(k)
+                        kk.append(math.sqrt(q) * k
+                                  + math.sqrt(max(1 - q, 0.0)) * z)
+                    k3, k4 = kk
+                    ex = (-(k3 / 6.0) * (al * pa / var),
+                          (k4 / 24.0) * (pa * (al * al - 1.0) / (sig * var)),
+                          -(k3 / 6.0) * (al * al * pa / var),
+                          (k4 / 24.0) * (pa * al * (al * al - 1.0) / (sig * var)))
+                    per_q[q] = np.concatenate([B0, np.stack(ex, axis=1)],
+                                              axis=1)
+                rows[L] = (mu0, ref["mean_true"][l] - mu0, per_q, ref)
+            if l + 1 < DEPTH:
+                Wn = W[l + 1]
+                mt = ref["mean_true"][l]
+                Cht = aux["HH"][l].astype(np.float64) - np.outer(mt, mt)
+                m = Wn.T @ mt
+                C = Wn.T @ Cht @ Wn
+        return rows
+
+    tr = {s: collect(s) for s in train_seeds}
+    ev = {s: collect(s) for s in eval_seeds}
+    base = {L: float(np.mean([unbiased_mse(ev[s][L][0], ev[s][L][3], L)
+                              for s in eval_seeds])) for L in layers}
+    #: the reference's own noise, below which a residual cannot be resolved
+    floor = float(np.mean([np.mean((ev[s][layers[0]][3]["mA"]
+                                    - ev[s][layers[0]][3]["mB"]) ** 2) / 4.0
+                           for s in eval_seeds]))
+    print(f"  {'R2 of the cumulant field':>26} "
+          + "".join(f"{'gain L=%d' % L:>12}" for L in layers))
+    print(f"  {'0 (no cumulants at all)':>26} "
+          + "".join(f"{1.0:12.2f}" for L in layers))
+    for q in r2_grid:
+        cells = []
+        for L in layers:
+            X = np.concatenate([tr[s][L][2][q] for s in train_seeds])
+            y = np.concatenate([tr[s][L][1] for s in train_seeds])
+            beta = solve(X, y)
+            v = float(np.mean([
+                unbiased_mse(ev[s][L][0] + ev[s][L][2][q] @ beta,
+                             ev[s][L][3], L) for s in eval_seeds]))
+            if v < floor:
+                cells.append(f"{'>' + '%.1f' % math.sqrt(base[L]/floor):>12}")
+            else:
+                cells.append(f"{math.sqrt(base[L] / v):12.2f}")
+        print(f"  {q:26.4f} " + "".join(cells))
+    print(f"\n# '>' marks a residual below the reference's own noise floor "
+          f"({math.sqrt(floor):.2e} rms); the measurement stops there.")
+    print("\n# for scale, the best available predictors of that field:\n"
+          "#   analytic star / tree diagrams  R^2 = 0.00-0.12 at depth\n"
+          "#   3-factor model on Cov(z^L)     R^2 = 0.78-0.81\n"
+          "#   degree-5 polynomial in alpha   R^2 = 0.84-0.87")
+
+
+# ---------------------------------------------------------------------------
+# mode: price -- what a given r is actually worth on the graded score
+# ---------------------------------------------------------------------------
+#: ``docs/integrable_cv.md`` sec 3.1, official ladder (2 MLPs, --mode ladder
+#: --official): ``L -> (R2_eff, rms projected bias of the Gaussian closure)``.
+#: The bias is ``c'(mtilde - m)`` at the ridge coefficients that would actually
+#: be used, NOT ``rms(mtilde - m)``; dividing it by ``r`` is the same operation
+#: that page's ``--mode summary`` performs.
+LADDER_OFFICIAL = {
+    1: (0.4136, 5.9e-05), 2: (0.5022, 1.42e-03), 4: (0.5962, 3.16e-03),
+    8: (0.6966, 4.22e-03), 16: (0.8360, 5.33e-03), 24: (0.9295, 5.91e-03),
+    32: (0.9887, 6.36e-03),
+}
+LADDER_LOCAL = {
+    1: (0.3773, 8.8e-05), 2: (0.4615, 1.56e-03), 4: (0.5821, 3.36e-03),
+    8: (0.7164, 5.26e-03), 16: (0.8596, 6.02e-03), 24: (0.9383, 6.68e-03),
+    32: (0.9886, 7.00e-03),
+}
+V0 = 4.06e-07          # 0.1 V/N at the shipped operating point
+SHIP_ADJ = 2.47e-07    # the shipped adjusted score the ladder is scored against
+BUDGET = 2.72e11       # B
+CLAMP_BUDGET = 0.1 * BUDGET
+
+
+def price(r_by_L, ladder, closure_flops=0.0):
+    """`x ship` of the layer-``L`` control variate at closure accuracy ``r``.
+
+    ``MSE(theta) = (1-R1) V/N - 2 theta D + theta^2 (D + b^2)`` is minimised at
+    ``theta* = D/(D+b^2)`` and saves ``D^2/(D+b^2)``.  The closure's own FLOPs
+    are charged where they are actually paid: at the multiplier clamp the
+    sample budget is ``0.1B - F_closure``, so ``V/N`` inflates by
+    ``1/(1 - F_closure/0.1B)``.
+    """
+    VN = V0 / 0.1
+    R1 = ladder[1][0]
+    infl = 1.0 / max(1.0 - closure_flops / CLAMP_BUDGET, 1e-9)
+    out = []
+    for L, r in sorted(r_by_L.items()):
+        R2, b0 = ladder[L]
+        D = max(R2 - R1, 0.0) * VN * infl
+        b2 = (b0 / r) ** 2
+        mse = (1 - R1) * VN * infl - (D * D / (D + b2) if D > 0 else 0.0)
+        out.append({"L": L, "r": r, "theta": D / (D + b2) if D + b2 else 0.0,
+                    "adjusted": 0.1 * mse, "x_ship": SHIP_ADJ / (0.1 * mse)})
+    return out
+
+
+def mode_price(r_grid, layers, ladder_name, closure_flops):
+    ladder = LADDER_OFFICIAL if ladder_name == "official" else LADDER_LOCAL
+    print("# What a closure accuracy r is worth, on docs/integrable_cv.md's\n"
+          f"# exact objective, {ladder_name} ladder, closure charged "
+          f"{closure_flops:.2e} FLOPs = "
+          f"{100*closure_flops/CLAMP_BUDGET:.1f}% of the clamp budget.\n")
+    print("  " + f"{'r':>7}" + "".join(f"{'L=%d' % L:>10}" for L in layers)
+          + f"{'best':>10}")
+    for r in r_grid:
+        rows = {p["L"]: p for p in price({L: r for L in layers}, ladder,
+                                         closure_flops)}
+        best = max(rows.values(), key=lambda p: p["x_ship"])
+        print(f"  {r:7.2f}" + "".join(f"{rows[L]['x_ship']:10.3f}"
+                                      for L in layers)
+              + f"{best['x_ship']:9.3f}x @ L={best['L']}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", required=True,
-                    choices=("ref", "aux", "baseline", "ceiling", "fit"))
+                    choices=("ref", "aux", "baseline", "ceiling", "fit",
+                             "stepfit", "fidelity", "price"))
+    ap.add_argument("--r2-grid", default="0.5,0.8,0.9,0.95,0.99,1.0")
+    ap.add_argument("--oracle-cum-basis", action="store_true")
+    ap.add_argument("--r-grid", default="1,1.6,2,2.9,4.4,5.85,7.2,10")
+    ap.add_argument("--ladder", default="official",
+                    choices=("official", "local"))
+    ap.add_argument("--closure-flops", type=float, default=0.0)
     ap.add_argument("--ceilings", default="gauss,mean,postvar,mean+postvar")
     ap.add_argument("--pack", default="free")
     ap.add_argument("--src", default="star")
@@ -686,6 +941,16 @@ def main():
         mode_baseline(seeds, a.official, a.arms.split(","), layers)
     elif a.mode == "ceiling":
         mode_ceiling(seeds, a.official, layers, a.ceilings.split(","))
+    elif a.mode == "stepfit":
+        mode_stepfit(seeds[: a.train], seeds[a.train:], a.official, layers,
+                     a.oracle_cum_basis)
+    elif a.mode == "fidelity":
+        mode_fidelity(seeds[: a.train], seeds[a.train:], a.official, layers,
+                      [float(v) for v in a.r2_grid.split(",")])
+    elif a.mode == "price":
+        mode_price([float(v) for v in a.r_grid.split(",")],
+                   [L for L in (2, 4, 8, 16, 24, 32)], a.ladder,
+                   a.closure_flops)
     elif a.mode == "fit":
         mode_fit(seeds[: a.train], seeds[a.train:], a.official, a.pack, a.src,
                  a.lam, layers, a.cum, a.n_probe, transport, a.tag)
