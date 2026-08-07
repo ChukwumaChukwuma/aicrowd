@@ -63,8 +63,6 @@ own: rank 4 needs 7x.
 
 Three supporting negatives, each measured directly rather than inferred:
 
-Three supporting negatives, each measured directly rather than inferred:
-
 | claim | measurement |
 |---|---|
 | float16 is cheaper than float32 | **False.** Both bill at rate 1.000. Only float64 is penalised, at 2.0. |
