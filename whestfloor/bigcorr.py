@@ -519,39 +519,74 @@ class RFRidge:
     """
 
     def __init__(self, n_in: int, n_feat: int, seed: int = 0,
-                 scale: float = 1.0, linear: bool = True):
+                 scale: float = 1.0, linear: bool = True, n_lin: int = 0):
         rng = np.random.default_rng(seed)
-        self.A = (rng.standard_normal((n_in, n_feat))
-                  * (scale / math.sqrt(n_in))).astype(np.float32)
+        n_nl = n_in - n_lin
+        self.A = (rng.standard_normal((n_nl, n_feat))
+                  * (scale / math.sqrt(n_nl))).astype(np.float32)
         self.c = rng.uniform(-math.pi, math.pi, n_feat).astype(np.float32)
         self.linear = linear
-        self.n_in, self.n_feat = n_in, n_feat
+        self.n_in, self.n_feat, self.n_lin = n_in, n_feat, n_lin
         self.n_out = n_feat + (n_in if linear else 0)
 
     def phi(self, Xs):
+        """First ``n_lin`` columns pass through; the rest feed the tanh layer.
+
+        The split is what makes the comparison against plain ridge **nested**:
+        the linear block is the full rich design, so the random features can
+        only ever be an addition to it and any loss is the penalty's doing
+        rather than a different hypothesis class.
+        """
         X = np.asarray(Xs, dtype=np.float32)
-        h = np.tanh(X @ self.A + self.c)
+        h = np.tanh(X[:, self.n_lin:] @ self.A + self.c)
         return np.concatenate([X, h], axis=1) if self.linear else h
 
     def n_params(self) -> int:
         return self.A.size + self.c.size + self.n_out
 
-    def fit(self, X, y, lams, block: int = 16384) -> dict:
-        """Return ``{lam: beta}`` from streamed normal equations."""
+    def fit(self, X, y, lams, block: int = 16384, row_scale=None) -> dict:
+        """Return ``{lam: beta}`` from streamed normal equations.
+
+        ``row_scale`` multiplies every basis row, which is how the SCALE-FREE
+        parameterisation is reconciled with the METRIC.  The head is written as
+        ``y_j = sd_j f(z_j)`` because that is the form in which the map is a
+        bounded function of bounded inputs -- but least squares on ``y_j/sd_j``
+        minimises ``sum ((y-p)/sd)^2``, weighting each neuron by ``1/sd^2``,
+        while the score is the UNWEIGHTED ``sum (y-p)^2``.  Passing
+        ``row_scale = sd`` fits ``sd f(z)`` against ``y`` directly, which is
+        the same hypothesis class under the right loss.
+        """
         G = np.zeros((self.n_out, self.n_out), dtype=np.float64)
         b = np.zeros(self.n_out, dtype=np.float64)
         for lo in range(0, len(X), block):
             P = self.phi(X[lo:lo + block])
+            if row_scale is not None:
+                P = P * np.asarray(row_scale[lo:lo + block],
+                                   dtype=np.float32)[:, None]
             G += (P.T @ P).astype(np.float64)
             b += P.T @ np.asarray(y[lo:lo + block], dtype=np.float32)
+        # Penalise in the COLUMN-SCALED basis, exactly as the plain ridge
+        # does.  Without it the random features and the row-scaled linear
+        # block sit at wildly different magnitudes -- the linear columns carry
+        # a factor ``sd ~ 1e-3`` -- and no single ``lam`` can shrink both
+        # sensibly, which shows up as the grid pinning at its own endpoint and
+        # the nesting against plain ridge silently failing.
         n = len(X)
-        return {lam: ridge_solve(G, b, lam, n) for lam in lams}
+        dg = np.sqrt(np.maximum(np.diag(G) / n, 1e-300))
+        dg = np.where(dg > 0, dg, 1.0)
+        Gs = G / np.outer(dg, dg)
+        bs = b / dg
+        return {lam: ridge_solve(Gs, bs, lam, n) / dg for lam in lams}
 
-    def predict(self, X, beta, block: int = 16384) -> np.ndarray:
+    def predict(self, X, beta, block: int = 16384, row_scale=None):
         out = np.empty(len(X), dtype=np.float64)
         bf = np.asarray(beta, dtype=np.float32)
         for lo in range(0, len(X), block):
-            out[lo:lo + block] = self.phi(X[lo:lo + block]) @ bf
+            P = self.phi(X[lo:lo + block])
+            if row_scale is not None:
+                P = P * np.asarray(row_scale[lo:lo + block],
+                                   dtype=np.float32)[:, None]
+            out[lo:lo + block] = P @ bf
         return out
 
 
@@ -585,15 +620,15 @@ class SGDHead:
             acts.append(h)
         return acts
 
-    def predict(self, X, block: int = 65536) -> np.ndarray:
+    def predict(self, X, block: int = 65536, out_scale=None) -> np.ndarray:
         out = np.empty(len(X), dtype=np.float64)
         for lo in range(0, len(X), block):
             out[lo:lo + block] = self.forward(X[lo:lo + block])[-1][:, 0]
-        return out
+        return out if out_scale is None else out * np.asarray(out_scale)
 
     def fit(self, X, y, *, epochs: int = 30, lr: float = 3e-3,
             batch: int = 8192, wd: float = 0.0, seed: int = 0,
-            val=None, verbose: bool = False):
+            val=None, verbose: bool = False, out_scale=None):
         rng = np.random.default_rng(seed + 7)
         ps = self.W + self.b
         ms = [np.zeros_like(p) for p in ps]
@@ -608,7 +643,10 @@ class SGDHead:
                 sel = idx[lo:lo + batch]
                 acts = self.forward(X[sel])
                 m = len(sel)
-                g = (2.0 / m) * (acts[-1][:, 0] - y[sel])[:, None]
+                os_ = (1.0 if out_scale is None
+                       else np.asarray(out_scale[sel], dtype=np.float32))
+                g = (2.0 / m) * ((acts[-1][:, 0] * os_ - y[sel]) * os_
+                                 )[:, None]
                 gW, gb = [None] * nl, [None] * nl
                 for i in range(nl - 1, -1, -1):
                     gW[i] = acts[i].T @ g
