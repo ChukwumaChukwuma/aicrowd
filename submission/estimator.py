@@ -229,7 +229,7 @@ class Estimator(BaseEstimator):
         return fnp.stack(rows, axis=0)
 
     # ------------------------------------------------------------------
-    def _hermite_cv(self, x, z1, y, w1, kmax):
+    def _hermite_cv(self, x, z1, y, w1, sig1, kmax):
         """Layer-1 Hermite control-variate corrections, one per output neuron.
 
         Two length-N matvecs per order plus one (width x width) solve; billed,
@@ -239,10 +239,12 @@ class Estimator(BaseEstimator):
         one pass over the (N, width) array is saved.  Normalising the columns
         of ``W^1`` before the Gram keeps ``rho`` exactly symmetric (no divide
         to lose the tag) with an exact unit diagonal.
+
+        ``sig1 = ||W^1[:, i]||`` is passed in, not recomputed: the mean-field
+        arm needs the identical four dispatches.
         """
         n = x.shape[0]
         h = n // 2
-        sig1 = fnp.sqrt(fnp.maximum(fnp.sum(w1 * w1, axis=0), VAR_FLOOR))
         inv1 = (1.0 / sig1).astype(z1.dtype)
 
         bases = [(x, None, None, 0.0)]
@@ -276,7 +278,7 @@ class Estimator(BaseEstimator):
         return out
 
     # ------------------------------------------------------------------
-    def _meanfield_cv(self, h1m, weights, alpha, Ph):
+    def _meanfield_cv(self, h1m, sig1, weights, gates, Ph):
         """Layer-1 mean gap pushed forward through the mean-field Jacobian.
 
         ``E[relu(z^1_i)] = ||W^1[:,i]|| / sqrt(2 pi)`` exactly, so
@@ -292,17 +294,80 @@ class Estimator(BaseEstimator):
         it measures better with a unit coefficient (1.43x against 1.25x), and
         it is biased by the mean-field approximation, which is why both are
         offered to the head rather than one being chosen.
+
+        ``gates`` is the whole ``(depth, width)`` block of ``Phi(alpha)``, from
+        ONE ``norm.cdf`` call in the caller rather than 30 here: an elementwise
+        transcendental is bitwise identical batched or not, and a row view of a
+        flopscope array costs nothing.  60 dispatches removed.
         """
         depth = len(weights)
-        w1 = weights[0]
-        sig1 = fnp.sqrt(fnp.maximum(fnp.sum(w1 * w1, axis=0), VAR_FLOOR))
         prop = h1m - sig1 * INV_SQRT_2PI
         for l in range(1, depth):
             prop = prop @ weights[l]
             if l < depth - 1:
-                g = flops.stats.norm.cdf(alpha[l])
-                prop = prop * g.astype(prop.dtype)
+                prop = prop * gates[l]
         return prop * Ph
+
+    # ------------------------------------------------------------------
+    def _pilot(self, weights, rng, n_pilot, n):
+        """Short dense pass -> ``(alpha, mean_h)``, both ``(depth, width)``.
+
+        One pass does three jobs: ``alpha`` for the threshold, the frozen
+        constants for the pruned neurons, and the unscored filler rows.
+
+        COST.  The per-layer scalar algebra -- centring, the variance floor,
+        the square root, the division -- runs ONCE on the stacked
+        ``(depth, width)`` array rather than 32 times on rows of it.
+        Elementwise ops are bitwise identical either way, and *integer
+        indexing of a flopscope array is free* (measured: 0 dispatches,
+        0 FLOPs), so the per-layer rows come back for nothing.  160 dispatches
+        removed at ~22 us of billed residual each.
+        """
+        x = rng.standard_normal((n_pilot, n), dtype=fnp.float32)
+        ms, e2s, mhs = [], [], []
+        for w in weights:
+            z = x @ w
+            ms.append(fnp.mean(z, axis=0))
+            e2s.append(fnp.mean(z * z, axis=0))
+            x = fnp.maximum(z, 0.0)
+            mhs.append(fnp.mean(x, axis=0))
+        m = fnp.stack(ms, axis=0)
+        v = fnp.maximum(fnp.stack(e2s, axis=0) - m * m, VAR_FLOOR)
+        return m / fnp.sqrt(v), fnp.stack(mhs, axis=0)
+
+    # ------------------------------------------------------------------
+    def _plan(self, weights, alpha, mean_h, tau):
+        """Masks, pre-sliced weights and frozen biases; billed once.
+
+        The last layer keeps all n output columns.  Pruning them would save
+        ~1% of the pass and would force a scatter back into n slots, whose
+        only failure mode (an all-dead layer) is the one thing that must never
+        raise.
+
+        COST, two changes, both exactly answer-preserving.  (1) The COLUMNS
+        are sliced first: ``w[:, keep]`` is both the matrix the next layer's
+        rows come from and the matrix the frozen bias contracts against, so one
+        ``(width, |keep|)`` selection serves both and the full-width row
+        selection ``w[keep_prev, :]`` -- 33k elements a layer -- never happens.
+        Selection commutes, so the result is bitwise identical.  (2)
+        ``fnp.where`` replaces ``mean_h * (1 - keep.astype(f32))``: one
+        dispatch instead of three, identical output because the multiplier is
+        exactly 0 or exactly 1.
+        """
+        depth = len(weights)
+        keeps = None if tau is None else (alpha > -tau)
+        subs, biases = [], []
+        keep_prev = None
+        for l, w in enumerate(weights):
+            keep = None if (keeps is None or l == depth - 1) else keeps[l]
+            wc = w if keep is None else w[:, keep]
+            subs.append(wc if keep_prev is None else wc[keep_prev, :])
+            if keep_prev is None:
+                biases.append(None)
+            else:
+                biases.append(fnp.where(keep_prev, 0.0, mean_h[l - 1]) @ wc)
+            keep_prev = keep
+        return subs, biases
 
     # ------------------------------------------------------------------
     def _sparse(self, mlp, tau, n_samples, n_pilot, seed):
@@ -310,36 +375,8 @@ class Estimator(BaseEstimator):
         depth = len(mlp.weights)
         rng = fnp.random.default_rng(seed)
 
-        # ---- pilot: a short dense pass -------------------------------
-        x = rng.standard_normal((n_pilot, n), dtype=fnp.float32)
-        alpha, mean_h = [], []
-        for w in mlp.weights:
-            z = x @ w
-            m = fnp.mean(z, axis=0)
-            v = fnp.maximum(fnp.mean(z * z, axis=0) - m * m, VAR_FLOOR)
-            alpha.append(m / fnp.sqrt(v))
-            x = fnp.maximum(z, 0.0)
-            mean_h.append(fnp.mean(x, axis=0))
-
-        # ---- masks and pre-sliced weights: billed once, not per sample
-        # The last layer keeps all n output columns.  Pruning them would save
-        # ~1% of the pass and would force a scatter back into n slots, whose
-        # only failure mode (an all-dead layer) is the one thing that must
-        # never raise.
-        subs, biases = [], []
-        keep_prev = None
-        for l, w in enumerate(mlp.weights):
-            keep = (None if (tau is None or l == depth - 1)
-                    else alpha[l] > -tau)
-            wr = w if keep_prev is None else w[keep_prev, :]
-            subs.append(wr if keep is None else wr[:, keep])
-            if keep_prev is None:
-                biases.append(None)
-            else:
-                dead = mean_h[l - 1] * (1.0 - keep_prev.astype(fnp.float32))
-                wd = w if keep is None else w[:, keep]
-                biases.append(dead @ wd)
-            keep_prev = keep
+        alpha, mean_h = self._pilot(mlp.weights, rng, n_pilot, n)
+        subs, biases = self._plan(mlp.weights, alpha, mean_h, tau)
 
         # ---- scored pass ---------------------------------------------
         x0 = rng.standard_normal((n_samples, n), dtype=fnp.float32)
@@ -361,7 +398,7 @@ class Estimator(BaseEstimator):
         # they are not blended with the scored pass, which would correlate the
         # estimate with the mask that was derived from the same samples.
         if self._beta is None or DAMP == 0.0:
-            return fnp.stack(mean_h[:-1] + [mu], axis=0)
+            return fnp.concatenate([mean_h[:-1], mu[None, :]], axis=0)
 
         # ---- features and the offline head ---------------------------
         # FIFTEEN columns.  Thirteen more were fitted, measured at exactly
@@ -371,7 +408,9 @@ class Estimator(BaseEstimator):
         # cancellation costs 1e-6 relative on ``v``, six orders under the
         # ~1.7e-3 residual the head predicts, and the pilot above already uses
         # exactly this form.
-        cvs = self._hermite_cv(x0, z1, x, mlp.weights[0], CV_KMAX)
+        w1 = mlp.weights[0]
+        sig1 = fnp.sqrt(fnp.maximum(fnp.sum(w1 * w1, axis=0), VAR_FLOOR))
+        cvs = self._hermite_cv(x0, z1, x, w1, sig1, CV_KMAX)
         m = fnp.mean(z, axis=0)
         v = fnp.maximum(fnp.mean(z * z, axis=0) - m * m, VAR_FLOOR)
         s = fnp.sqrt(v)
@@ -382,8 +421,9 @@ class Estimator(BaseEstimator):
         ph = flops.stats.norm.pdf(a).astype(a.dtype)
         one = fnp.ones_like(a)
         cv1, cv2 = cvs[0], cvs[1]
-        mf = self._meanfield_cv(fnp.mean(h1, axis=0), mlp.weights,
-                                alpha, Ph)
+        gates = flops.stats.norm.cdf(alpha).astype(alpha.dtype)
+        mf = self._meanfield_cv(fnp.mean(h1, axis=0), sig1, mlp.weights,
+                                gates, Ph)
         cols = [
             one,
             cv1, cv1 * Ph, cv1 * a,
@@ -395,4 +435,4 @@ class Estimator(BaseEstimator):
         corr = fnp.stack(cols, axis=1) @ self._beta
         if DAMP != 1.0:
             corr = corr * DAMP
-        return fnp.stack(mean_h[:-1] + [mu + corr], axis=0)
+        return fnp.concatenate([mean_h[:-1], (mu + corr)[None, :]], axis=0)

@@ -713,46 +713,77 @@ def _dense_rows(weights, n_samples, seed):
     return fnp.stack(rows, axis=0)
 
 
+def _pilot_stats(weights, rng, n_pilot, n):
+    """Short dense pass -> ``(alpha, mean_h)``, both ``(depth, width)``.
+
+    It supplies alpha (which the threshold needs), the frozen constants for
+    the dead neurons, and the depth-1 filler rows -- all from one pass, so the
+    only thing priced here is the pass itself.  The caller's generator is
+    advanced in place, so the scored draw that follows is independent of the
+    pilot while every stream still descends from the single seed.
+
+    COST NOTE.  The per-layer scalar algebra -- centring, the variance floor,
+    the square root, the division -- is done ONCE on the stacked
+    ``(depth, width)`` array instead of 32 times on rows of it.  Elementwise
+    ops are bitwise identical either way, and *integer indexing of a flopscope
+    array is free* (measured: 0 dispatches, 0 FLOPs), so the per-layer rows
+    come back for nothing.  That removes 160 dispatches at ~22 us of billed
+    residual each -- 0.0013 of the budget, for an identical answer.
+    """
+    x = rng.standard_normal((n_pilot, n), dtype=fnp.float32)
+    ms, e2s, mhs = [], [], []
+    for w in weights:
+        z = x @ w
+        ms.append(fnp.mean(z, axis=0))
+        e2s.append(fnp.mean(z * z, axis=0))
+        x = fnp.maximum(z, 0.0)
+        mhs.append(fnp.mean(x, axis=0))
+    m = fnp.stack(ms, axis=0)
+    v = fnp.maximum(fnp.stack(e2s, axis=0) - m * m, 1e-12)
+    return m / fnp.sqrt(v), fnp.stack(mhs, axis=0)
+
+
+def _sparse_plan(weights, alpha, mean_h, tau):
+    """Masks, pre-sliced weights and frozen biases: billed once, not per sample.
+
+    The last layer keeps all n output columns.  Pruning them would save ~1% of
+    the pass and would force a scatter back into 256 slots, whose only failure
+    mode (an all-dead layer) is the one thing that must never raise.  The kept
+    columns also remove the frozen constants from the scored row entirely.
+
+    COST NOTE, two of them, both exactly answer-preserving.  (1) The COLUMNS
+    are sliced first: ``w[:, keep]`` is both the matrix the next layer's rows
+    are taken from and the matrix the frozen bias contracts against, so one
+    ``(width, |keep|)`` selection serves both and the full-width row selection
+    ``w[keep_prev, :]`` -- 33k elements a layer -- never happens.  Selection
+    commutes, so ``w[:, keep][keep_prev, :] == w[keep_prev, :][:, keep]`` bit
+    for bit.  (2) ``fnp.where`` replaces ``mean_h * (1 - keep.astype(f32))``:
+    one dispatch instead of three, and identical output because the multiplier
+    is exactly 0 or exactly 1.
+    """
+    depth = len(weights)
+    keeps = None if tau is None else (alpha > -tau)
+    subs, biases = [], []
+    keep_prev = None
+    for l, w in enumerate(weights):
+        keep = None if (keeps is None or l == depth - 1) else keeps[l]
+        wc = w if keep is None else w[:, keep]
+        subs.append(wc if keep_prev is None else wc[keep_prev, :])
+        if keep_prev is None:
+            biases.append(None)
+        else:
+            biases.append(fnp.where(keep_prev, 0.0, mean_h[l - 1]) @ wc)
+        keep_prev = keep
+    return subs, biases
+
+
 def _sparse_mc(weights, tau, n_samples, n_pilot, seed):
     n = weights[0].shape[0]
     depth = len(weights)
     rng = fnp.random.default_rng(seed)
 
-    # ---- pilot: a short dense pass ------------------------------------
-    # It supplies alpha (which the threshold needs), the frozen constants for
-    # the dead neurons, and the depth-1 filler rows -- all from one pass, so
-    # the only thing priced here is the pass itself.  The main draw continues
-    # the SAME generator, so the scored samples are independent of the pilot
-    # and every stream descends from the single `seed` argument.
-    x = rng.standard_normal((n_pilot, n), dtype=fnp.float32)
-    alpha, mean_h = [], []
-    for w in weights:
-        z = x @ w
-        m = fnp.mean(z, axis=0)
-        v = fnp.maximum(fnp.mean(z * z, axis=0) - m * m, 1e-12)
-        alpha.append(m / fnp.sqrt(v))
-        x = fnp.maximum(z, 0.0)
-        mean_h.append(fnp.mean(x, axis=0))
-
-    # ---- masks and pre-sliced weights: billed once, not per sample -----
-    # The last layer keeps all n output columns.  Pruning them would save
-    # ~1% of the pass and would force a scatter back into 256 slots, whose
-    # only failure mode (an all-dead layer) is the one thing that must never
-    # raise.  The kept columns also remove the frozen constants from the
-    # scored row entirely.
-    subs, biases = [], []
-    keep_prev = None
-    for l, w in enumerate(weights):
-        keep = None if (tau is None or l == depth - 1) else (alpha[l] > -tau)
-        wr = w if keep_prev is None else w[keep_prev, :]
-        subs.append(wr if keep is None else wr[:, keep])
-        if keep_prev is None:
-            biases.append(None)
-        else:
-            dead_mu = mean_h[l - 1] * (1.0 - keep_prev.astype(fnp.float32))
-            wd = w if keep is None else w[:, keep]
-            biases.append(dead_mu @ wd)
-        keep_prev = keep
+    alpha, mean_h = _pilot_stats(weights, rng, n_pilot, n)
+    subs, biases = _sparse_plan(weights, alpha, mean_h, tau)
 
     # ---- scored pass ---------------------------------------------------
     x = rng.standard_normal((n_samples, n), dtype=fnp.float32)
@@ -761,7 +792,10 @@ def _sparse_mc(weights, tau, n_samples, n_pilot, seed):
         if biases[l] is not None:
             z = z + biases[l]
         x = fnp.maximum(z, 0.0)
-    return fnp.stack(mean_h[:-1] + [fnp.mean(x, axis=0)], axis=0)
+    # Only the last row is scored; rows 0..depth-2 come free from the pilot
+    # and are already stacked, so one concatenate replaces a 32-way stack.
+    return fnp.concatenate([mean_h[:-1], fnp.mean(x, axis=0)[None, :]],
+                           axis=0)
 
 
 def sparse_mc_kernel(weights, ctx=None, tau: float | None = 2.5,
@@ -920,29 +954,8 @@ def _sparse_mc_rqmc(weights, tau, n_samples, n_pilot, seed, base, order):
     depth = len(weights)
     rng = fnp.random.default_rng(seed)
 
-    x = rng.standard_normal((n_pilot, n), dtype=fnp.float32)
-    alpha, mean_h = [], []
-    for w in weights:
-        z = x @ w
-        m = fnp.mean(z, axis=0)
-        v = fnp.maximum(fnp.mean(z * z, axis=0) - m * m, 1e-12)
-        alpha.append(m / fnp.sqrt(v))
-        x = fnp.maximum(z, 0.0)
-        mean_h.append(fnp.mean(x, axis=0))
-
-    subs, biases = [], []
-    keep_prev = None
-    for l, w in enumerate(weights):
-        keep = None if (tau is None or l == depth - 1) else (alpha[l] > -tau)
-        wr = w if keep_prev is None else w[keep_prev, :]
-        subs.append(wr if keep is None else wr[:, keep])
-        if keep_prev is None:
-            biases.append(None)
-        else:
-            dead_mu = mean_h[l - 1] * (1.0 - keep_prev.astype(fnp.float32))
-            wd = w if keep is None else w[:, keep]
-            biases.append(dead_mu @ wd)
-        keep_prev = keep
+    alpha, mean_h = _pilot_stats(weights, rng, n_pilot, n)
+    subs, biases = _sparse_plan(weights, alpha, mean_h, tau)
 
     if base is None:
         x = rng.standard_normal((n_samples, n), dtype=fnp.float32)
@@ -973,7 +986,8 @@ def _sparse_mc_rqmc(weights, tau, n_samples, n_pilot, seed, base, order):
         if biases[l] is not None:
             z = z + biases[l]
         x = fnp.maximum(z, 0.0)
-    return fnp.stack(mean_h[:-1] + [fnp.mean(x, axis=0)], axis=0)
+    return fnp.concatenate([mean_h[:-1], fnp.mean(x, axis=0)[None, :]],
+                           axis=0)
 
 
 _LATTICE_CACHE: dict = {}
@@ -1204,17 +1218,19 @@ CV_GRAM_JITTER = 1e-6
 INV_SQRT_2PI = 0.3989422804014327
 
 
-def _hermite_cv(x, z1, y, w1, kmax: int = 2):
+def _hermite_cv(x, z1, y, w1, sig1, kmax: int = 2):
     """Layer-1 Hermite control-variate corrections; see the module note.
 
     Two length-N matvecs per order plus one (width x width) solve.  The k=2
     basis is kept as ``z1^2`` rather than ``He_2(z1/sigma)``: the per-column
     scale folds into ``d`` and ``u``, and the constant folds into the centring,
     so one pass over the (N, width) array is saved.
+
+    ``sig1 = ||W^1[:, i]||`` is passed in rather than recomputed: the
+    mean-field arm needs the same four dispatches.
     """
     n = x.shape[0]
     h = n // 2
-    sig1 = fnp.sqrt(fnp.maximum(fnp.sum(w1 * w1, axis=0), 1e-12))
     inv1 = (1.0 / sig1).astype(z1.dtype)
 
     bases = [(x, None, None, 0.0)]
@@ -1248,7 +1264,7 @@ def _hermite_cv(x, z1, y, w1, kmax: int = 2):
     return out
 
 
-def _meanfield_cv(h1m, w1, weights, alpha, Ph):
+def _meanfield_cv(h1m, sig1, weights, gates, Ph):
     """Layer-1 mean gap pushed forward through the mean-field linearisation.
 
     ``E[relu(z^1_i)] = ||W^1[:,i]|| / sqrt(2 pi)`` exactly, so
@@ -1263,15 +1279,18 @@ def _meanfield_cv(h1m, w1, weights, alpha, Ph):
     is why it measures BETTER (1.43x against 1.25x with unit coefficients),
     and it is biased by the mean-field approximation, which is why the two are
     both offered to the head rather than one being chosen.
+
+    ``gates`` is the whole ``(depth, width)`` block of ``Phi(alpha)``, computed
+    in ONE ``norm.cdf`` call by the caller instead of 30: elementwise
+    transcendentals are bitwise identical batched or not, and the row views
+    cost nothing.  60 dispatches removed.
     """
     depth = len(weights)
-    sig1 = fnp.sqrt(fnp.maximum(fnp.sum(w1 * w1, axis=0), 1e-12))
     prop = h1m - sig1 * INV_SQRT_2PI
     for l in range(1, depth):
         prop = prop @ weights[l]
         if l < depth - 1:
-            g = flops.stats.norm.cdf(alpha[l])
-            prop = prop * g.astype(prop.dtype)
+            prop = prop * gates[l]
     return prop * Ph
 
 
@@ -1303,30 +1322,9 @@ def _corrected_sparse(weights, tau, n_samples, n_pilot, seed, beta, damp,
     depth = len(weights)
     rng = fnp.random.default_rng(seed)
 
-    # ---- pilot: identical to _sparse_mc ---------------------------------
-    x = rng.standard_normal((n_pilot, n), dtype=fnp.float32)
-    alpha, mean_h = [], []
-    for w in weights:
-        z = x @ w
-        m = fnp.mean(z, axis=0)
-        v = fnp.maximum(fnp.mean(z * z, axis=0) - m * m, 1e-12)
-        alpha.append(m / fnp.sqrt(v))
-        x = fnp.maximum(z, 0.0)
-        mean_h.append(fnp.mean(x, axis=0))
-
-    subs, biases = [], []
-    keep_prev = None
-    for l, w in enumerate(weights):
-        keep = None if (tau is None or l == depth - 1) else (alpha[l] > -tau)
-        wr = w if keep_prev is None else w[keep_prev, :]
-        subs.append(wr if keep is None else wr[:, keep])
-        if keep_prev is None:
-            biases.append(None)
-        else:
-            dead_mu = mean_h[l - 1] * (1.0 - keep_prev.astype(fnp.float32))
-            wd = w if keep is None else w[:, keep]
-            biases.append(dead_mu @ wd)
-        keep_prev = keep
+    # ---- pilot and plan: identical to _sparse_mc ------------------------
+    alpha, mean_h = _pilot_stats(weights, rng, n_pilot, n)
+    subs, biases = _sparse_plan(weights, alpha, mean_h, tau)
 
     # ---- scored pass ----------------------------------------------------
     x0 = rng.standard_normal((n_samples, n), dtype=fnp.float32)
@@ -1346,9 +1344,11 @@ def _corrected_sparse(weights, tau, n_samples, n_pilot, seed, beta, damp,
     mu = fnp.mean(x, axis=0)
     if beta is None or damp == 0.0:
         # exact ablation: identical stream, identical mu, no feature block
-        return fnp.stack(mean_h[:-1] + [mu], axis=0)
+        return fnp.concatenate([mean_h[:-1], mu[None, :]], axis=0)
 
-    cvs = _hermite_cv(x0, z1, x, weights[0], kmax=kmax)
+    w1 = weights[0]
+    sig1 = fnp.sqrt(fnp.maximum(fnp.sum(w1 * w1, axis=0), 1e-12))
+    cvs = _hermite_cv(x0, z1, x, w1, sig1, kmax=kmax)
 
     # ``v`` from the raw second moment rather than from a centred copy of the
     # (N, width) array: one pass fewer, and the pilot already uses this form.
@@ -1359,17 +1359,18 @@ def _corrected_sparse(weights, tau, n_samples, n_pilot, seed, beta, damp,
     s = fnp.sqrt(v)
     a = m / s
     Ph, ph = _norm01(a)
+    gates = flops.stats.norm.cdf(alpha).astype(alpha.dtype)
     prim = {
         "mu": mu, "cv1": cvs[0], "cv2": cvs[1],
-        "cv1mf": _meanfield_cv(fnp.mean(h1, axis=0), weights[0],
-                               weights, alpha, Ph),
+        "cv1mf": _meanfield_cv(fnp.mean(h1, axis=0), sig1,
+                               weights, gates, Ph),
         "alpha": a, "Phi": Ph, "phi": ph, "s": s,
         "dpilot": mu - mean_h[-1],
     }
     corr = corrector_design(prim) @ beta
     if damp != 1.0:
         corr = corr * damp
-    return fnp.stack(mean_h[:-1] + [mu + corr], axis=0)
+    return fnp.concatenate([mean_h[:-1], (mu + corr)[None, :]], axis=0)
 
 
 def corrected_sparse_kernel(weights, ctx=None, tau: float | None = 2.5,
