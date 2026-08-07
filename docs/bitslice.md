@@ -71,6 +71,14 @@ not 6**. Two smaller traps on the way: the default `sum` accumulator is uint64,
 billed at rate 2.0, and declaring `dtype=int32` is worth 1.30x on its own;
 `fnp.view` does not exist, so uint8 → uint32 has to be gathered by hand.
 
+**The whole pipeline runs in the reduced sandbox.** `--mode sandbox` spawns a
+fresh interpreter with the repo off `sys.path` and runs quantise → pack →
+AND/popcount/reduce using *nothing but* `flopscope.numpy` — no `np.`, no
+`.base` (which `RemoteArray` does not have), no `.view` (which `fnp` does not
+have). Every primitive is present, and the packed result matches a float32
+matmul of the same codes to **0.0**, checked inside flopscope so even the
+assertion needs no host numpy.
+
 ## 2. The kernel, and its price
 
 `whestfloor/bitslice.py::bitsliced_sparse_kernel` is a complete billed forward

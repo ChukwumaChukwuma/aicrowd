@@ -526,11 +526,121 @@ def mode_bias(seeds, n, n_stat, reps, cfgs) -> None:
 
 
 # ---------------------------------------------------------------------------
+_SANDBOX_PROBE = '''# Fresh-interpreter probe: the packed pipeline with the repo off sys.path
+import sys, json
+sys.dont_write_bytecode = True
+import importlib.util
+assert importlib.util.find_spec("whestfloor") is None, "repo still importable"
+import flopscope as flops
+import flopscope.numpy as fnp
+out = {}
+out["numpy_importable_by_us"] = importlib.util.find_spec("numpy") is not None
+missing = [n for n in ("packbits","bitwise_and","bitwise_count","bitwise_or",
+                       "left_shift","astype","sum","uint32","uint8","int32",
+                       "minimum","maximum","floor","random")
+           if not hasattr(fnp, n)]
+out["missing"] = missing
+with flops.BudgetContext(flop_budget=10**11, quiet=True) as ctx:
+    g = fnp.random.default_rng(0)
+    K, M, N, ba, bw = 64, 8, 6, 3, 4
+    h = g.standard_normal((N, K), dtype=fnp.float32)
+    lv = float(2 ** ba - 1)
+    q = fnp.minimum(fnp.maximum(fnp.floor((h + 2.0) * (lv / 4.0)
+                    + g.random((N, K), dtype=fnp.float32)), 0.0), lv)
+    qi = q.astype(fnp.uint8)
+    wq = (g.random((K, M), dtype=fnp.float32) * (2 ** bw - 1)).astype(fnp.uint8)
+
+    def pack_rows(x, nb):
+        r = []
+        for p in range(nb):
+            p8 = fnp.packbits(fnp.bitwise_and(x, 1 << p), axis=1)
+            a = p8[:, 0::4].astype(fnp.uint32)
+            for j in (1, 2, 3):
+                a = fnp.bitwise_or(a, fnp.left_shift(
+                    p8[:, j::4].astype(fnp.uint32), 8 * j))
+            r.append(a)
+        return r
+
+    def pack_cols(x, nb):
+        r = []
+        for p in range(nb):
+            p8 = fnp.packbits(fnp.bitwise_and(x, 1 << p), axis=0)
+            a = p8[0::4, :].astype(fnp.uint32)
+            for j in (1, 2, 3):
+                a = fnp.bitwise_or(a, fnp.left_shift(
+                    p8[j::4, :].astype(fnp.uint32), 8 * j))
+            r.append(a)
+        return r
+
+    A, W = pack_rows(qi, ba), pack_cols(wq, bw)
+    acc = None
+    for p, a in enumerate(A):
+        for qq, wv in enumerate(W):
+            s = fnp.sum(fnp.bitwise_count(fnp.bitwise_and(a[:, :, None],
+                                                          wv[None, :, :])),
+                        axis=1, dtype=fnp.int32)
+            s = s if p + qq == 0 else fnp.left_shift(s, p + qq)
+            acc = s if acc is None else acc + s
+    out["packed_shape"] = list(acc.shape)
+    out["packed_dtype"] = str(acc.dtype)
+    out["flops"] = int(ctx.flops_used)
+    # exactness check WITHOUT numpy: reconstruct the integer product from the
+    # flopscope arrays themselves via a float32 matmul, then compare.
+    ref = qi.astype(fnp.float32) @ wq.astype(fnp.float32)
+    d = fnp.max(fnp.abs(acc.astype(fnp.float32) - ref))
+    out["max_abs_diff_vs_float_matmul"] = float(d)
+print("@@" + json.dumps(out))
+'''
+
+
+def mode_sandbox() -> None:
+    """Run the packed pipeline in a FRESH interpreter with the repo off sys.path.
+
+    The grader supplies flopscope, whestbench and a reduced stdlib -- no numpy
+    -- and on the eval servers ``fnp.ndarray`` is a ``RemoteArray`` with no
+    ``.base``.  This probe therefore uses NOTHING but ``flopscope.numpy``: no
+    ``np.`` anywhere, no ``.base``, no ``.view`` (which does not exist in
+    ``fnp`` at all, hence the hand-rolled uint8 -> uint32 gather).  It also
+    checks the packed product against a float32 matmul of the same codes
+    *inside* flopscope, so the exactness assertion needs no host-side numpy
+    either.
+    """
+    import subprocess  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "probe.py"
+        f.write_text(_SANDBOX_PROBE)
+        env = dict(os.environ)
+        # keep flopscope (and the opt_einsum it imports) reachable, drop the
+        # repo -- matched on the resolved repo root, not on a substring, since
+        # the scratch prefix can itself contain the repo's name
+        root = str(Path(__file__).resolve().parent.parent)
+        keep = [p for p in env.get("PYTHONPATH", "").split(os.pathsep)
+                if p and str(Path(p).resolve()) != root]
+        env["PYTHONPATH"] = os.pathsep.join(keep)
+        r = subprocess.run([sys.executable, str(f)], capture_output=True,
+                           text=True, cwd=td, env=env, timeout=300)
+    line = next((l for l in r.stdout.splitlines() if l.startswith("@@")), None)
+    if line is None:
+        print("SANDBOX PROBE FAILED\n", r.stdout, r.stderr)
+        raise SystemExit(1)
+    out = json.loads(line[2:])
+    print("# fresh interpreter, repo off sys.path, flopscope.numpy only\n")
+    for k, v in out.items():
+        print(f"  {k:<32} {v}")
+    ok = (not out["missing"]) and out["max_abs_diff_vs_float_matmul"] == 0.0
+    print(f"\n  {'PASS' if ok else 'FAIL'}: every packed primitive is present "
+          f"and the packed product is exact in a repo-free interpreter.")
+    (artifacts() / "sandbox.json").write_text(json.dumps(out, indent=1))
+
+
+# ---------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", required=True,
-                    choices=("probe", "ranges", "sweep", "bias", "layers",
-                             "price", "score"))
+                    choices=("probe", "sandbox", "ranges", "sweep", "bias",
+                             "layers", "price", "score"))
     ap.add_argument("--seeds", default="700000,700001,700002")
     ap.add_argument("--n", type=int, default=4096)
     ap.add_argument("--n-stat", type=int, default=32768)
@@ -547,6 +657,8 @@ def main() -> int:
     t0 = time.time()
     if a.mode == "probe":
         mode_probe()
+    elif a.mode == "sandbox":
+        mode_sandbox()
     elif a.mode == "ranges":
         mode_ranges(seeds, a.n_stat, a.tau)
     elif a.mode == "layers":
