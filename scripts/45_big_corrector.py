@@ -1,0 +1,782 @@
+#!/usr/bin/env python
+"""Scale the offline-trained corrector: generate, study, fit, curve, cost.
+
+The shipped head is 15 floats fitted on 640 MLPs generated at ``(tau, N, P) =
+(2.5, 8500, 150)`` and deployed at ``(2.5, 25000, 225)``.  This script rebuilds
+that pipeline at the deployed operating point, with a superset feature block,
+seed replication, and heads whose parameter count can be swept.
+
+Modes, in the order the decision is taken.
+
+``--mode refcal``
+    Calibrate the REFERENCE, before any training data exists.  Ground truth is
+    the binding compute constraint of the whole programme, so its cost/accuracy
+    curve is measured first: rms error of :func:`bigcorr.reference` at several
+    ``n_gt``, with and without the exactly-mean-zero k=1 control variate,
+    against a 1e6-sample reference on the same networks.
+
+``--mode data``
+    Generate training data at the SHIPPED operating point.  Fresh local MLP
+    seeds (``--mlp-seed-base``, default 400000), disjoint from the 100000-block
+    used by ``scripts/28``, from every suite, and from the official seeds.  Each
+    MLP gets ONE reference (two independent halves) and ``--n-seeds``
+    independent estimator seeds, because the reference costs about as much as
+    four scored passes and depends only on the weights.  Blocks are written
+    every ``--block`` MLPs so a fit can run against partial output and
+    generation can be stopped at any time.
+
+``--mode fit``
+    Everything selective, on a train/validation split BY MLP SEED.  A third
+    split is held back and read once.  Reports, in order: the shipped 15-float
+    head evaluated as-is at the deployed operating point; the same design
+    refitted here; the rich design; leave-one-group-out and only-one-group; and
+    the random-feature head.
+
+``--mode curve``
+    The learning curve: held-out gain against the number of training MLPs and
+    against the parameter count, which is the deliverable if this bottoms out.
+
+``--mode cost``
+    Bill the new feature channels in a real ``flopscope.BudgetContext`` and
+    time ``fnp.load`` of a full-size weight file against the 5 s setup window.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from whestfloor import bigcorr as BC  # noqa: E402
+from whestfloor import corrector as C  # noqa: E402
+from whestfloor.contract import DEPTH, WIDTH  # noqa: E402
+from whestfloor.mc import make_mlp  # noqa: E402
+
+#: Operating point of the shipped estimator.  Everything is generated here.
+SHIP_TAU, SHIP_N, SHIP_P = 2.5, 25_000, 225
+
+#: Correction channels: columns whose scale is the Monte-Carlo error itself.
+CH: tuple[str, ...] = (
+    "cv1", "cv2", "cv3", "cv1mf", "cv1mfg",
+    "mfm", "mfv", "mfv2", "mfmg", "mfvg", "mfv2g",
+    "relu1", "q2", "dpilot",
+)
+#: Shape channels: per-neuron state, O(1), used to modulate the corrections.
+SH: tuple[str, ...] = (
+    "one", "s", "Phi", "phi", "alpha", "sd_mc", "gam1", "gam2", "alpha_p",
+    "wn1", "w43", "vbar", "arms", "keep_frac", "u1", "u2", "lam1", "lam2",
+)
+
+#: POOLED modulators.  A per-neuron head is pointwise and cannot represent
+#: ``u1_j <u1, c>`` -- a rank-one interaction across neurons -- however many
+#: parameters it has.  ``Cov(h^32)/N`` IS the covariance of the residual being
+#: predicted, so its top eigendirection is where that residual lives; giving
+#: the head the projection of each correction channel onto it, scattered back
+#: through the same eigenvector, is the cheapest possible non-pointwise term
+#: and it stays exactly permutation-equivariant.
+POOL: tuple[str, ...] = ("u1", "u2")
+#: Modulators the linear design crosses every correction channel with.
+MOD: tuple[str, ...] = ("one", "Phi", "alpha")
+
+#: Feature groups, for leave-one-group-out.
+GROUPS: dict[str, tuple[str, ...]] = {
+    "cv1": ("cv1",),
+    "cv2": ("cv2",),
+    "cv3": ("cv3",),
+    "mf_pilot": ("cv1mf", "mfm"),
+    "mf_gated": ("cv1mfg", "mfmg"),
+    "mf_var_diag": ("mfv", "mfvg"),
+    "mf_var_exact": ("mfv2", "mfv2g"),
+    "relu1": ("relu1",),
+    "q2": ("q2",),
+    "dpilot": ("dpilot",),
+    "pooled_u1u2": tuple(f"<{u},{k}>" for u in ("u1", "u2") for k in ()),
+}
+
+
+def artifacts() -> Path:
+    return Path(os.environ.get("WHEST_ARTIFACTS", "_artifacts")).resolve()
+
+
+#: Sub-directory of the artifact tree the current invocation reads and writes.
+#: Runs with different channel sets live in different directories, because a
+#: column that is real in one block and structurally zero in another is the one
+#: way a pooled fit can silently learn nonsense.
+SUBDIR = "bigcorr"
+
+
+def data_dir() -> Path:
+    p = artifacts() / SUBDIR
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# mode: refcal
+# ---------------------------------------------------------------------------
+def mode_refcal(n_mlps: int, n_big: int, reps: int) -> None:
+    grid = (16384, 32768, 65536)
+    res: dict = {}
+    t0 = time.time()
+    for mi in range(n_mlps):
+        W = make_mlp(WIDTH, DEPTH, 990_000 + mi)
+        big = 0.5 * (BC.reference(W, n_big // 2, 900 + mi, chunk=8192)
+                     + BC.reference(W, n_big // 2, 950 + mi, chunk=8192))
+        for n in grid:
+            for cv in (False, True):
+                e = [np.sqrt(np.mean((BC.reference(
+                    W, n, 7000 + mi * 100 + r * 13, chunk=8192, use_cv=cv)
+                    - big) ** 2)) for r in range(reps)]
+                res.setdefault((n, cv), []).append(float(np.mean(e)))
+        print(f"  mlp {mi + 1}/{n_mlps}  {time.time() - t0:.0f}s", flush=True)
+    print(f"\n# reference calibration: {n_mlps} MLPs x {reps} reps, "
+          f"{n_big:,}-sample yardstick")
+    print(f"{'n_gt':>8} {'rms no CV':>11} {'rms + k=1 CV':>13} "
+          f"{'var ratio':>10} {'eff. n_gt':>11}")
+    for n in grid:
+        a = float(np.mean(res[(n, False)]))
+        b = float(np.mean(res[(n, True)]))
+        print(f"{n:8d} {a:11.4e} {b:13.4e} {(a / b) ** 2:10.3f} "
+              f"{n * (a / b) ** 2:11.0f}")
+    (data_dir() / "refcal.json").write_text(json.dumps(
+        {f"{n}_{int(cv)}": v for (n, cv), v in res.items()}, indent=1))
+
+
+# ---------------------------------------------------------------------------
+# mode: data
+# ---------------------------------------------------------------------------
+def mode_data(n_mlps: int, seed_base: int, n_gt: int, n_seeds: int,
+              shard: int, n_shards: int, block: int, n_samples: int,
+              n_pilot: int, tau: float, want_q2: bool, want_relu1: bool,
+              gt_seed_base: int = 7_000_000) -> None:
+    idx = list(range(shard, n_mlps, n_shards))
+    acc: dict = {k: [] for k in BC.PER_SEED + BC.PER_MLP}
+    acc.update({k: [] for k in BC.PER_SEED_SCALAR})
+    ga, gb, mseeds, eseeds = [], [], [], []
+    nblk = 0
+    t0 = time.time()
+
+    def flush():
+        nonlocal acc, ga, gb, mseeds, eseeds, nblk
+        if not mseeds:
+            return
+        out = data_dir() / f"blk_s{shard}_{nblk:04d}.npz"
+        np.savez(out,
+                 mlp_seeds=np.asarray(mseeds, dtype=np.int64),
+                 est_seeds=np.asarray(eseeds, dtype=np.int64),
+                 gt_a=np.asarray(ga, dtype=np.float64),
+                 gt_b=np.asarray(gb, dtype=np.float64),
+                 n_gt=n_gt, n_samples=n_samples, n_pilot=n_pilot, tau=tau,
+                 **{k: np.asarray(v, dtype=(np.float64 if k == "mu"
+                                            else np.float32))
+                    for k, v in acc.items()})
+        print(f"  wrote {out.name}  ({len(mseeds)} rows, "
+              f"{time.time() - t0:.0f}s)", flush=True)
+        nblk += 1
+        acc = {k: [] for k in acc}
+        ga, gb, mseeds, eseeds = [], [], [], []
+
+    for c, i in enumerate(idx):
+        ms = seed_base + i
+        W = make_mlp(WIDTH, DEPTH, ms)
+        a = BC.reference(W, n_gt, gt_seed_base + 2 * i, chunk=8192)
+        b = BC.reference(W, n_gt, gt_seed_base + 2 * i + 1, chunk=8192)
+        for k in range(n_seeds):
+            es = 1_000_000 + 977 * i + k
+            f = BC.extract(W, es, tau=tau, n_samples=n_samples,
+                           n_pilot=n_pilot, kmax=3, want_relu1=want_relu1,
+                           want_q2=want_q2)
+            for key in acc:
+                acc[key].append(f[key])
+            ga.append(a)
+            gb.append(b)
+            mseeds.append(ms)
+            eseeds.append(es)
+        del W
+        if (c + 1) % block == 0:
+            flush()
+    flush()
+
+
+def load_blocks(limit_mlps: int | None = None, pattern: str = "blk_*.npz"):
+    files = sorted(data_dir().glob(pattern))
+    if not files:
+        raise SystemExit(f"no data blocks in {data_dir()}")
+    parts = []
+    for f in files:
+        with np.load(f) as z:
+            parts.append({k: z[k] for k in z.files})
+    keys = [k for k in parts[0] if parts[0][k].ndim >= 1]
+    d = {k: np.concatenate([p[k] for p in parts], axis=0) for k in keys}
+    d["meta"] = {k: float(parts[0][k]) for k in parts[0]
+                 if parts[0][k].ndim == 0}
+    order = np.lexsort((d["est_seeds"], d["mlp_seeds"]))
+    for k in keys:
+        d[k] = d[k][order]
+    if limit_mlps is not None:
+        uniq = np.unique(d["mlp_seeds"])[:limit_mlps]
+        sel = np.isin(d["mlp_seeds"], uniq)
+        for k in keys:
+            d[k] = d[k][sel]
+    return d
+
+
+# ---------------------------------------------------------------------------
+# Design
+# ---------------------------------------------------------------------------
+def primitives(d: dict, rows) -> dict:
+    """Named per-neuron primitive arrays for the selected rows."""
+    p = {k: d[k][rows].astype(np.float64) for k in d
+         if k not in ("meta",) and getattr(d[k], "ndim", 0) == 2}
+    one = np.ones_like(p["alpha"])
+    p["one"] = one
+    for k in BC.PER_SEED_SCALAR:
+        p[k] = d[k][rows].astype(np.float64)[:, None] * one
+    p["lam1"] = p["lam1"] * 30.0 - 1.0
+    p["lam2"] = p["lam2"] * 100.0 - 1.0
+    p["vbar"] = p["vbar"] - 0.025
+    p["arms"] = p["arms"] - 3.1
+    p["keep_frac"] = p["keep_frac"] - 0.83
+    p["wn1"] = p["wn"] - 1.0
+    p["w43"] = p["w4"] - 3.0
+    for k in ("cv3", "relu1", "q2"):
+        p.setdefault(k, np.zeros_like(one))
+    # A neuron that never fires in the scored pass has ``Var(relu z) = 0`` and
+    # therefore ``sd_mc = 0``; it also has an exactly zero residual, so the
+    # scale-free parameterisation divides 0 by 0.  Floor at 1e-3 of the median,
+    # which leaves every live neuron untouched.
+    sd = p["sd_mc"]
+    p["sd_mc_f"] = np.maximum(sd, 1e-3 * float(np.median(sd[sd > 0])))
+    return p
+
+
+def design(p: dict, ch: tuple[str, ...], sh: tuple[str, ...],
+           mod: tuple[str, ...]) -> tuple[np.ndarray, list[str]]:
+    cols, names = [], []
+    for k in sh:
+        cols.append(p[k])
+        names.append(k)
+    for k in ch:
+        for m in mod:
+            cols.append(p[k] if m == "one" else p[k] * p[m])
+            names.append(k if m == "one" else f"{k}*{m}")
+    for u in POOL:
+        if u not in p:
+            continue
+        for k in ch:
+            cols.append(p[u] * np.sum(p[u] * p[k], axis=-1, keepdims=True))
+            names.append(f"<{u},{k}>{u}")
+    return np.stack(cols, axis=-1), names
+
+
+def umse(pred, a, b) -> float:
+    """Paired unbiased MSE: ``E[(p-a)(p-b)] = (p - mu_true)^2`` for a _|_ b."""
+    return float(np.mean((pred - a) * (pred - b)))
+
+
+def split_by_mlp(d: dict, seed: int = 20260808):
+    uniq = np.unique(d["mlp_seeds"])
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(uniq))
+    n = len(uniq)
+    n_v = max(1, int(round(0.2 * n)))
+    tst, val, trn = uniq[perm[:n_v]], uniq[perm[n_v:2 * n_v]], uniq[perm[2 * n_v:]]
+    m = d["mlp_seeds"]
+    return (np.flatnonzero(np.isin(m, trn)), np.flatnonzero(np.isin(m, val)),
+            np.flatnonzero(np.isin(m, tst)))
+
+
+def fit_eval(Xt, yt, Xv, muv, av, bv, lams, scale=None):
+    """Ridge over a lambda grid; returns ``(best_lam, best_umse, best_beta)``."""
+    if scale is None:
+        scale = np.sqrt(np.mean(Xt * Xt, axis=0))
+        scale = np.where(scale > 0, scale, 1.0)
+    Xs = Xt / scale
+    G = Xs.T @ Xs
+    bb = Xs.T @ yt
+    nrow = len(Xs)
+    best = (None, np.inf, None)
+    for lam in lams:
+        beta = BC.ridge_solve(G, bb, lam, nrow) / scale
+        v = umse(muv + Xv @ beta, av, bv)
+        if v < best[1]:
+            best = (lam, v, beta)
+    return best
+
+
+# ---------------------------------------------------------------------------
+# mode: fit
+# ---------------------------------------------------------------------------
+def mode_fit(lams, limit_mlps, rf_feats, rf_scale, rf_seed, out_name,
+             do_groups: bool = True, sgd_hidden=(), sgd_epochs: int = 25,
+             sgd_lr: float = 3e-3) -> None:
+    d = load_blocks(limit_mlps)
+    trn, val, tst = split_by_mlp(d)
+    nm = len(np.unique(d["mlp_seeds"]))
+    print(f"{len(d['mlp_seeds'])} rows over {nm} MLPs "
+          f"({len(d['est_seeds']) / max(nm, 1):.1f} seeds each) at "
+          f"N={d['meta'].get('n_samples')} P={d['meta'].get('n_pilot')} "
+          f"n_gt={d['meta'].get('n_gt')}")
+    print(f"  train {len(trn)} / val {len(val)} / test {len(tst)} rows "
+          f"({len(trn) * WIDTH:,} training neurons)")
+
+    A, B, MU = d["gt_a"], d["gt_b"], d["mu"]
+    base = {k: umse(MU[s], A[s], B[s]) for k, s in
+            (("t", trn), ("v", val), ("x", tst))}
+    print(f"\nbaseline sparse-MC unbiased true MSE:  train {base['t']:.4e}  "
+          f"val {base['v']:.4e}  test {base['x']:.4e}")
+
+    pt, pv, px = primitives(d, trn), primitives(d, val), primitives(d, tst)
+    yt = (0.5 * (A[trn] + B[trn]) - MU[trn]).ravel()
+
+    # ---- 0. the SHIPPED head, evaluated as-is at the deployed point -------
+    ship_beta = None
+    sp = Path(__file__).resolve().parent.parent / "submission" / "corrector.npz"
+    if sp.is_file():
+        ship_beta = np.load(sp)["beta"].astype(np.float64)
+    SHIP_CH = ("cv1", "cv2", "cv1mf")
+    SHIP_SH = ("s", "Phi", "phi", "alpha")
+
+    def ship_design(p):
+        cols = [p["one"]]
+        for k in SHIP_CH:
+            cols += [p[k], p[k] * p["Phi"], p[k] * p["alpha"]]
+        cols += [p[k] for k in SHIP_SH] + [p["dpilot"]]
+        return np.stack(cols, axis=-1)
+
+    print("\n=== 1. the shipped 15-float head at the deployed operating point ===")
+    Xt15, Xv15, Xx15 = ship_design(pt), ship_design(pv), ship_design(px)
+    if ship_beta is not None:
+        for s, X, nmn in (("val", Xv15, val), ("test", Xx15, tst)):
+            v = umse(MU[nmn] + X @ ship_beta, A[nmn], B[nmn])
+            print(f"  as shipped (fitted at N=8500,P=150)   {s:>4} "
+                  f"{v:11.4e}   {base[s[0]] / v:6.3f}x")
+    lam15, v15, b15 = fit_eval(Xt15.reshape(-1, Xt15.shape[-1]), yt, Xv15,
+                               MU[val], A[val], B[val], lams)
+    x15 = umse(MU[tst] + Xx15 @ b15, A[tst], B[tst])
+    print(f"  REFITTED here (lam {lam15:.0e})            val "
+          f"{v15:11.4e}   {base['v'] / v15:6.3f}x")
+    print(f"  {'':<38}test {x15:11.4e}   {base['x'] / x15:6.3f}x")
+
+    # ---- 2. raw channels at unit coefficient ------------------------------
+    print("\n=== 2. each channel alone, coefficient fixed at 1 (no fitting) ===")
+    for k in CH:
+        if k not in pv:
+            continue
+        v = umse(MU[val] - pv[k], A[val], B[val])
+        print(f"  - {k:<8} {v:11.4e}   {base['v'] / v:6.3f}x")
+
+    # ---- 3. the rich design ----------------------------------------------
+    ch = tuple(k for k in CH if float(np.abs(pt[k]).max()) > 0)
+    Xt, names = design(pt, ch, SH, MOD)
+    Xv, _ = design(pv, ch, SH, MOD)
+    Xx, _ = design(px, ch, SH, MOD)
+    nf = Xt.shape[-1]
+    print(f"\n=== 3. rich linear design, {nf} columns "
+          f"({len(ch)} correction channels x {len(MOD)} modulators "
+          f"+ {len(SH)} shape) ===")
+    Xt2 = Xt.reshape(-1, nf)
+    scale = np.sqrt(np.mean(Xt2 * Xt2, axis=0))
+    scale = np.where(scale > 0, scale, 1.0)
+    lam, vv, beta = fit_eval(Xt2, yt, Xv, MU[val], A[val], B[val], lams, scale)
+    xx = umse(MU[tst] + Xx @ beta, A[tst], B[tst])
+    print(f"  lambda {lam:.0e}   val {vv:11.4e} {base['v'] / vv:6.3f}x   "
+          f"test {xx:11.4e} {base['x'] / xx:6.3f}x")
+
+    if do_groups:
+        print("\n=== 4. leave-one-group-out / only-one-group, on validation ===")
+        print(f"  {'group':<12} {'without':>11} {'x':>8} {'only':>11} {'x':>8}")
+        for gname, gcols in GROUPS.items():
+            if not any(g in ch for g in gcols):
+                continue
+            drop = [i for i, n_ in enumerate(names)
+                    if n_.split("*")[0] in gcols]
+            keep = np.setdiff1d(np.arange(nf), drop)
+            _, v1, _ = fit_eval(Xt2[:, keep], yt, Xv[:, :, keep], MU[val],
+                                A[val], B[val], lams, scale[keep])
+            only = np.array([i for i, n_ in enumerate(names)
+                             if n_.split("*")[0] in gcols or n_ in SH])
+            _, v2, _ = fit_eval(Xt2[:, only], yt, Xv[:, :, only], MU[val],
+                                A[val], B[val], lams, scale[only])
+            print(f"  {gname:<12} {v1:11.4e} {base['v'] / v1:8.3f} "
+                  f"{v2:11.4e} {base['v'] / v2:8.3f}")
+
+    # ---- 5. the random-feature head ---------------------------------------
+    # Inputs are made SCALE-FREE first: every correction column is divided by
+    # the per-neuron Monte-Carlo noise scale ``sd_mc`` and the prediction is
+    # multiplied back by it.  The optimal shrinkage of a control variate is a
+    # ratio of signal to noise, so this is the parameterisation in which the
+    # map the head has to learn is a bounded function of bounded inputs -- and
+    # it is why ``sd_mc``, which a linear head measured at exactly 1.000x, is
+    # worth carrying now.
+    print("\n=== 5. random-feature head (tanh), scaled by sd_mc ===")
+    Zt, sct = rf_inputs(pt, ch, SH)
+    Zv, _ = rf_inputs(pv, ch, SH, sct)
+    Zx, _ = rf_inputs(px, ch, SH, sct)
+    nin = Zt.shape[-1]
+    Zt2, Zv2, Zx2 = (Z.reshape(-1, nin) for Z in (Zt, Zv, Zx))
+    yts = (yt.reshape(pt["alpha"].shape) / pt["sd_mc_f"]).ravel()
+
+    def sc_umse(flat, p, rows):
+        return umse(MU[rows] + flat.reshape(p["alpha"].shape) * p["sd_mc_f"],
+                    A[rows], B[rows])
+
+    res_rf = []
+    for nfeat in rf_feats:
+        t0 = time.time()
+        mdl = BC.RFRidge(nin, nfeat, seed=rf_seed, scale=rf_scale)
+        betas = mdl.fit(Zt2, yts, lams)
+        cand = [(sc_umse(mdl.predict(Zv2, w), pv, val), lm, w)
+                for lm, w in betas.items()]
+        v, lm, w = min(cand, key=lambda t: t[0])
+        xv = sc_umse(mdl.predict(Zx2, w), px, tst)
+        npar = mdl.n_params()
+        print(f"  {nfeat:6d} features ({npar:9,d} params) lam {lm:.0e}   "
+              f"val {v:11.4e} {base['v'] / v:6.3f}x   "
+              f"test {xv:11.4e} {base['x'] / xv:6.3f}x   "
+              f"[{time.time() - t0:.0f}s]", flush=True)
+        res_rf.append({"n_feat": nfeat, "n_params": int(npar),
+                       "val": v, "test": xv,
+                       "val_x": base['v'] / v, "test_x": base['x'] / xv})
+
+    # ---- 6. the SGD head ---------------------------------------------------
+    res_sgd = []
+    if sgd_hidden:
+        print("\n=== 6. per-neuron MLP head, Adam in numpy, scaled by sd_mc ===")
+        for hid in sgd_hidden:
+            t0 = time.time()
+            m = BC.SGDHead(nin, hid, seed=rf_seed)
+            m.fit(Zt2, yts, epochs=sgd_epochs, lr=sgd_lr, batch=8192,
+                  seed=rf_seed)
+            v = sc_umse(m.predict(Zv2), pv, val)
+            xv = sc_umse(m.predict(Zx2), px, tst)
+            print(f"  hidden {str(hid):<12} ({m.n_params():9,d} params)  "
+                  f"val {v:11.4e} {base['v'] / v:6.3f}x   "
+                  f"test {xv:11.4e} {base['x'] / xv:6.3f}x   "
+                  f"[{time.time() - t0:.0f}s]", flush=True)
+            res_sgd.append({"hidden": list(hid), "n_params": m.n_params(),
+                            "val": v, "test": xv, "val_x": base['v'] / v,
+                            "test_x": base['x'] / xv})
+
+    payload = {
+        "sgd": res_sgd,
+        "n_mlps": int(nm), "n_rows": int(len(d["mlp_seeds"])),
+        "base_val": base["v"], "base_test": base["x"],
+        "ship15_refit": {"lam": lam15, "val": v15, "test": x15,
+                         "val_x": base["v"] / v15, "test_x": base["x"] / x15},
+        "rich": {"lam": lam, "val": vv, "test": xx, "n_cols": int(nf),
+                 "val_x": base["v"] / vv, "test_x": base["x"] / xx,
+                 "names": names, "beta": beta.tolist()},
+        "rf": res_rf,
+    }
+    (data_dir() / out_name).write_text(json.dumps(payload, indent=1))
+    print(f"\nwrote {data_dir() / out_name}")
+
+
+def rf_inputs(p: dict, ch, sh, sc=None):
+    """Scale-free inputs: corrections in units of ``sd_mc``, shape as-is.
+
+    The POOL columns are appended in the same scale-free units, so the head
+    sees the rank-one cross-neuron term alongside the pointwise ones.
+    """
+    sd = p["sd_mc_f"]
+    cols = [p[k] / sd for k in ch] + [p[k] for k in sh if k != "one"]
+    for u in POOL:
+        for k in ch:
+            cols.append(p[u] * np.sum(p[u] * p[k] / sd, axis=-1, keepdims=True))
+    Z = np.stack(cols, axis=-1)
+    if sc is None:
+        sc = np.sqrt(np.mean(Z.reshape(-1, Z.shape[-1]) ** 2, axis=0))
+        sc = np.where(sc > 0, sc, 1.0)
+    return (Z / sc).astype(np.float32), sc
+
+
+# ---------------------------------------------------------------------------
+# mode: curve
+# ---------------------------------------------------------------------------
+def mode_curve(lams, rf_feats, rf_scale, rf_seed, grid) -> None:
+    d_all = load_blocks()
+    uniq = np.unique(d_all["mlp_seeds"])
+    print(f"# learning curve, {len(uniq)} MLPs available\n")
+    hdr = (f"{'train MLPs':>11} {'rows':>9} {'ridge15':>9} {'rich':>9} "
+           + " ".join(f"{'rf' + str(k):>9}" for k in rf_feats))
+    print(hdr)
+    print("-" * len(hdr))
+    trn_all, val, tst = split_by_mlp(d_all)
+    A, B, MU = d_all["gt_a"], d_all["gt_b"], d_all["mu"]
+    base_x = umse(MU[tst], A[tst], B[tst])
+    base_v = umse(MU[val], A[val], B[val])
+    pv, px = primitives(d_all, val), primitives(d_all, tst)
+    trn_m = np.unique(d_all["mlp_seeds"][trn_all])
+    ch = tuple(k for k in CH if float(np.abs(pv[k]).max()) > 0)
+    for g in grid:
+        if g > len(trn_m):
+            continue
+        sub = trn_m[:g]
+        trn = np.flatnonzero(np.isin(d_all["mlp_seeds"], sub))
+        pt = primitives(d_all, trn)
+        yt = (0.5 * (A[trn] + B[trn]) - MU[trn]).ravel()
+        out = []
+        cols15 = ("cv1", "cv2", "cv1mf")
+        X15t, _ = design(pt, cols15, ("one", "s", "Phi", "phi", "alpha"), MOD)
+        X15v, _ = design(pv, cols15, ("one", "s", "Phi", "phi", "alpha"), MOD)
+        X15x, _ = design(px, cols15, ("one", "s", "Phi", "phi", "alpha"), MOD)
+        _, _, b = fit_eval(X15t.reshape(-1, X15t.shape[-1]), yt, X15v,
+                           MU[val], A[val], B[val], lams)
+        out.append(base_x / umse(MU[tst] + X15x @ b, A[tst], B[tst]))
+        Xt, _ = design(pt, ch, SH, MOD)
+        Xv, _ = design(pv, ch, SH, MOD)
+        Xx, _ = design(px, ch, SH, MOD)
+        _, _, b = fit_eval(Xt.reshape(-1, Xt.shape[-1]), yt, Xv, MU[val],
+                           A[val], B[val], lams)
+        out.append(base_x / umse(MU[tst] + Xx @ b, A[tst], B[tst]))
+        Zt, sct = rf_inputs(pt, ch, SH)
+        Zv, _ = rf_inputs(pv, ch, SH, sct)
+        Zx, _ = rf_inputs(px, ch, SH, sct)
+        nin = Zt.shape[-1]
+        Zt2, Zv2, Zx2 = (Z.reshape(-1, nin) for Z in (Zt, Zv, Zx))
+        yts = (yt.reshape(pt["alpha"].shape) / pt["sd_mc_f"]).ravel()
+        for nfeat in rf_feats:
+            mdl = BC.RFRidge(nin, nfeat, seed=rf_seed, scale=rf_scale)
+            betas = mdl.fit(Zt2, yts, lams)
+            bst = (np.inf, None)
+            for lm, w in betas.items():
+                v = umse(MU[val] + mdl.predict(Zv2, w).reshape(
+                    pv["alpha"].shape) * pv["sd_mc_f"], A[val], B[val])
+                if v < bst[0]:
+                    bst = (v, w)
+            w = bst[1]
+            out.append(base_x / umse(
+                MU[tst] + mdl.predict(Zx2, w).reshape(px["alpha"].shape)
+                * px["sd_mc_f"], A[tst], B[tst]))
+        print(f"{g:11d} {len(trn) * WIDTH:9,d} "
+              + " ".join(f"{v:9.3f}" for v in out), flush=True)
+    print(f"\n(all columns are held-out TEST gain over the uncorrected sparse "
+          f"pass, base {base_x:.4e}; validation base {base_v:.4e})")
+
+
+# ---------------------------------------------------------------------------
+# mode: noise -- the MLPs-versus-label-precision tradeoff
+# ---------------------------------------------------------------------------
+def mode_noise(lams, grid_mlps, infl) -> None:
+    """Held-out gain on a (training MLPs) x (reference precision) grid.
+
+    Generating a second dataset at a different ``n_gt`` is not necessary and
+    would be confounded by using different networks.  The reference error is
+    Monte-Carlo noise on a mean, i.e. independent, zero-mean and of KNOWN
+    per-neuron variance ``vh_j / (n_gt r)`` -- and ``vh_j = sd_mc_j^2 N`` is
+    already a stored feature.  So a reference of ``n_gt / f`` samples is
+    simulated EXACTLY by adding independent noise of variance ``(f - 1)
+    vh_j/(n_gt r)`` to each of the two halves, on the same networks, with the
+    paired unbiased estimator staying unbiased because the two additions are
+    independent.  One dataset therefore answers the whole tradeoff.
+    """
+    d = load_blocks()
+    trn_all, val, tst = split_by_mlp(d)
+    A0, B0, MU = d["gt_a"], d["gt_b"], d["mu"]
+    meta = d["meta"]
+    n_gt = meta.get("n_samples") and meta["n_gt"]
+    vh = (d["sd_mc"].astype(np.float64) ** 2) * meta["n_samples"]
+    lab_var = vh / (n_gt * BC_REF_CV_GAIN)
+    trn_m = np.unique(d["mlp_seeds"][trn_all])
+    pv, px = primitives(d, val), primitives(d, tst)
+    ch = tuple(k for k in CH if float(np.abs(pv[k]).max()) > 0)
+    Xv, _ = design(pv, ch, SH, MOD)
+    Xx, _ = design(px, ch, SH, MOD)
+    print(f"# held-out TEST gain: training MLPs x simulated reference size\n"
+          f"# base n_gt = {n_gt:,} per half (x2 halves), rms label noise "
+          f"{np.sqrt(np.mean(lab_var)):.3e}\n")
+    hdr = (f"{'train MLPs':>11} " +
+           " ".join(f"{'n_gt/' + str(f):>10}" for f in infl))
+    print(hdr)
+    print("-" * len(hdr))
+    base_x = umse(MU[tst], A0[tst], B0[tst])
+    for g in grid_mlps:
+        if g > len(trn_m):
+            continue
+        trn = np.flatnonzero(np.isin(d["mlp_seeds"], trn_m[:g]))
+        pt = primitives(d, trn)
+        Xt, _ = design(pt, ch, SH, MOD)
+        Xt2 = Xt.reshape(-1, Xt.shape[-1])
+        row = []
+        for f in infl:
+            rng = np.random.default_rng(4242 + int(f * 97))
+            sd = np.sqrt(np.maximum(f - 1.0, 0.0) * lab_var[trn])
+            a = A0[trn] + sd * rng.standard_normal(sd.shape)
+            b = B0[trn] + sd * rng.standard_normal(sd.shape)
+            yt = (0.5 * (a + b) - MU[trn]).ravel()
+            _, _, beta = fit_eval(Xt2, yt, Xv, MU[val], A0[val], B0[val], lams)
+            row.append(base_x / umse(MU[tst] + Xx @ beta, A0[tst], B0[tst]))
+        print(f"{g:11d} " + " ".join(f"{v:10.3f}" for v in row), flush=True)
+    print("\n(evaluation labels are never perturbed; only the TRAINING labels "
+          "are.\n rows are iso-#MLPs, columns iso-precision; equal reference "
+          "compute runs\n down-right along  n_mlps x n_gt = const.)")
+
+
+#: Variance reduction the k=1 control variate buys on the reference at the
+#: shipped ``n_gt``.  MEASURED by ``--mode refcal``: 1.139 / 1.333 / 1.585 at
+#: n_gt = 16384 / 32768 / 65536.
+BC_REF_CV_GAIN = 1.333
+
+
+# ---------------------------------------------------------------------------
+# mode: cost
+# ---------------------------------------------------------------------------
+def mode_cost(n_params: int) -> None:
+    import flopscope as flops  # noqa: PLC0415
+    import flopscope.numpy as fnp  # noqa: PLC0415
+
+    from whestfloor.contract import FLOP_BUDGET  # noqa: PLC0415
+
+    W = [np.asarray(w) for w in make_mlp(WIDTH, DEPTH, 123)]
+    print("# billed cost of the new channels, in a real BudgetContext\n")
+
+    def bill(fn, *a):
+        with flops.BudgetContext(flop_budget=FLOP_BUDGET, quiet=True) as c:
+            fn(*a)
+        return int(c.flops_used), float(c.residual_wall_time_s)
+
+    fw = [fnp.asarray(w) for w in W]
+    sq = None
+
+    def prop_mean(weights, gates, d0):
+        p = d0
+        for l in range(1, len(weights)):
+            p = p @ weights[l]
+            if l < len(weights) - 1:
+                p = p * gates[l]
+        return p
+
+    def prop_two(weights, gates, gv, d0, v0):
+        nonlocal sq
+        p, q = d0, v0
+        for l in range(1, len(weights)):
+            p = p @ weights[l]
+            q = q @ sq[l]
+            if l < len(weights) - 1:
+                p = p * gates[l] + q * gv[l]
+                q = q * gv[l]
+        return p, q
+
+    d0 = fnp.asarray(np.random.default_rng(0).standard_normal(WIDTH)
+                     .astype(np.float32))
+    gates = fnp.asarray(np.full((DEPTH, WIDTH), 0.5, dtype=np.float32))
+    f1, r1 = bill(prop_mean, fw, gates, d0)
+    with flops.BudgetContext(flop_budget=FLOP_BUDGET, quiet=True):
+        pass
+    sq = [w * w for w in fw]
+    f2, r2 = bill(prop_two, fw, gates, gates, d0, d0)
+    print(f"  cv1mf mean propagation (shipped)   {f1:12,d} FLOPs  "
+          f"{f1 / FLOP_BUDGET * 100:7.4f}% of B   {r1 * 1e3:6.2f} ms")
+    print(f"  mfm + mfv two-channel propagation  {f2:12,d} FLOPs  "
+          f"{f2 / FLOP_BUDGET * 100:7.4f}% of B   {r2 * 1e3:6.2f} ms")
+    print(f"  the W .^ 2 tables, once per MLP    "
+          f"{DEPTH * WIDTH * WIDTH:12,d} FLOPs  "
+          f"{DEPTH * WIDTH * WIDTH / FLOP_BUDGET * 100:7.4f}% of B")
+
+    # head evaluation
+    for npar_in, nfeat in ((24, 256), (24, 2048), (24, 16384)):
+        Ain = fnp.asarray(np.zeros((npar_in, nfeat), dtype=np.float32))
+        cin = fnp.asarray(np.zeros(nfeat, dtype=np.float32))
+        w = fnp.asarray(np.zeros(nfeat + npar_in, dtype=np.float32))
+        Z = fnp.asarray(np.zeros((WIDTH, npar_in), dtype=np.float32))
+
+        def head(Z, Ain, cin, w):
+            h = fnp.tanh(Z @ Ain + cin)
+            return fnp.concatenate([Z, h], axis=1) @ w
+
+        f, r = bill(head, Z, Ain, cin, w)
+        print(f"  RF head {nfeat:6d} features ({npar_in * nfeat + nfeat:9,d} "
+              f"params)  {f:12,d} FLOPs  {f / FLOP_BUDGET * 100:7.4f}% of B  "
+              f"{r * 1e3:6.2f} ms")
+
+    # npz load at size, and the 5 s setup window
+    print()
+    for mb in (1, 8, 32):
+        n = int(mb * 1024 * 1024 / 4)
+        p = artifacts() / f"_loadprobe_{mb}.npz"
+        np.savez(p, W=np.zeros(n, dtype=np.float32))
+        t = time.time()
+        with flops.BudgetContext(flop_budget=FLOP_BUDGET, quiet=True) as c:
+            arr = fnp.load(str(p))["W"]
+            _ = arr.shape
+        dt = time.time() - t
+        print(f"  fnp.load {mb:3d} MiB ({n:,} float32): {int(c.flops_used)} "
+              f"FLOPs, {dt * 1e3:.0f} ms wall "
+              f"({dt / 5.0 * 100:.1f}% of the setup window)")
+        p.unlink()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", required=True,
+                    choices=("refcal", "data", "fit", "curve", "noise",
+                             "cost"))
+    ap.add_argument("--n-mlps", type=int, default=2000)
+    ap.add_argument("--mlp-seed-base", type=int, default=400_000)
+    ap.add_argument("--n-gt", type=int, default=65_536)
+    ap.add_argument("--n-seeds", type=int, default=4)
+    ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--n-shards", type=int, default=1)
+    ap.add_argument("--block", type=int, default=50)
+    ap.add_argument("--n-samples", type=int, default=SHIP_N)
+    ap.add_argument("--n-pilot", type=int, default=SHIP_P)
+    ap.add_argument("--tau", type=float, default=SHIP_TAU)
+    ap.add_argument("--q2", action="store_true")
+    ap.add_argument("--no-relu1", action="store_true")
+    ap.add_argument("--limit-mlps", type=int, default=None)
+    ap.add_argument("--lams", type=str,
+                    default="1e-7,1e-5,1e-4,1e-3,1e-2,3e-2,1e-1,3e-1,1")
+    ap.add_argument("--rf-feats", type=str, default="256,1024,4096")
+    ap.add_argument("--rf-scale", type=float, default=1.0)
+    ap.add_argument("--rf-seed", type=int, default=0)
+    ap.add_argument("--curve-grid", type=str, default="25,50,100,200,400,800")
+    ap.add_argument("--out", type=str, default="fit.json")
+    ap.add_argument("--reps", type=int, default=4)
+    ap.add_argument("--n-big", type=int, default=1_000_000)
+    ap.add_argument("--no-groups", action="store_true")
+    ap.add_argument("--sub", type=str, default="bigcorr")
+    ap.add_argument("--sgd-hidden", type=str, default="",
+                    help="e.g. '64;256;512,256' -- semicolon-separated shapes")
+    ap.add_argument("--sgd-epochs", type=int, default=25)
+    ap.add_argument("--sgd-lr", type=float, default=3e-3)
+    ap.add_argument("--infl", type=str, default="1,2,4,8,16")
+    args = ap.parse_args()
+
+    global SUBDIR
+    SUBDIR = args.sub
+    lams = [float(v) for v in args.lams.split(",")]
+    rf = [int(v) for v in args.rf_feats.split(",") if int(v) > 0]
+    if args.mode == "refcal":
+        mode_refcal(args.n_mlps, args.n_big, args.reps)
+    elif args.mode == "data":
+        mode_data(args.n_mlps, args.mlp_seed_base, args.n_gt, args.n_seeds,
+                  args.shard, args.n_shards, args.block, args.n_samples,
+                  args.n_pilot, args.tau, args.q2, not args.no_relu1)
+    elif args.mode == "fit":
+        hid = tuple(tuple(int(x) for x in h.split(","))
+                    for h in args.sgd_hidden.split(";") if h)
+        mode_fit(lams, args.limit_mlps, rf, args.rf_scale, args.rf_seed,
+                 args.out, not args.no_groups, hid, args.sgd_epochs,
+                 args.sgd_lr)
+    elif args.mode == "noise":
+        mode_noise(lams, [int(v) for v in args.curve_grid.split(",")],
+                   [float(v) for v in args.infl.split(",")])
+    elif args.mode == "curve":
+        mode_curve(lams, rf, args.rf_scale, args.rf_seed,
+                   [int(v) for v in args.curve_grid.split(",")])
+    else:
+        mode_cost(0)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

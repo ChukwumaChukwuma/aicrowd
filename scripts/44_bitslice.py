@@ -53,10 +53,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from whestfloor.bitslice import (  # noqa: E402
     Cfg,
-    dense_layer_cost,
     np_forward,
-    np_group_steps,
-    np_quant_weight,
+    np_plan,
     np_ranges,
     packed_layer_cost,
 )
@@ -235,12 +233,26 @@ def _v_and_bias(weights, stats, cfg, n, seed, reps):
     v_nat = float(np.mean(np.var(y_ex, axis=0, dtype=np.float64)))
     mu_ex = y_ex.mean(axis=0, dtype=np.float64)
 
+    # the weight quantisation is FIXED for the run -- one plan, many rounding
+    # replicates -- otherwise its bias would average away across replicates
+    # and be reported as zero.
+    plan = np_plan(weights, stats, cfg, seed * 7 + 3)
+    half = (n + 1) // 2
     v_inj, dmu = [], []
     for r in range(reps):
         rq = np.random.default_rng(seed * 131 + 977 + r)
-        y_q = np_forward(x0, weights, stats, cfg, rq)
+        y_q = np_forward(x0, plan, cfg, rq)
         d = (y_q.astype(np.float64) - y_ex.astype(np.float64))
-        v_inj.append(float(np.mean(np.var(d, axis=0))))
+        # v_eff is N * Var(batch mean), NOT the per-sample variance: with
+        # antithetic rounding the two differ by 2x and only the former is what
+        # the score charges.  With sample s paired to s+half,
+        #   Var(mean) = (V + C) / N,   V = per-sample variance,
+        #                              C = within-pair covariance
+        # so v_q_eff = V + C.  C is ~0 without pairing, which is the control.
+        da, db = d[:half], d[half:half * 2]
+        V = float(np.mean(np.var(d, axis=0)))
+        C = float(np.mean(np.mean((da - da.mean(0)) * (db - db.mean(0)), axis=0)))
+        v_inj.append(V + (C if cfg.anti else 0.0))
         dmu.append(y_q.mean(axis=0, dtype=np.float64) - mu_ex)
     D = np.asarray(dmu)                       # (reps, width)
     v_q = float(np.mean(v_inj))
@@ -435,10 +447,20 @@ def main() -> int:
 
 def build_grid(name):
     if name == "main":
-        g = []
-        for b in (2, 3, 4, 5, 6):
-            g.append(Cfg(ba=b, bw=b, kappa=3.0, groups=6))
-        return g
+        return [Cfg(ba=b, bw=b, kappa=3.0, groups=6) for b in (2, 3, 4, 5, 6)]
+    if name == "opt":
+        # the definitive grid: best kappa, octave groups, antithetic rounding
+        return [Cfg(ba=ba, bw=bw, kappa=2.0, groups=6, anti=True)
+                for ba in (2, 3, 4, 5, 6) for bw in (4, 5, 6)]
+    if name == "anti":
+        return [Cfg(ba=ba, bw=5, kappa=2.0, groups=6, anti=a)
+                for ba in (3, 4, 5) for a in (False, True)]
+    if name == "kappa2":
+        return [Cfg(ba=4, bw=5, kappa=k, groups=6, anti=True)
+                for k in (1.0, 1.25, 1.5, 1.75, 2.0, 2.5)]
+    if name == "groups2":
+        return [Cfg(ba=4, bw=5, kappa=2.0, groups=G, anti=True)
+                for G in (1, 2, 4, 6, 8, 12)]
     if name == "asym":
         return [Cfg(ba=ba, bw=bw, kappa=3.0, groups=6)
                 for ba in (2, 3, 4, 5) for bw in (3, 4, 5, 6, 8)]

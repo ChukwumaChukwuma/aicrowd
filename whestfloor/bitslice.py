@@ -152,11 +152,181 @@ def np_group_steps(lo, hi, ba, n_groups):
     return (base * np.exp2(-g) / lv).astype(np.float32), g.astype(np.int32)
 
 
-def np_forward(x0, weights, stats, cfg, rng, want_layers=False):
-    """One quantised forward pass in raw NumPy.  Returns the final activations.
+_SQRT_2PI = 2.5066282746310002
 
-    ``stats`` is ``(m_z, s_z)``, each ``(depth, width)`` -- the pilot's
-    pre-activation mean and sd, used only to size the per-neuron window.
+
+def _phi(a):
+    return np.exp(-0.5 * a * a) / _SQRT_2PI
+
+
+def _Phi(a):
+    return 0.5 * (1.0 + _erf(a / 1.4142135623730951))
+
+
+def _erf(x):
+    """Abramowitz-Stegun 7.1.26 -- 1.5e-7 absolute, ample for a noise model."""
+    s = np.sign(x)
+    x = np.abs(x)
+    t = 1.0 / (1.0 + 0.3275911 * x)
+    y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
+                - 0.284496736) * t + 0.254829592) * t * np.exp(-x * x)
+    return s * y
+
+
+def np_noise_plan(weights, stats, cfg, steps_by_layer, wresid):
+    """Analytic propagation of the quantisation noise, and the mean it costs.
+
+    **This is the mechanism that decides the whole lane.**  Stochastic rounding
+    is unbiased through a LINEAR map.  A ReLU network is not one: ``relu`` is
+    convex, so an injected zero-mean perturbation ``eps`` of variance ``v`` on
+    a pre-activation ``z ~ N(m, s^2)`` raises the mean of the activation by
+
+        E[relu(z + eps)] - E[relu(z)]  =  (1/2) v phi(m/s) / s  +  O(v^2)
+
+    -- a FIRST-ORDER bias in the injected variance, at every one of 32 layers,
+    each amplified by everything downstream.  Measured, it is 1.6e-2 rms at
+    ``b_a = 4``, and ``0.1 b^2`` is then 100x the entire shipped score.  It is
+    not a defect of the rounding; it is the price of injecting variance into a
+    convex map, and it is what makes "quantisation is free because it is
+    unbiased" wrong for this problem.
+
+    It is also entirely computable in advance.  ``v`` obeys a linear recursion,
+
+        v_pre^{l}_j  =  sum_i [ Phi_i v_pre^{l-1}_i + fresh_i ] W_ij^2  +  wq_j
+
+    (a perturbation survives a relu only through an open gate, hence ``Phi``;
+    ``fresh_i = Phi_i step_i^2 / 6`` is the layer's own rounding, with the
+    ``Phi`` because ``relu`` outputs an exact zero that the grid represents
+    exactly and so does not round), and every input to it -- the steps, the
+    pilot's ``(m, s)``, ``W^2`` -- is known per MLP.  The correction
+    ``dh^l = (1/2) v_pre^l phi(alpha^l) / s^l`` is therefore a per-MLP
+    ``O(depth * K^2)`` computation, ~230 FLOPs a sample at N=27000, and it
+    folds into the next layer's bias vector for free.
+    """
+    m_z, s_z = stats
+    depth = len(weights)
+    v_prev = None
+    v_pre, dh = [], []
+    for l in range(depth):
+        w = weights[l]
+        step = steps_by_layer[l]
+        if step is None:                                   # exact layer
+            fresh = np.zeros(w.shape[0], dtype=np.float64)
+        else:
+            gate = (np.ones(w.shape[0]) if l == 0
+                    else _Phi(m_z[l - 1] / s_z[l - 1]).astype(np.float64))
+            fresh = gate * (step.astype(np.float64) ** 2) / 6.0
+        tv = fresh if v_prev is None else v_prev + fresh
+        v = (tv[None, :] @ (w.astype(np.float64) ** 2))[0]
+        e = wresid[l]
+        if e is not None:
+            # the weight residual's own per-sample fluctuation: the batch-mean
+            # fix removes its mean, what is left is Var(h_i) E_ij^2
+            varh = _relu_var(m_z[l - 1], s_z[l - 1]) if l else np.ones(w.shape[0])
+            v = v + (varh[None, :] @ (e.astype(np.float64) ** 2))[0]
+        a = (m_z[l] / s_z[l]).astype(np.float64)
+        v_pre.append(v)
+        dh.append(0.5 * v * _phi(a) / s_z[l].astype(np.float64))
+        v_prev = _Phi(a) * v
+    return v_pre, dh
+
+
+def _relu_var(m, s):
+    a = (m / s).astype(np.float64)
+    P, p = _Phi(a), _phi(a)
+    mu = m * P + s * p
+    e2 = (m.astype(np.float64) ** 2 + s.astype(np.float64) ** 2) * P + m * s * p
+    return np.maximum(e2 - mu ** 2, 0.0)
+
+
+def np_plan(weights, stats, cfg, seed):
+    """Everything that is fixed for one MLP: windows, steps, quantised weights.
+
+    Built ONCE per MLP with its own generator, so replicating the experiment
+    re-draws only the per-sample activation rounding.  That separation is not
+    cosmetic: the weight rounding is fixed for the whole run, so it is a BIAS
+    and must not be allowed to average away across replicates.
+    """
+    m_z, s_z = stats
+    rng = np.random.default_rng(seed)
+    los, steps, lvls, whats, resid = [], [], [], [], []
+    for l, w in enumerate(weights):
+        ba, bw = cfg.ba_at(l), cfg.bw_at(l)
+        if ba is None or bw is None:
+            los.append(None); steps.append(None); lvls.append(None)
+            whats.append(w); resid.append(None)
+            continue
+        if l == 0:                              # input is N(0,1), not a relu
+            k0 = cfg.kappa0 or cfg.kappa
+            lo = np.full(w.shape[0], -k0, dtype=np.float32)
+            hi = np.full(w.shape[0], k0, dtype=np.float32)
+        else:
+            lo, hi = np_ranges(m_z[l - 1], s_z[l - 1], cfg.kappa)
+            lo, hi = np.maximum(lo, 0.0), np.maximum(hi, 0.0)
+        step, _ = np_group_steps(lo, hi, ba, cfg.groups)
+        los.append(lo.astype(np.float32))
+        steps.append(step)
+        lvls.append(float(2 ** ba - 1))
+        if bw >= 24:
+            whats.append(w)
+            resid.append(None)
+        else:
+            qw, ws = np_quant_weight(w, bw, rng, stochastic=cfg.stoch_w)
+            what = qw * ws[None, :]
+            whats.append(what)
+            resid.append(w - what)
+    dh = None
+    if cfg.relufix:
+        _, dh = np_noise_plan(weights, stats, cfg, steps, resid)
+    return {"lo": los, "step": steps, "lv": lvls, "what": whats,
+            "resid": resid, "dh": dh, "w": weights,
+            "m": m_z.astype(np.float64), "s": s_z.astype(np.float64)}
+
+
+def np_calibrate(x_cal, plan, cfg, seed, reps=1):
+    """Per-layer mean-shift correction, measured instead of modelled.
+
+    The analytic first-order correction ``(1/2) v phi(alpha)/s`` is wrong here
+    by up to 3x (``scripts/44``, the propagation diagnostic) because the
+    injected perturbation is not small: at ``b_a = 4`` its sd is **half** the
+    pre-activation sd at every layer, so nothing linearised in it converges.
+    This measures the shift instead, by running the exact and the quantised
+    pass on the SAME calibration inputs and taking the paired difference layer
+    by layer, correcting as it goes so each layer's estimate is conditional on
+    the ones before it being already fixed.
+
+    It is an ORACLE in the sense that matters for a bound: give it as many
+    calibration samples as you like and it is the best any bias correction can
+    do, because it is a direct unbiased measurement of the thing to subtract.
+    A shippable version pays ``n_cal / N`` of a dense pass for it.
+    """
+    he = np.asarray(x_cal, dtype=np.float32)
+    hq = he.copy()
+    rng = np.random.default_rng(seed)
+    dh = []
+    for l, w in enumerate(plan["w"]):
+        ze = he @ w
+        step = plan["step"][l]
+        if step is None:
+            zq = hq @ w
+        else:
+            qa = np_quant_act(hq, plan["lo"][l], step, plan["lv"][l], rng,
+                              stochastic=cfg.stochastic, anti=cfg.anti)
+            hh = plan["lo"][l][None, :] + qa * step[None, :]
+            zq = hh @ plan["what"][l]
+            e = plan["resid"][l]
+            if cfg.wmeanfix and e is not None:
+                zq = zq + hh.mean(axis=0, dtype=np.float64).astype(np.float32) @ e
+        he = np.maximum(ze, 0.0)
+        hq = np.maximum(zq, 0.0)
+        d = (hq.mean(axis=0, dtype=np.float64) - he.mean(axis=0, dtype=np.float64))
+        dh.append(d)
+        hq = hq - d.astype(np.float32)
+    return dh
+
+
+def np_forward(x0, plan, cfg, rng, want_layers=False):
+    """One quantised forward pass in raw NumPy.  Returns the final activations.
 
     The arithmetic here is EXACTLY the grouped bit-sliced kernel's: the codes
     are integers, the per-group scale is a power of two, and the weight scale
@@ -164,56 +334,71 @@ def np_forward(x0, weights, stats, cfg, rng, want_layers=False):
     identity, so nothing about the variance measured here depends on the
     packing actually being done.
     """
-    m_z, s_z = stats
-    depth = len(weights)
     h = np.asarray(x0, dtype=np.float32)
     rows = []
-    for l in range(depth):
-        w = weights[l]
-        ba, bw = cfg.ba_at(l), cfg.bw_at(l)
-        if ba is None or bw is None:            # exact layer
+    for l, w in enumerate(plan["w"]):
+        step = plan["step"][l]
+        if step is None:                        # exact layer
             z = h @ w
         else:
-            if l == 0:                          # input is N(0,1), not a relu
-                lo = np.full(w.shape[0], -cfg.kappa, dtype=np.float32)
-                hi = np.full(w.shape[0], cfg.kappa, dtype=np.float32)
-            else:
-                lo, hi = np_ranges(m_z[l - 1], s_z[l - 1], cfg.kappa)
-                lo, hi = np.maximum(lo, 0.0), np.maximum(hi, 0.0)
-            step, _ = np_group_steps(lo, hi, ba, cfg.groups)
-            lv = float(2 ** ba - 1)
+            lo, lv = plan["lo"][l], plan["lv"][l]
             qa = np_quant_act(h, lo, step, lv, rng,
                               stochastic=cfg.stochastic, anti=cfg.anti)
             hq = lo[None, :] + qa * step[None, :]
-            if bw >= 24:
-                what = w
-            else:
-                qw, wstep = np_quant_weight(w, bw, rng, stochastic=cfg.stoch_w)
-                what = qw * wstep[None, :]
-            z = hq @ what
-            if cfg.wmeanfix and bw < 24:
+            z = hq @ plan["what"][l]
+            e = plan["resid"][l]
+            if cfg.wmeanfix and e is not None:
                 # hbar @ (W - What): the BATCH MEAN of the weight-quantisation
                 # residual, folded back.  A quantised weight is fixed for the
                 # whole run, so its error is BIAS and does not divide by N;
                 # this cancels its first-order part exactly on this batch and
                 # leaves only a per-sample fluctuation, which does.
-                z = z + hq.mean(axis=0, dtype=np.float64).astype(np.float32) \
-                    @ (w - what)
+                z = z + hq.mean(axis=0, dtype=np.float64).astype(np.float32) @ e
         h = np.maximum(z, 0.0)
+        if cfg.varmatch and step is not None:
+            # VARIANCE MATCHING -- the bias fix that needs no exact reference.
+            #
+            # relu is convex, so injecting variance v raises E[relu].  But
+            # z_q = z + eps is still very nearly Gaussian (z is, by CLT over
+            # 256 inputs; eps is, by CLT over 256 independent roundings), so
+            # the shift is exactly the difference of two Gaussian relu means
+            # at the SAME mean and two different sds:
+            #
+            #   dh = [m Phi(m/sq) + sq phi(m/sq)] - [m Phi(m/s) + s phi(m/s)]
+            #
+            # ``s`` is the pilot's; ``sq`` is measured from the scored batch
+            # itself -- 2 reductions over the (N,K) array, ~2 FLOPs a sample a
+            # neuron -- so NO exact forward pass is needed anywhere.  Nothing
+            # is linearised in the perturbation, which matters because the
+            # perturbation is ~50% of the signal.
+            m, s = plan["m"][l], plan["s"][l]
+            vq = np.maximum(z.var(axis=0, dtype=np.float64) - s ** 2, 0.0)
+            h = h - (_relu_mean(m, np.sqrt(s ** 2 + vq)) - _relu_mean(m, s)
+                     ).astype(np.float32)
+        if plan["dh"] is not None:
+            h = h - plan["dh"][l].astype(np.float32)
         if want_layers:
             rows.append(h.mean(axis=0, dtype=np.float64))
     return (h, rows) if want_layers else h
+
+
+def _relu_mean(m, s):
+    a = m / s
+    return m * _Phi(a) + s * _phi(a)
 
 
 class Cfg:
     """Precision schedule + switches for one experiment."""
 
     def __init__(self, ba=4, bw=4, kappa=3.0, groups=6, stochastic=True,
-                 stoch_w=True, anti=False, wmeanfix=True,
-                 ba_sched=None, bw_sched=None, exact_layers=()):
+                 stoch_w=True, anti=False, wmeanfix=True, relufix=False,
+                 varmatch=False, kappa0=None, ba_sched=None, bw_sched=None,
+                 exact_layers=()):
         self.ba, self.bw, self.kappa, self.groups = ba, bw, kappa, groups
         self.stochastic, self.stoch_w = stochastic, stoch_w
-        self.anti, self.wmeanfix = anti, wmeanfix
+        self.anti, self.wmeanfix, self.relufix = anti, wmeanfix, relufix
+        self.varmatch = varmatch
+        self.kappa0 = kappa0
         self.ba_sched, self.bw_sched = ba_sched, bw_sched
         self.exact = set(exact_layers)
 
@@ -239,6 +424,12 @@ class Cfg:
             s += " detW"
         if not self.stochastic:
             s += " RTN"
+        if self.relufix:
+            s += " lin1fix"
+        if self.varmatch:
+            s += " vm"
+        if self.kappa0:
+            s += f" k0={self.kappa0:g}"
         if self.exact:
             s += f" ex{len(self.exact)}"
         return s
