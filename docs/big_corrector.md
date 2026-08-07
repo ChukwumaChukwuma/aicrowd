@@ -191,15 +191,50 @@ on the dominant mode back through that mode. It is exactly permutation
 equivariant, it costs one inner product per channel, and it is the cheapest
 non-pointwise structure available.
 
-## 5. Results
+## 5. The score model, which is how a variance ratio becomes a graded number
 
-*(see §6 for the pre-registered bars)*
+Only ratios transfer — the local harness runs ~1.45x above the grader on
+identical seeds and two changes have already measured better locally and graded
+worse. So the ratio is measured against the shipped head **in the same run**
+and applied to the grader's own calibrated constants.
 
-## 6. Bars, fixed before the runs
+With `raw = b^2 + v/N` and `C = F0 + cN`, the graded objective
+`adjusted = raw x max(0.1, C/B)` expands to
+`[b^2 F0 + b^2 c N + v F0/N + v c]/B`, which is convex in `N` with
+`d/dN = 0` at `N* = sqrt(v F0 / (b^2 c))`, giving
+
+```
+adjusted(N*)  =  ( sqrt(b^2 F0) + sqrt(v c) )^2 / B
+```
+
+This closed form was not in the repository and it is worth stating on its own:
+the score is the square of a **sum of two independent square roots**, one for
+the pilot's bias floor and one for the sampler. Reducing `v` by `r` shrinks
+only the second term, so the payoff is sub-linear in `r` and saturates at
+`b^2 F0 / B` — currently 1.6e-9 — no matter how good the corrector gets.
+
+Constants from the graded sweeps (`c` and `F0` from `C/B = 0.1001` at
+`N = 8500` and `0.2287` at `N = 22000`; `b^2 = 1.2e-7` at `P = 150` from
+`raw = 4.846e-7` at `N = 67000`; both rescaled to the shipped `P = 225`).
+**Validation of the model, not a fit to it:** it returns adjusted
+**2.470e-07** at `N* = 24,160` against the graded **2.4646e-07** at the shipped
+`N = 25,000` — the level to 0.2% and the argmin to 3%.
+
+| `v_eff` reduced by | projected adjusted | `N*` | x over the ship |
+|---|---|---|---|
+| 1.0x | 2.4706e-07 | 24,160 | 1.000 |
+| 1.2x | 2.0908e-07 | 22,055 | 1.182 |
+| 1.5x | 1.7077e-07 | 19,727 | 1.447 |
+| 2.0x | 1.3197e-07 | 17,084 | 1.872 |
+| 5.0x | 5.9816e-08 | 10,805 | 4.130 |
+
+## 6. Results
+
+## 7. Bars, fixed before the runs
 
 | # | bar, fixed before the run | measured | verdict |
 |---|---|---|---|
 | 1 | refitting the shipped 15-column design at the deployed operating point beats the shipped coefficients on held-out TEST by **>= 1.02x** | | |
 | 2 | the rich linear design beats the refitted 15 on held-out TEST by **>= 1.05x** | | |
 | 3 | a nonlinear head (random-feature or SGD) beats the best linear design on held-out TEST by **>= 1.05x** | | |
-| 4 | the whole stack, converted through the score model, clears the current ship's graded **2.4646e-07** | | |
+| 4 | the whole stack, converted through the score model of §5, clears the current ship's graded **2.4646e-07** | | |

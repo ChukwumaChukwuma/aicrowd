@@ -445,28 +445,34 @@ def mode_fit(lams, limit_mlps, rf_feats, rf_scale, rf_seed, out_name,
     # is the best any of them could do if it knew that MLP's optimal
     # coefficients exactly.  Whatever gap remains between the fitted head and
     # this row is the only thing more data or more capacity could ever buy.
-    print("\n=== 2b. ceiling: per-MLP-optimal coefficients on the same "
-          "channels ===")
-    for nm_, cols_ in (("shipped 3 channels", ("cv1", "cv2", "cv1mf")),
-                       ("all channels", ch)):
+    print("\n=== 2b. ceiling: per-MLP-optimal coefficients, same columns ===")
+    vb = float(np.mean((A[tst] - B[tst]) ** 2)) / 2.0
+    print(f"  reference half-noise Var(b) = {vb:.4e}; the correction below is "
+          f"vb (1 + p/n), p = columns, n = 256 neurons")
+    ceil_res = {}
+    for nm_, cols_, mod_ in (
+            ("shipped 3 channels", ("cv1", "cv2", "cv1mf"), ("one",)),
+            ("shipped 3, x modulators", ("cv1", "cv2", "cv1mf"), MOD),
+            ("all channels", ch, ("one",)),
+            ("all channels x modulators", ch, MOD)):
         cols_ = tuple(k for k in cols_ if float(np.abs(px[k]).max()) > 0)
-        G_ = np.stack([px[k] for k in cols_] + [px["one"]], axis=-1)
-        acc, half = 0.0, 0.0
+        G_, nm2, _ = design(px, cols_, ("one",), mod_)
+        p_ = G_.shape[-1]
+        acc = 0.0
         for src, dst in ((A, B), (B, A)):
             y_ = src[tst] - MU[tst]
             gt_ = np.einsum("mnp,mnq->mpq", G_, G_)
             bt_ = np.einsum("mnp,mn->mp", G_, y_)
-            di = np.arange(G_.shape[-1])
-            gt_[:, di, di] += 1e-8 * np.trace(gt_, axis1=1, axis2=2)[
-                :, None] / G_.shape[-1]
+            di = np.arange(p_)
+            gt_[:, di, di] += 1e-9 * np.trace(gt_, axis1=1, axis2=2)[
+                :, None] / p_
             th = np.linalg.solve(gt_, bt_[..., None])[..., 0]
             pa = MU[tst] + np.einsum("mnp,mp->mn", G_, th)
-            acc += float(np.mean((pa - dst[tst]) ** 2))
-            half += 1.0
-        vb = float(np.mean((A[tst] - B[tst]) ** 2)) / 2.0
-        cm = acc / half - vb
-        print(f"  {nm_:<22} {cm:11.4e}   {base['x'] / cm:6.3f}x  "
-              f"(TEST split, {len(cols_) + 1} coefficients per MLP)")
+            acc += 0.5 * float(np.mean((pa - dst[tst]) ** 2))
+        cm = acc - vb * (1.0 + p_ / WIDTH)
+        ceil_res[nm_] = cm
+        print(f"  {nm_:<26} {cm:11.4e}   {base['x'] / cm:6.3f}x  "
+              f"({p_} coefficients per MLP)")
 
     # ---- 3. the rich design ----------------------------------------------
     Xt, names, tags = design(pt, ch, SH, MOD, POOL)
@@ -779,7 +785,7 @@ BC_REF_CV_GAIN = 1.333
 # ---------------------------------------------------------------------------
 # mode: export -- the shippable artifact and its loader contract
 # ---------------------------------------------------------------------------
-def mode_export(lams, out_name: str) -> None:
+def mode_export(lams, out_name: str, pool=POOL, drop=()) -> None:
     """Write ``bigcorr_head.npz`` and print the predict-time contract.
 
     The penalty is selected on VALIDATION and the honest generalisation number
@@ -793,19 +799,65 @@ def mode_export(lams, out_name: str) -> None:
     trn, val, tst = split_by_mlp(d)
     A, B, MU = d["gt_a"], d["gt_b"], d["mu"]
     pt, pv, px = (primitives(d, s) for s in (trn, val, tst))
-    ch = tuple(k for k in CH if float(np.abs(pt[k]).max()) > 0)
-    Xt, names, _ = design(pt, ch, SH, MOD, POOL)
-    Xv, _, _ = design(pv, ch, SH, MOD, POOL)
-    Xx, _, _ = design(px, ch, SH, MOD, POOL)
+    avail = tuple(k for k in CH
+                  if float(np.abs(pt[k]).max()) > 0 and k not in drop)
     yt = (0.5 * (A[trn] + B[trn]) - MU[trn]).ravel()
-    lam, vv, beta = fit_eval(Xt.reshape(-1, len(names)), yt, Xv, MU[val],
-                             A[val], B[val], lams)
+    base_v = umse(MU[val], A[val], B[val])
     base_x = umse(MU[tst], A[tst], B[tst])
+
+    def try_set(cs, sh, pl):
+        Xt_, nm_, _ = design(pt, cs, sh, MOD, pl)
+        Xv_, _, _ = design(pv, cs, sh, MOD, pl)
+        lam_, v_, b_ = fit_eval(Xt_.reshape(-1, len(nm_)), yt, Xv_, MU[val],
+                                A[val], B[val], lams)
+        return v_, lam_, b_, nm_
+
+    # ---- selection, on VALIDATION only ------------------------------------
+    # Greedy forward selection over CHANNELS, then the two optional blocks.
+    # Every candidate is scored on the validation split; the test split is read
+    # ONCE, at the end, for the winner.  A channel is only kept if it improves
+    # validation by more than 0.2%, which is the threshold this repository has
+    # used for overriding a simpler design throughout.
+    print(f"# greedy forward selection over {len(avail)} channels, on "
+          f"validation ({len(np.unique(d['mlp_seeds'][val]))} MLPs)")
+    cur: tuple[str, ...] = ()
+    best_v = umse(MU[val] + design(pv, (), SH, MOD, ())[0]
+                  @ try_set((), SH, ())[2], A[val], B[val])
+    while True:
+        cands = [(try_set(cur + (k,), SH, ())[0], k) for k in avail
+                 if k not in cur]
+        if not cands:
+            break
+        v_, k_ = min(cands)
+        if v_ > best_v * 0.998:
+            break
+        cur, best_v = cur + (k_,), v_
+        print(f"  + {k_:<8} val {best_v:11.4e}  {base_v / best_v:6.3f}x")
+    sh, pool = SH, ()
+    SH_NOEIG = tuple(k for k in SH
+                     if k not in ("u1", "u2", "lam1", "lam2"))
+    # An ADDITION must beat the incumbent by 0.2%; a REMOVAL is taken unless
+    # it loses by more than 0.2%.  Both thresholds point the same way -- toward
+    # the cheaper design -- which is the right prior when the expensive block
+    # (the power iteration) is 0.15% of the whole FLOP budget and the
+    # difference it makes is 0.1% of a validation number.
+    for lbl, sh_, pl_, add in (("+ pooled u1/u2 terms", SH, POOL, True),
+                               ("- eigen shape cols", SH_NOEIG, (), False)):
+        v_ = try_set(cur, sh_, pl_)[0]
+        keep = (v_ < best_v * 0.998) if add else (v_ < best_v * 1.002)
+        print(f"  {lbl:<22} val {v_:11.4e}  {base_v / v_:6.3f}x   "
+              f"{'ADOPTED' if keep else 'rejected'}")
+        if keep:
+            best_v, sh, pool = v_, sh_, pl_
+    ch = cur
+    vv, lam, beta, names = try_set(ch, sh, pool)
+    Xx, _, _ = design(px, ch, sh, MOD, pool)
     xx = umse(MU[tst] + Xx @ beta, A[tst], B[tst])
+    print(f"\nselected channels: {', '.join(ch)}")
 
     tv = np.concatenate([trn, val])
     ptv = primitives(d, tv)
-    Xtv, _, _ = design(ptv, ch, SH, MOD, POOL)
+    Xtv, _, _ = design(ptv, ch, sh, MOD, pool)
     ytv = (0.5 * (A[tv] + B[tv]) - MU[tv]).ravel()
     sc = np.sqrt(np.mean(Xtv.reshape(-1, len(names)) ** 2, axis=0))
     sc = np.where(sc > 0, sc, 1.0)
@@ -815,16 +867,32 @@ def mode_export(lams, out_name: str) -> None:
     p = data_dir() / out_name
     np.savez(p, beta=beta_ship.astype(np.float32),
              features=np.array(names), channels=np.array(ch),
-             shape_cols=np.array(SH), modulators=np.array(MOD),
-             pool=np.array(POOL), lam=float(lam),
+             shape_cols=np.array(sh), modulators=np.array(MOD),
+             pool=np.array(pool if pool else [""]), lam=float(lam),
              n_train_mlps=len(np.unique(d["mlp_seeds"][trn])),
              n_fit_mlps=len(np.unique(d["mlp_seeds"][tv])),
-             test_gain=float(base_x / xx), val_gain=float(
-                 umse(MU[val], A[val], B[val]) / vv),
+             test_gain=float(base_x / xx), val_gain=float(base_v / vv),
              tau=SHIP_TAU, n_samples=SHIP_N, n_pilot=SHIP_P)
     print(f"wrote {p}  ({p.stat().st_size} bytes, {len(names)} coefficients)")
     print(f"  penalty {lam:.0e} selected on validation; TEST gain of the "
           f"train-only fit {base_x / xx:.3f}x")
+    sp = Path(__file__).resolve().parent.parent / "submission" / "corrector.npz"
+    if sp.is_file():
+        sb = np.load(sp)["beta"].astype(np.float64)
+        cols = [px["one"]]
+        for k in ("cv1", "cv2", "cv1mf"):
+            cols += [px[k], px[k] * px["Phi"], px[k] * px["alpha"]]
+        cols += [px[k] for k in ("s", "Phi", "phi", "alpha")] + [px["dpilot"]]
+        xs = umse(MU[tst] + np.stack(cols, axis=-1) @ sb, A[tst], B[tst])
+        dflop = (NEW_CHANNEL_FLOPS - 4.09e8) if not pool and sh is SH_NOEIG \
+            else NEW_CHANNEL_FLOPS
+        a0, _ = project(1.0)
+        a1, n1 = project(xs / xx, d_flops=dflop)
+        print(f"  shipped head on the SAME test split {xs:.4e}; this head "
+              f"{xx:.4e}  ->  {xs / xx:.3f}x")
+        print(f"  projected graded {a1:.4e} at N* = {n1:,.0f}  "
+              f"({a0 / a1:.3f}x over the shipped 2.4646e-07), "
+              f"new-channel cost {dflop:.2e} FLOPs")
     print(f"  shipped vector refitted on train+validation "
           f"({int(len(np.unique(d['mlp_seeds'][tv])))} MLPs)")
     print("\n--- loader contract -------------------------------------------")
@@ -1021,6 +1089,8 @@ def main() -> int:
     ap.add_argument("--sgd-epochs", type=int, default=25)
     ap.add_argument("--sgd-lr", type=float, default=3e-3)
     ap.add_argument("--infl", type=str, default="1,2,4,8,16")
+    ap.add_argument("--no-pool", action="store_true")
+    ap.add_argument("--drop", type=str, default="")
     args = ap.parse_args()
 
     global SUBDIR
@@ -1041,7 +1111,9 @@ def main() -> int:
                  args.sgd_lr)
     elif args.mode == "export":
         mode_export(lams, args.out if args.out != "fit.json"
-                    else "bigcorr_head.npz")
+                    else "bigcorr_head.npz",
+                    () if args.no_pool else POOL,
+                    tuple(k for k in args.drop.split(",") if k))
     elif args.mode == "noise":
         mode_noise(lams, [int(v) for v in args.curve_grid.split(",")],
                    [float(v) for v in args.infl.split(",")])
