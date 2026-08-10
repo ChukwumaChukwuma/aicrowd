@@ -10,47 +10,11 @@ is what is shipped.
 
 The estimator in one paragraph
 ------------------------------
-Sparse Monte Carlo — the always-off neurons pruned out of every matmul —
-driven by a **randomly-shifted rank-1 lattice** instead of pseudorandom points.
-The lattice costs 1.51% of the pass and is worth **1.448x on raw MSE and 1.427x
-on the adjusted score**, measured paired on the official 100-MLP suite. It is
-exactly unbiased at every ``N``. The layer-1 Hermite control variates and the
-offline-trained head are still in this file and still loaded, but are shipped at
-``DAMP = 0``: they and the lattice target the same variance and, measured, they
-do not compose — the head is worth 1.609x on an iid draw and **0.922x on top of
-a lattice**. See ``DAMP``.
-
-The lattice, in three lines
----------------------------
-Take the rank-1 point set ``p_i = frac(i * z / N)`` for a generating vector
-``z`` searched offline, rotate it by a per-MLP uniform shift, and map it to
-Gaussians by inverse CDF::
-
-    x_i = Phi^{-1}( frac(i*z/N + U) ),      U ~ U[0,1)^d  from mlp.seed
-
-For each FIXED ``i`` this is exactly uniform on the cube, so every point is
-marginally a genuine standard Gaussian draw and the estimator is exactly
-unbiased at every ``N`` — only the dependence BETWEEN points is structured, and
-dependence does not move a mean. What the structure buys is that every
-one-dimensional projection of the lattice is the exact ``N``-point grid, so the
-shift-averaged squared error of any first-order ANOVA term is ``1/(6N^2)``
-instead of Monte Carlo's ``1/N``.
-
-It is a CONSTANT, not a rate. Swept over seven doublings of ``N`` (primes under
-``2^10..2^17``, six official MLPs, variance across independent randomisations):
-``p = 1.043 +- 0.023`` for the lattice against ``p = 0.974 +- 0.034`` for iid as
-the control, in ``v = v_0/N^p``. The first-order share of ``Var(relu z^32)`` is
-27.6% and the remaining 72.4% sits at mean ANOVA order 15.5, so the lattice
-annihilates the first-order part and leaves the rest at the Monte-Carlo rate:
-the ratio saturates around 2.0x rather than growing. No generating vector can
-change that — the exact 1-D grids happen for ANY vector coprime to ``N``, so the
-search only ever buys the pairs. Full account and every bar in ``docs/rqmc.md``.
-
-Credit: the construction is **evaaaz**'s (forum 18053). **radiant-allomancer**
-(18085) published the redundancy warning that ``DAMP = 0`` is the answer to, and
-the refutation of *antithetic* RQMC, which is why no antithetic pairing appears
-here. The float64 inverse-CDF trap is **jamesrahenry**'s erratum (18097) and
-**mohanty**'s (18125).
+Sparse Monte Carlo (the always-off neurons pruned out of every matmul), plus
+two things that cost 0.4% of the pass between them: **layer-1 Hermite control
+variates**, whose expectations are known in closed form because ``z^1`` is
+exactly Gaussian, and an **offline-trained linear head** over those and ~20
+other predict-time features, loaded from ``corrector.npz`` at zero FLOPs.
 
 Why sampling at all
 -------------------
@@ -142,18 +106,7 @@ the identical code path.  If ``corrector.npz`` is missing or unreadable the
 head is simply absent and the estimator degrades to that same uncorrected
 sparse pass rather than failing.  Every numerical path is wrapped so that a
 raise falls back to a dense Monte-Carlo pass: a single zeroed MLP would cost
-~850x the whole score, and this has actually happened once (a ``SymmetryError``
-on official MLP 19 that was invisible on eight local suites).
-
-The lattice adds two operations to the hot path — ``norm.ppf`` and, at larger
-``N`` than shipped, a ``concatenate`` — and both are inside that guard, because
-``_draw`` is called from ``_sparse`` which ``predict`` wraps.  It also has two
-degradations of its own BEFORE the guard is needed: if ``setup`` cannot build
-the point set the draw rebuilds it lazily and pays for it, and if that fails too
-the draw is pseudorandom.  So the failure ladder is lattice-in-setup ->
-lattice-in-predict -> iid sparse -> dense fallback, and only the last is a real
-loss.  A ``setup`` that raised would lose all 100 MLPs rather than one, which is
-why the base build is wrapped there as well.
+~850x the whole score.
 
 Sizing
 ------
@@ -252,100 +205,7 @@ TAU = 2.5
 #: (20000 -> 2.4892e-07, 31000 -> 2.6101e-07).  25000 is the centre of that
 #: flat region, not a sharp argmin -- the grader carries ~1-2% run-to-run
 #: noise, which is the same size as the differences inside the region.
-#:
-#: MOVED to 24989 for the lattice, which is the prime immediately below 25000.
-#: ``cbc_order2`` needs a prime ``N`` to run its FFT search at all, and prime
-#: ``N`` is also what makes every ``z_j`` automatically coprime to ``N`` --
-#: which is what makes every one-dimensional projection of the lattice the
-#: exact ``N``-point grid, the property the whole method rests on.  The 11
-#: samples are 0.04% of the pass and the operating point is unchanged.
-#:
-#: 24989 is not the local argmin.  The argmin is 49999 (adj@1x 2.8121e-07
-#: against 2.9686e-07) and it is NOT taken, for three reasons, all measured:
-#: it sits at ``C/B = 0.615`` where a residual surprise on an unknown box is
-#: amplified, the ordering REVERSES at 2x residual (3.17e-07 vs 3.10e-07), and
-#: ``docs/cost_floor.md`` section 5 measured a 3x residual cliff past
-#: ``N ~ 35000`` on this shape.  ``docs/rqmc.md`` section 7.1 also measures
-#: 9.0% of single-seed realisation noise on a 100-MLP local raw, which is
-#: larger than the 1.06x on offer.  A second tarball at ``N = 11987`` -- same
-#: score, ``C/B = 0.139``, half the billed compute -- is submitted alongside
-#: this one to let the grader settle the residual question.
-N_SAMPLES = 24989
-
-#: Number of lattice points.  MUST equal ``N_SAMPLES`` or the point set is
-#: ignored and the draw silently degrades to pseudorandom (checked, not
-#: assumed, in ``_draw``).
-RQMC_N = 24989
-
-#: Width assumed when ``SetupContext`` does not carry one.  The competition
-#: shape is 256 (``whestbench/cli.py``), and a wrong guess is harmless: ``_draw``
-#: checks the built base against the ACTUAL width and rebuilds or degrades.
-WIDTH_DEFAULT = 256
-
-#: float32 has 24 mantissa bits, so a uniform can round to exactly 0.0 or 1.0
-#: and send ``norm.ppf`` to -inf / +inf.  Clamp inside the representable range.
-#: This is jamesrahenry's erratum (forum 18097) and mohanty's 18125, and it has
-#: already NaN'd another team's tail branch.
-U_EPS = 6.0e-8
-
-#: Rows of the lattice mapped through ``norm.ppf`` at a time.  At
-#: ``N_SAMPLES = 24989`` this is one slice, so no ``concatenate`` is billed on
-#: the hot path; it exists so that a larger ``N`` cannot allocate a single
-#: ``(N, 256)`` float64 intermediate (205 MB at N = 100000).
-RQMC_CHUNK = 32768
-
-#: Generating vector for ``RQMC_N`` x 256, from a full component-by-component
-#: search against the exact order-2 (pairwise) shift-averaged worst-case-error
-#: criterion ``sum_{j<k} (1/N) sum_i B_2(i z_j/N) B_2(i z_k/N)``, done in
-#: O(d N log N) by FFT (``whestfloor/rqmc.py::cbc_order2``, run offline; the
-#: grader sandbox has no numpy so it cannot run here and the vector travels as
-#: source).  256 integers, 2 KiB, DATA INDEPENDENT -- nothing in it is fitted
-#: to any MLP, so it carries no overfitting risk whatsoever.
-#:
-#: Measured quality (``whestfloor.rqmc.lattice_quality``) against the
-#: search-free Roberts/Kronecker vector evaaaz published:
-#:
-#:      1-D term          2.6690e-10  ==  1/(6N^2) = 2.6690e-10
-#:      order-2 sum T     1.0132e-03  vs Roberts' 2.1273e-02   21.0x better
-#:      worst pair        4.288e-06   vs Roberts' 1.389e-03
-#:
-#: The 1-D term is identical by construction: ANY vector coprime to N gives the
-#: exact N-point grid in every single coordinate, which is why the search only
-#: ever buys the pairs, and why no better vector can change the CONVERGENCE
-#: RATE (measured p = 1.043 +- 0.023 against iid's 0.974 +- 0.034).
-#:
-#: ``tests/test_submission_parity.py`` asserts this literal is bit-identical to
-#: what the search produces.  A transcription slip would NOT raise: prime N
-#: keeps every z_j coprime, so the projections would stay exact and the
-#: estimator would stay unbiased while silently discarding the pair quality --
-#: it would keep working and quietly lose most of its gain.
-RQMC_Z = (
-    1, 9664, 10561, 11442, 15862, 17147, 14783, 13957, 17740, 19081, 5340,
-    16980, 3155, 10906, 16095, 2239, 6896, 4887, 1705, 7057, 5689, 13463,
-    7926, 2875, 8874, 21826, 16579, 24378, 16121, 1053, 18422, 17677,
-    5656, 19427, 7710, 20103, 19243, 20052, 2729, 16889, 20720, 14881,
-    5224, 15059, 17349, 14869, 15055, 14405, 18953, 14449, 17454, 5132,
-    3546, 15501, 14300, 8375, 4173, 7884, 7080, 4973, 3469, 24279, 22138,
-    23523, 14828, 3773, 16389, 1179, 19050, 9713, 13980, 716, 1624, 4913,
-    5972, 16813, 17104, 1246, 18837, 7948, 8714, 1631, 9405, 18004, 1181,
-    23313, 14635, 20644, 17798, 10402, 6697, 4392, 16344, 13222, 902,
-    18682, 19932, 8772, 13267, 12227, 6014, 3404, 8573, 2984, 22511, 581,
-    23746, 17799, 20415, 16636, 1128, 15391, 21472, 3724, 8918, 891,
-    12331, 2504, 15379, 15746, 1230, 20991, 16702, 19539, 3870, 17207,
-    11865, 21353, 3747, 11789, 10105, 24253, 24070, 10868, 8716, 1917,
-    15479, 19780, 12896, 18737, 24209, 9794, 23203, 3465, 23586, 13294,
-    7987, 14911, 19792, 19208, 23561, 614, 22520, 19232, 915, 10417, 4014,
-    15882, 21249, 13117, 22757, 11549, 14668, 14036, 7098, 1000, 954,
-    8670, 20655, 13259, 21069, 633, 577, 7109, 8396, 23045, 15665, 11546,
-    8265, 21213, 9627, 6451, 16145, 4384, 23183, 7538, 16809, 15744, 5181,
-    10571, 14584, 3369, 4535, 6071, 7316, 7985, 24609, 7234, 13133, 18673,
-    8955, 5099, 728, 3514, 1610, 11321, 7787, 4951, 20972, 20397, 8792,
-    19551, 21018, 4330, 16463, 13907, 11209, 24673, 12451, 12965, 4289,
-    20935, 23932, 2015, 12822, 9312, 4355, 20378, 6362, 17611, 7531,
-    21894, 21125, 658, 4482, 16112, 6417, 2900, 1926, 10274, 17704, 17459,
-    22287, 2277, 8293, 7838, 15232, 23418, 11112, 6795, 23385, 17384,
-    4081, 16673, 22022, 10361
-)
+N_SAMPLES = 25000
 
 #: Pilot samples.  A short DENSE pass doing three jobs at once: it supplies
 #: ``alpha`` (which the threshold needs), the frozen constants for the pruned
@@ -427,35 +287,7 @@ CV_KMAX = 2
 #: Scales the offline head's output.  ``0.0`` is the exact ablation: the
 #: identical code path with the correction switched off, reproducing the
 #: uncorrected sparse estimator bit for bit.
-#:
-#: **SHIPPED AT 0.0, and the head is deliberately still loaded.**  The lattice
-#: and this head target the same variance, and measured they do not compose.
-#: 6 official MLPs x 10 independent randomisations, N = 24989, all four cells
-#: paired on the same seeds, MSE against the 1e9 reference:
-#:
-#:      iid,     head off   2.1695e-06   1.000x
-#:      iid,     head ON    1.3480e-06   1.609x    <- the previous ship
-#:      lattice, head off   8.7599e-07   2.477x    <- THIS ship
-#:      lattice, head ON    9.5061e-07   2.282x
-#:
-#: so the head is worth 1.609x on top of an iid draw and **0.922x on top of a
-#: lattice** (redundancy factor 0.573).  The mechanism is a theorem, not an
-#: accident: the ``k=1`` Hermite block is provably the optimal input-LINEAR
-#: control variate, and a rank-1 lattice annihilates exactly the first-order
-#: ANOVA terms.  Same target, two directions.  The head's coefficients were
-#: fitted offline against an iid residual in which that first-order part is
-#: still present, so under a lattice a coefficient of 1 over-corrects and
-#: injects noise.
-#:
-#: ``damp`` enters linearly, so one pair of runs prices every value:
-#: ``P(damp) = P(0) + damp*(P(1) - P(0))`` at fixed seed.  The lattice arm's
-#: argmin is ``damp = 0.25`` at 8.6486e-07, worth **1.013x** over switching the
-#: head off -- one scalar fitted on 6 MLPs cannot claim 1.3%, and
-#: ``docs/rqmc.md`` section 7.1 measures 9.0% of local realisation noise, so it
-#: is not taken.  ``corrector.npz`` and its loader stay in the tree because the
-#: right fix is to REFIT the head on lattice draws, at which point this knob
-#: comes back live (``docs/rqmc.md`` section 6.1).
-DAMP = 0.0
+DAMP = 1.0
 
 #: Relative jitter on the analytic Hermite Gram's diagonal.  Insurance only:
 #: measured cond(2 rho .^ 2) = 2.41, because squaring O(1/16) correlations
@@ -500,7 +332,6 @@ class Estimator(BaseEstimator):
 
     def __init__(self) -> None:
         self._beta = None
-        self._base = None
 
     def setup(self, ctx) -> None:  # noqa: ANN001 - whestbench SetupContext
         # ``fnp.load`` is billed at 0 FLOPs (measured), and setup runs off
@@ -512,103 +343,6 @@ class Estimator(BaseEstimator):
             self._beta = fnp.load(os.path.join(d, COEF_FILE))["beta"]
         except Exception:  # noqa: BLE001 - no head is a valid degradation
             self._beta = None
-
-        # The lattice point set is DATA INDEPENDENT, so it is built once here
-        # where it costs nothing at grade time (billed it is 76,866,676 FLOPs,
-        # 0.028% of the budget -- measured, so nothing depends on setup being
-        # free).  ``SetupContext`` carries ``width``, which is what lets this
-        # happen in setup at all; if it is absent or the shape turns out not to
-        # match, ``_draw`` rebuilds lazily and pays for it, and if even that
-        # fails the draw degrades to pseudorandom.  Three levels, because a
-        # setup that RAISES loses all 100 MLPs, not one.
-        #
-        # Measured setup wall time with the base built: see ``scripts/35``.
-        self._base = None
-        try:
-            w = int(getattr(ctx, "width", 0) or 0) or WIDTH_DEFAULT
-            if N_SAMPLES == RQMC_N and 0 < w <= len(RQMC_Z):
-                self._base = self._lattice_base(N_SAMPLES, RQMC_Z[:w])
-        except Exception:  # noqa: BLE001 - iid is a valid degradation
-            self._base = None
-
-    # ------------------------------------------------------------------
-    def _lattice_base(self, n_points, z):
-        """``(n_points, d)`` float32 lattice points ``frac(i * z_j / N)``.
-
-        The modulo is EXACT rather than approximate: ``(N-1) * max(z)`` is
-        6.2e8 at ``N = 24989``, twenty-four bits inside float64's exact-integer
-        range, so ``p - floor(p/N)*N`` loses nothing.  Doing it in float32
-        would not survive -- 6.2e8 is past float32's integer resolution -- which
-        is why the base is built in float64 and cast only at the end.
-        """
-        zz = fnp.asarray([float(v) for v in z])
-        inv = 1.0 / float(n_points)
-        parts = []
-        for lo in range(0, n_points, RQMC_CHUNK):
-            hi = min(lo + RQMC_CHUNK, n_points)
-            i = fnp.arange(lo, hi, dtype=fnp.float64)
-            p = fnp.outer(i, zz)
-            p = p - fnp.floor(p * inv) * float(n_points)
-            parts.append((p * inv).astype(fnp.float32))
-        return parts[0] if len(parts) == 1 else fnp.concatenate(parts, axis=0)
-
-    # ------------------------------------------------------------------
-    def _lattice_normals(self, base, rng):
-        """Cranley-Patterson shift + inverse CDF.  float64 ppf, float32 out.
-
-        UNBIASEDNESS.  For a fixed lattice index ``i`` and coordinate ``j``, the
-        map ``t -> frac(p_ij + t)`` is a measure-preserving rotation of the
-        circle and the coordinates of the shift are independent, so
-        ``frac(p_i + U) ~ U[0,1)^d`` **exactly**, for every ``i`` and every
-        ``N``.  Hence each point is marginally a genuine standard Gaussian draw
-        and ``E[(1/N) sum f(x_i)] = E[f(x)]`` with no asymptotics and no lattice
-        property used.  Only the DEPENDENCE between points is structured, and
-        dependence does not move a mean.
-
-        DTYPE, and this has already cost another team 2x.  ``norm.ppf`` promotes
-        float32 to float64 to match scipy, and ONE promoted array reprices the
-        entire 32-layer chain at the float64 rate.  The ppf must run in float64
-        -- that is what stops a float32 uniform of exactly 1.0 returning ``inf``
-        -- and the result must be cast back immediately, before anything touches
-        it.  Verified in a real ``BudgetContext``: the marginal cost per sample
-        is 1.0151x the iid kernel's, not 2.00x, and the whole overhead is 157.0
-        FLOPs per ELEMENT of the draw (166 of which is the ppf itself, against
-        16 for ``standard_normal``) -- i.e. proportional to the draw, not to the
-        pass, which is the signature that the cast held.
-        """
-        shift = rng.random(base.shape[1], dtype=fnp.float32)
-        n = base.shape[0]
-        parts = []
-        for lo in range(0, n, RQMC_CHUNK):
-            u = base[lo:min(lo + RQMC_CHUNK, n)] + shift
-            u = u - fnp.floor(u)
-            u = fnp.minimum(fnp.maximum(u, U_EPS), 1.0 - U_EPS)
-            parts.append(flops.stats.norm.ppf(u).astype(fnp.float32))
-        return parts[0] if len(parts) == 1 else fnp.concatenate(parts, axis=0)
-
-    # ------------------------------------------------------------------
-    def _draw(self, rng, n_samples, n):
-        """The scored draw: a shifted lattice when one is available, else iid.
-
-        Every branch returns a ``(n_samples, n)`` float32 array of exact
-        standard Gaussian marginals, so everything downstream -- pilot, mask,
-        frozen constants, control variates, head -- is unchanged either way and
-        the iid branch is the exact ablation.
-        """
-        base = self._base
-        if base is None or base.shape[0] != n_samples or base.shape[1] != n:
-            base = None
-            if n_samples == RQMC_N and 0 < n <= len(RQMC_Z):
-                try:
-                    # Billed, unlike the setup path, and cached so it is paid
-                    # at most once per run rather than once per MLP.
-                    base = self._lattice_base(n_samples, RQMC_Z[:n])
-                    self._base = base
-                except Exception:  # noqa: BLE001
-                    base = None
-        if base is None:
-            return rng.standard_normal((n_samples, n), dtype=fnp.float32)
-        return self._lattice_normals(base, rng)
 
     def predict(self, mlp, budget: int):  # noqa: ANN001 - whestbench MLP
         _ = budget
@@ -789,18 +523,7 @@ class Estimator(BaseEstimator):
         # cache and the BILLED RESIDUAL -- wall minus flopscope's own backend
         # and dispatch time, charged at 1e11 FLOP/s -- triples for an
         # identical FLOP count.  See CHUNK.
-        # A randomly-shifted rank-1 lattice instead of pseudorandom points.
-        # Drawn AFTER the pilot from the same generator, so the pilot stream is
-        # untouched and the shift still descends from ``mlp.seed`` alone.
-        # Measured end to end on the official 100-MLP suite, paired:
-        #
-        #      iid  N=25000 damp=1   raw 1.5250e-06  C/B 0.2778  adj 4.2358e-07
-        #      lat  N=24989 damp=0   raw 1.0530e-06  C/B 0.2819  adj 2.9686e-07
-        #
-        # 1.448x on raw, 1.427x on adjusted, and 3.2x on the worst MLP
-        # (1.315e-05 -> 4.163e-06), which matters because the score is a mean
-        # over MLPs and ours is worst-MLP dominated.
-        x0 = self._draw(rng, n_samples, n)
+        x0 = rng.standard_normal((n_samples, n), dtype=fnp.float32)
         z1p, zp, xp, h1p = [], [], [], []
         for lo in range(0, n_samples, CHUNK or n_samples):
             x = x0[lo:lo + (CHUNK or n_samples)]
