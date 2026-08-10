@@ -465,7 +465,7 @@ pilot moves raw by at most 1.11x and costs 3.4% of `F`, netting nothing.
 
 **The calibration this leaves is worth more than the retracted claim.** Three
 runs of the identical estimator at the identical `N`, differing only in pilot
-size, spread over raw MSE with **CV 8.8%** — and the `raw · N` scatter across the
+size, spread over raw MSE with **CV 9.0%** (8.8% on the first three) — and the `raw · N` scatter across the
 `N` sweep is 7.7%, the same number arriving independently. So **a single-seed
 100-MLP local raw carries ~8% of realisation noise**, and no local A/B below
 about 10% is real. That is the quantitative form of "only the grader ranks", and

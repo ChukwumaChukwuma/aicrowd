@@ -32,7 +32,7 @@
 >
 > And one calibration from that sweep which bears on every A/B on this page:
 > three runs of the identical estimator at identical `N`, differing only in pilot
-> size, spread over raw MSE with **CV 8.8%**, and the `raw·N` scatter across the
+> size, spread over raw MSE with **CV 9.0%**, and the `raw·N` scatter across the
 > whole `N` sweep is 7.7% — the same number independently. **A single-seed
 > 100-MLP local raw carries ~8% of realisation noise.** So the 1.02-1.04x of §4.1
 > and the 1.0121x of §5.1 are inside it and are correctly described here as
