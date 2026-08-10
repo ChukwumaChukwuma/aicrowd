@@ -1,31 +1,55 @@
 #!/usr/bin/env python
-"""Is the top of the leaderboard converging at the lattice rate?  Measure it.
+"""Can the metered frontier be an IID sampler?  A single-point feasibility test.
 
-The claim under test: fitting ``raw = v / N_eq^p`` to the top entries with
-``v = 0.045`` and ``N_eq = F / 4.198656e6`` gives ``p`` of 1.7-2.1 against our
-1.11, and ``p ~ 2`` is the classical randomised-QMC rate, so the top of the
-board is running a lattice and we are not.
+The statistic the RQMC line was reopened on is
 
-The statistic that claim rests on is
+    p_implied  =  ln(v / raw) / ln(N_eq),      N_eq = F / 4.198656e6,  v = 0.045
 
-    p_implied  =  ln(v / raw) / ln(N_eq)
+evaluated at ONE (N_eq, raw) pair per entry.  **It is not identifiable**: one
+point cannot separate ``v`` from ``p``, and ``p_implied`` returns a number for a
+deterministic estimator just as happily as for a sampler.  Two independent
+demonstrations, in order of how much they cost to believe.
 
-evaluated at ONE (N_eq, raw) pair per entry.  One point cannot identify two
-parameters.  ``p_implied`` is a monotone recoding of ``raw`` at fixed ``N_eq``:
-it is defined for a deterministic estimator, for a biased estimator, and for an
-estimator whose per-sample cost is not one dense forward pass, and in each of
-those cases it is not a convergence exponent at all.
+``--mode unmetered``
+    The cheap one, and it has already been vindicated.  An entry whose whole
+    billed arithmetic is a couple of dense-forward-pass equivalents cannot be
+    sampling at all, whatever ``p_implied`` says about it.  Run against the
+    telemetry snapshot in ``$WHEST_ARTIFACTS/recon*/subs`` this flagged dpskv5
+    (``N_eq = 0.5``), dstepanov (3.0) and ely2sh (3.5) as non-samplers; the
+    2026-08-07 re-grade then found dpskv5's and joe_wanza's leading entries at
+    ``F/C = 0.000`` and put them under review.  So the diagnostic works, and it
+    is the reason the pre-re-grade version of this analysis reached the right
+    conclusion about the wrong entries.
 
-There IS an identifiable version, and the leaderboard telemetry supports it.
-Several entries submitted the SAME method at DIFFERENT ``N``.  Regressing
-``ln raw`` on ``ln N_eq`` *within* an entry estimates ``p`` with ``v``
-eliminated, which is the quantity the claim is about.  That is what this
-script does.
+``--mode feasible``
+    **The one that matters, and it supports the superlinear hypothesis.**  For a
+    metered entry, ask instead: is there ANY ``(c, N, v_eff)`` consistent with
+    ``p = 1`` that reaches its raw MSE inside this repository's own measured
+    limits?  ``F`` is known, so ``N = F/c``, so ``v_eff = raw * N`` is forced by
+    the entry's own numbers once ``c`` is chosen.  Two measured constraints then
+    close the box from both sides:
 
-Data: ``$WHEST_ARTIFACTS/recon*/subs/*.json`` — the server-rendered submission
-pages, each carrying ``per_mlp[].telemetry.flops_used`` for all 100 MLPs plus
-the aggregate ``final_layer_mse``.  Provenance and the fetch are
-``docs/recon.md`` §1.
+      * ``docs/cost_floor.md`` section 3 -- an ORACLE Gaussian surrogate that
+        replaces a prefix of the network costs an irreducible ``b^2``, measured:
+        9.04e-07 at 1 layer-equivalent a sample, 3.25e-06 at 3, 3.77e-06 at 4.
+        So a cheap per-sample pass has a bias floor, and ``raw >= b^2``.
+      * ``docs/hermite_rank_ceiling.md`` -- the layer-1 Hermite family caps
+        variance reduction at 1.76x, and the dictionary-free bound (top-8
+        eigenfunctions of ``Cov(y)``) at ~10x.
+
+    Squeeze those together and either the entry needs a variance reduction far
+    past the ceiling, or it needs a per-sample cost whose bias floor is far
+    above its raw.  If both fail, ``p = 1`` is refuted for that entry **without
+    assuming anything about v** -- which is exactly what a single point can
+    support and ``p_implied`` cannot.
+
+Board snapshot: 2026-08-07 re-grade, supplied by the coordinator; the earlier
+top three were corrected down hard (dpskv5 4.0e-10 -> 5.43e-08, huang_chung_yi
+9.0e-10 -> 1.159e-07, joe_wanza 1.0e-09 -> 4.87e-08) and the submissions the
+original brief was fitted to no longer exist.  ``www.aicrowd.com`` is blocked by
+the egress proxy from this sandbox, so the current rows are carried here as data
+rather than re-fetched; the stale per-MLP JSON under ``$WHEST_ARTIFACTS/recon*``
+is still used by ``--mode unmetered``, which only ever needed ``F``.
 """
 
 from __future__ import annotations
@@ -35,19 +59,52 @@ import glob
 import json
 import math
 import os
+import sys
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 DENSE_FLOPS = 4_198_656.0
 V_ASSUMED = 0.045
+B = 2.72e11
+
+#: 2026-08-07 re-grade.  ``fc`` is the instrumented share ``sum F / sum C``.
+BOARD = [
+    # who,            fc,     F,         raw,        note
+    ("rayan53",       0.957, 2.687e10, 1.349e-08, "new #1, metered"),
+    ("ednacob",       0.930, 1.283e11, 3.633e-08, "metered"),
+    ("oabuod",        0.885, 1.517e11, 1.165e-07, "metered"),
+    ("US (shipped)",  1.000, 6.221e10, 9.285e-07, "metered"),
+    ("dpskv5",        0.000, 2.111e06, 7.840e-08, "UNMETERED, under review"),
+    ("joe_wanza",     0.000, 1.296e07, 5.211e-08, "UNMETERED, under review"),
+]
+
+#: ``docs/cost_floor.md`` section 3, measured on 3 local MLPs x 400,000 oracle
+#: surrogate samples: (layer-equivalents per sample, irreducible b^2).  The
+#: 32-layer row is the full pass and has no model error at all.
+BIAS_FLOOR = ((1, 9.04e-07), (3, 3.25e-06), (4, 3.77e-06), (5, 4.08e-06),
+              (7, 5.66e-06), (9, 6.87e-06), (13, 8.87e-06), (32, 0.0))
+LAYER_EQ = 131_072.0
+
+#: ``docs/hermite_rank_ceiling.md``: the layer-1 Hermite dictionary caps at
+#: 1.76x; the dictionary-free bound from the top-8 eigenfunctions of Cov(y) is
+#: 90.1% of the variance, i.e. 10.1x.  Both are variance-reduction ceilings on
+#: v_eff against the bare v = 0.0449.
+V_BARE = 0.0449
+CEILING_HERMITE = 1.76
+CEILING_EIGEN = 10.1
 
 
 def art() -> Path:
     return Path(os.environ.get("WHEST_ARTIFACTS", "_artifacts")).resolve()
 
 
+# ---------------------------------------------------------------------------
+# mode: unmetered
+# ---------------------------------------------------------------------------
 def load_subs():
     seen, out = set(), []
     for p in sorted(glob.glob(str(art() / "recon*" / "subs" / "*.json"))):
@@ -56,7 +113,7 @@ def load_subs():
             sub = d["props"]["data"]["submission"]
         except Exception:  # noqa: BLE001
             continue
-        if sub["id"] in seen:
+        if sub["id"] in seen or sub.get("scoreSecondary") is None:
             continue
         who = None
 
@@ -76,61 +133,42 @@ def load_subs():
         r = sub["evaluation"]["results"]
         F = [m["telemetry"]["flops_used"]
              for m in (r.get("per_mlp") or []) if m.get("telemetry")]
-        if not F or sub.get("scoreSecondary") is None:
+        if not F:
             continue
         seen.add(sub["id"])
-        out.append(dict(id=sub["id"], who=who or "?", ts=sub.get("createdAt", ""),
-                        adj=float(sub["score"]),
-                        raw=float(sub["scoreSecondary"]),
-                        F=float(np.mean(F)),
+        out.append(dict(id=sub["id"], who=who or "?",
+                        ts=sub.get("createdAt", ""), adj=float(sub["score"]),
+                        raw=float(sub["scoreSecondary"]), F=float(np.mean(F)),
                         neq=float(np.mean(F)) / DENSE_FLOPS))
-    return out
+    return [s for s in out if s["raw"] < 1e-3]
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--v", type=float, default=V_ASSUMED)
-    args = ap.parse_args()
+def mode_unmetered():
     subs = load_subs()
-    subs = [s for s in subs if s["raw"] < 1e-3]     # 324900 crashed at 1.7e-2
-
-    print("# every graded submission we hold telemetry for, newest last\n")
-    hdr = (f"{'who':<18} {'sub':>7} {'when':>17} {'N_eq':>9} {'raw':>11} "
-           f"{'adjusted':>11} {'p_implied':>10}")
+    print("# Entries whose entire billed arithmetic is a few dense forward "
+          "passes.\n# A sampler with v = 0.045 at N_eq = n scores 0.045/n; "
+          "these are 1e6x better.\n")
+    hdr = (f"{'who':<18} {'sub':>7} {'N_eq':>7} {'raw':>11} "
+           f"{'a sampler would score':>22} {'x better than possible':>23}")
     print(hdr)
     print("-" * len(hdr))
-    for s in sorted(subs, key=lambda s: (s["who"], s["ts"])):
-        pi = (math.log(args.v / s["raw"]) / math.log(s["neq"])
-              if s["neq"] > 1.05 else float("nan"))
-        print(f"{s['who']:<18} {s['id']:>7} {s['ts'][:16]:>17} "
-              f"{s['neq']:9.0f} {s['raw']:11.4e} {s['adj']:11.4e} "
-              f"{pi:10.3f}")
+    for s in sorted(subs, key=lambda s: s["neq"]):
+        if s["neq"] > 6:
+            continue
+        best = V_ASSUMED / max(s["neq"], 1e-9)
+        print(f"{s['who']:<18} {s['id']:>7} {s['neq']:7.1f} {s['raw']:11.4e} "
+              f"{best:22.4e} {best / s['raw']:23.3e}")
+    print("\n  These are the entries the 2026-08-07 re-grade put at F/C = 0.000\n"
+          "  and under organizer review.  The diagnostic found them from F "
+          "alone,\n  before the re-grade, and it needed no assumption about v.")
 
-    print("\n\n# 1. The single-point statistic is not identifiable, and here "
-          "is the proof\n")
-    print("Four of dpskv5's graded submissions ran at N_eq ~ 1 -- ONE dense "
-          "forward-pass\nequivalent of billed compute for the whole "
-          "prediction:\n")
-    low = [s for s in subs if s["neq"] < 5]
-    for s in sorted(low, key=lambda s: s["neq"]):
-        print(f"  {s['who']:<16} {s['id']}  N_eq {s['neq']:6.1f}  "
-              f"raw {s['raw']:.4e}")
-    print(f"\nA sampler with per-sample variance v = {args.v} and N_eq = 1 has "
-          f"raw = {args.v:.3f}.\nThese entries are 1e6 times better than that "
-          "at that compute, so their error is\nMODEL error, not sampling "
-          "error.  For them `p_implied` is not an exponent; it is\n"
-          "`ln(v/raw)/ln(N_eq)` with a denominator near zero.")
-
-    print("\n\n# 2. The identifiable version: regress ln raw on ln N_eq "
-          "WITHIN an entry\n")
+    print("\n\n# Within-entry rate fits on the SAME (now stale) snapshot, for "
+          "the record.\n# These are the fits the pre-re-grade analysis rested "
+          "on.  The scores they\n# used have been corrected, so they are "
+          "reported as history, not evidence.\n")
     by = defaultdict(list)
     for s in subs:
         by[s["who"]].append(s)
-    hdr2 = (f"{'who':<18} {'n subs':>7} {'N_eq range':>20} {'raw range':>24} "
-            f"{'fitted p':>9}")
-    print(hdr2)
-    print("-" * len(hdr2))
-    fits = {}
     for who, ss in sorted(by.items()):
         ss = [s for s in ss if s["neq"] > 1.05]
         if len(ss) < 2:
@@ -140,39 +178,83 @@ def main() -> int:
         if x.max() - x.min() < 0.3:
             continue
         p = -float(np.polyfit(x, y, 1)[0])
-        fits[who] = p
-        print(f"{who:<18} {len(ss):7d} "
-              f"{min(s['neq'] for s in ss):9.0f} -{max(s['neq'] for s in ss):9.0f} "
-              f"{min(s['raw'] for s in ss):11.4e} -{max(s['raw'] for s in ss):11.4e} "
-              f"{p:9.3f}")
+        print(f"  {who:<18} {len(ss)} subs, N_eq "
+              f"{min(s['neq'] for s in ss):.0f}-{max(s['neq'] for s in ss):.0f}"
+              f"   fitted p = {p:+.3f}")
 
-    print("\n  The sharpest pair, because it is the same team 3.5 hours apart "
-          "and it is\n  the pair that took them to rank 1:\n")
-    a = next(s for s in subs if s["id"] == "324846")
-    b = next(s for s in subs if s["id"] == "324969")
-    pab = math.log(a["raw"] / b["raw"]) / math.log(b["neq"] / a["neq"])
-    print(f"    dpskv5 324846  N_eq {a['neq']:8.0f}  raw {a['raw']:.4e}  "
-          f"adjusted {a['adj']:.4e}")
-    print(f"    dpskv5 324969  N_eq {b['neq']:8.0f}  raw {b['raw']:.4e}  "
-          f"adjusted {b['adj']:.4e}")
-    print(f"\n    compute cut {a['neq'] / b['neq']:.2f}x, raw moved "
-          f"{a['raw'] / b['raw']:.4f}x  ->  fitted p = {pab:.3f}")
-    print(f"    adjusted improved {a['adj'] / b['adj']:.1f}x -- ALL of it from "
-          "the multiplier, none from raw.")
-    print(f"\n    Had p been 1.9, cutting N by {a['neq'] / b['neq']:.1f}x would "
-          f"have multiplied raw by\n    {(a['neq'] / b['neq']) ** 1.9:.0f}x, to "
-          f"{a['raw'] * (a['neq'] / b['neq']) ** 1.9:.2e}.  It moved by "
-          f"{100 * (b['raw'] / a['raw'] - 1):+.1f}%.")
 
-    print("\n\n# 3. What the board is actually doing\n")
-    print("Raw is FLAT in N for every top entry that varied N.  That is a bias "
-          "floor:\n`raw -> b^2` and `adjusted -> b^2 * max(0.1, C/B)`, so the "
-          "only lever left is\nC, and the way to rank is to drive C to the "
-          "0.1 clamp.  dpskv5 did exactly\nthat and it was worth 16x.  This "
-          "reproduces docs/graded.md section 5 from the\ntelemetry rather "
-          "than from an inequality.")
-    (art() / "rqmc" / "leader_rate.json").write_text(
-        json.dumps(dict(subs=subs, within_entry_p=fits), indent=1))
+# ---------------------------------------------------------------------------
+# mode: feasible
+# ---------------------------------------------------------------------------
+def bias_floor(layer_eq: float) -> float:
+    """Interpolate ``docs/cost_floor.md`` section 3's oracle bias floor."""
+    xs = [a for a, _ in BIAS_FLOOR]
+    ys = [b for _, b in BIAS_FLOOR]
+    if layer_eq <= xs[0]:
+        return ys[0]
+    if layer_eq >= 32:
+        return 0.0
+    return float(np.interp(layer_eq, xs, ys))
+
+
+def mode_feasible():
+    print("# Is p = 1 (iid) feasible for each metered entry, given its own F?\n")
+    print("For a chosen per-sample cost c, the entry's own numbers force")
+    print("    N = F/c        and        v_eff = raw * N")
+    print("with no assumption about v at all.  Then check v_eff against the")
+    print("measured variance-reduction ceilings, and check c against the")
+    print("measured bias floor of a per-sample pass that cheap.\n")
+    hdr = (f"{'who':<14} {'F':>10} {'p_impl':>7} | {'c (layer-eq)':>12} "
+           f"{'N':>10} {'v_eff needed':>13} {'x reduction':>12} {'b^2 floor':>10} "
+           f"{'verdict':>9}")
+    print(hdr)
+    print("-" * len(hdr))
+    out = {}
+    for who, fc, F, raw, note in BOARD:
+        neq = F / DENSE_FLOPS
+        pi = (math.log(V_ASSUMED / raw) / math.log(neq)) if neq > 1.05 else \
+            float("nan")
+        rows = []
+        for leq in (32, 21.7, 13, 9, 4, 3, 1):
+            c = leq * LAYER_EQ
+            N = F / c
+            v_eff = raw * N
+            red = V_BARE / v_eff
+            b2 = bias_floor(leq)
+            ok = (red <= CEILING_EIGEN) and (b2 <= raw)
+            rows.append((leq, N, v_eff, red, b2, ok))
+        any_ok = any(r[5] for r in rows)
+        for i, (leq, N, v_eff, red, b2, ok) in enumerate(rows):
+            head = (f"{who:<14} {F:10.3e} {pi:7.3f} |" if i == 0
+                    else f"{'':<14} {'':>10} {'':>7} |")
+            print(f"{head} {leq:12.1f} {N:10.0f} {v_eff:13.4e} "
+                  f"{red:12.1f} {b2:10.3e} {'ok' if ok else 'NO':>9}")
+        print(f"{'':<14} {'':>10} {'':>7} | "
+              f"{'--> p = 1 is ' + ('FEASIBLE' if any_ok else 'REFUTED'):>60}")
+        out[who] = dict(p_implied=pi, feasible_iid=any_ok, F=F, raw=raw,
+                        neq=neq, fc=fc, note=note)
+    print("\nCeilings used, both measured in this repository:")
+    print(f"  layer-1 Hermite dictionary        {CEILING_HERMITE:5.2f}x  "
+          "(docs/hermite_rank_ceiling.md)")
+    print(f"  dictionary-free, top-8 eigen      {CEILING_EIGEN:5.2f}x  "
+          "(same, section 5.3 -- generous, nothing realises it)")
+    print(f"  bare per-sample variance v        {V_BARE:.4f}")
+    print("  bias floor of a cheap pass        docs/cost_floor.md section 3, "
+          "oracle Gaussian")
+    (art() / "rqmc" / "feasible.json").write_text(json.dumps(out, indent=1))
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", default="feasible",
+                    choices=("feasible", "unmetered", "all"))
+    a = ap.parse_args()
+    if a.mode in ("all", "unmetered"):
+        mode_unmetered()
+        print("\n" + "=" * 78 + "\n")
+    if a.mode in ("all", "feasible"):
+        mode_feasible()
     return 0
 
 

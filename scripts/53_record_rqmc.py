@@ -136,7 +136,9 @@ def record_redundancy(n: int, n_mlps: int, reps: int):
         mse_lattice_head_on=on["mse"],
         bias2_lattice_head_on=on["b2"], bias2_iid_head_on=iid_on["b2"],
         raw_final_layer_mse=on["mse"],
-        compute_ratio=None, seed=0, n_mlps=n_mlps, gt_samples=1_000_000_000,
+        # matched N in both arms, so the compute ratio is the draw overhead
+        # alone: 157 FLOPs/element = 1.51% of the pass (section 3).
+        compute_ratio=1.0151, seed=0, n_mlps=n_mlps, gt_samples=1_000_000_000,
         n_randomisations=reps,
         notes="MSE against the official 1e9 reference; variance and bias^2 "
               "separated across randomisations.",
@@ -193,10 +195,65 @@ def record_score(n_mlps: int):
           f"{projected:.4e} (bar {SHIP_GRADED_ADJUSTED:.4e})")
 
 
+def record_ship(n_mlps: int):
+    """The configuration recommended for the ship, paired against the iid arm
+    measured in the SAME run -- not the best-adjusted variant, which sits at
+    N = 49,999 with C/B = 0.615 and is 1.06x better at 1x residual and WORSE at
+    2x (``docs/rqmc.md`` section 7)."""
+    d = load("score.json")
+    if not d:
+        print("no score.json; skipping")
+        return
+    key_l = next((k for k in d if k.startswith("lat") and "n=24989" in k
+                  and "damp=0.0" in k), None)
+    key_i = next((k for k in d if k.startswith("iid") and "n=25000" in k
+                  and "damp=1.0" in k), None)
+    if not (key_l and key_i):
+        print("score.json lacks the shipping pair; skipping")
+        return
+    lat, iid = d[key_l], d[key_i]
+    ratio = lat["adj"] / iid["adj"]
+    e = Experiment(
+        name="rqmc_shipping_config",
+        script="scripts/51_rqmc_deploy.py",
+        hypothesis=(
+            "The RECOMMENDED shipping configuration -- lattice at N = 24,989 "
+            "(prime, CBC order-2 vector), tau = 2.5, P = 225, offline head OFF "
+            "-- projected onto the grader through the local iid arm measured in "
+            "the same run, is below the shipped graded 2.4646e-07.  N is kept at "
+            "the shipped operating point rather than the local argmin at 49,999, "
+            "because that point sits at C/B = 0.615, reverses under a 2x "
+            "residual, and is past the measured cache cliff."),
+        acceptance_bar=SHIP_GRADED_ADJUSTED,
+        bar_metric="projected_graded_adjusted",
+        bar_direction="lower_is_better",
+    )
+    e.record(
+        estimator="corrected_sparse_kernel(tau=2.5, n_samples=24989, "
+                  "n_pilot=225, beta=None, damp=0.0, x0_fn=lattice)",
+        projected_graded_adjusted=SHIP_GRADED_ADJUSTED * ratio,
+        local_adjusted_lattice=lat["adj"], local_adjusted_iid=iid["adj"],
+        local_adjusted_ratio=ratio,
+        local_adjusted_lattice_2x=lat["adj2"], local_adjusted_iid_2x=iid["adj2"],
+        raw_final_layer_mse=lat["raw"], raw_final_layer_mse_iid=iid["raw"],
+        raw_ratio=iid["raw"] / lat["raw"],
+        compute_ratio=lat["CB"], compute_ratio_iid=iid["CB"],
+        worst_mlp=lat["worst"], worst_mlp_iid=iid["worst"],
+        raises=lat["nfail"], seed=0, n_mlps=n_mlps,
+        gt_samples=1_000_000_000,
+        notes="Only the grader ranks.  Worst-MLP also improves 3.2x "
+              "(1.315e-05 -> 4.163e-06), which matters because the score is a "
+              "mean over MLPs and ours is worst-MLP dominated.",
+    )
+    print(f"recorded ship: local ratio {ratio:.4f} (raw "
+          f"{iid['raw'] / lat['raw']:.4f}x), projected graded "
+          f"{SHIP_GRADED_ADJUSTED * ratio:.4e} (bar {SHIP_GRADED_ADJUSTED:.4e})")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--what", default="all",
-                    choices=("all", "rate", "redundancy", "score"))
+                    choices=("all", "rate", "redundancy", "score", "ship"))
     ap.add_argument("--n-mlps", type=int, default=6)
     ap.add_argument("--N", type=int, default=24989)
     ap.add_argument("--reps", type=int, default=10)
@@ -207,6 +264,8 @@ def main() -> int:
         record_redundancy(a.N, a.n_mlps, a.reps)
     if a.what in ("all", "score"):
         record_score(100)
+    if a.what in ("all", "ship"):
+        record_ship(100)
     return 0
 
 

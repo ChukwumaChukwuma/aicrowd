@@ -7,10 +7,12 @@
 > `(1 - f_1) sigma^2 / N`" in the low-order-barrier section assumes the
 > order-`>= 2` remainder converges at the **iid** Monte Carlo rate, and the
 > retrodiction table compares mechanisms at a fixed `N`. Measured
-> (`docs/rqmc.md`): a randomly-shifted rank-1 lattice runs at `p = 1.078` in
-> `v = v_0/N^p` against iid's `p = 1.002`, and beats iid by 1.6–2.1x at matched
-> `N` — i.e. the assumption is nearly right about the exponent and wrong about
-> the constant. See the amendment at the end of the barrier section.
+> (`docs/rqmc.md`, seven doublings of `N`, six official MLPs): a randomly-shifted
+> rank-1 lattice runs at `p = 1.043 ± 0.023` in `v = v_0/N^p` against iid's
+> control `p = 0.974 ± 0.034`, and beats iid by 1.60–2.65x (mean 2.00x) at
+> matched `N`. So the assumption is nearly right about the **exponent** and wrong
+> about the **constant**, which is the one this page states as a bound. See the
+> amendment at the end of the barrier section.
 
 ## Statement
 
@@ -149,7 +151,7 @@ control variate is at most `1 / (1 - sum_{d<=k} f_d)`. For `k = 1`:
 | optimal linear control variate | 1.33x | 1.38x |
 | MLMC over rank-truncated nets | 0.94x | 1.38x |
 | Rao-Blackwell on decided neurons | 1.001x | 1.38x |
-| RQMC (first-order accelerated, rest at MC rate) | **1.60–2.13x** | 1.38x, and it is **exceeded** |
+| RQMC (first-order accelerated, rest at MC rate) | **1.60–2.65x, mean 2.00x** | 1.38x, and it is **exceeded** |
 
 RQMC deserves a word because it is not a control variate: it integrates the
 first-order part at a much faster rate and leaves the remainder at the Monte
@@ -160,17 +162,19 @@ Carlo rate, so its asymptotic variance is `(1 - f_1) sigma^2 / N` — the SAME
 interesting direction.** `docs/rqmc.md` §2: a randomly-shifted rank-1 lattice,
 six official MLPs, `N` = the primes just under `2^10 … 2^17`, variance across
 independent randomisations, iid arm as the control. The gain over iid at
-matched `N` is 1.60x / 1.80x / 2.01x / 1.73x / 2.13x at
-`N = 1021 / 2039 / 4093 / 8191 / 16381` — **above** the 1.38x this table
-predicted, because the lattice also reaches part of the order-2 mass, not only
-`f_1`.
+matched `N` is 1.601 / 1.802 / 2.014 / 1.725 / 2.130 / 2.346 / 1.734 / 2.648 at
+`N = 1021 / 2039 / 4093 / 8191 / 16381 / 32749 / 65521 / 131071` — **above** the
+1.38x this table predicted at every single `N`, because the lattice also reaches
+part of the order-2 mass, not only `f_1`.
 
 What survived is the *shape* of the prediction, which is the part that matters:
 it is a **constant, not a rate**. Fitted exponents in `v = v_0/N^p` are
-`p = 1.002 ± 0.065` for iid — the control, and it lands on 1 — against
-`p = 1.078 ± 0.059` for the lattice. `1 - f_1` still governs the asymptotics,
-so the ratio saturates rather than growing; it just saturates somewhat higher
-than `1/(1 - f_1)`.
+`p = 0.974 ± 0.034` for iid — the control, and it lands on 1 — against
+`p = 1.043 ± 0.023` for the lattice. Fitting the ratio directly, which cancels
+the shared MLP-to-MLP spread, gives `p_lattice − p_iid = 0.0686 ± 0.0307`: a
+detectable but useless 2.2-sigma rate difference. `1 - f_1` still governs the
+asymptotics, so the ratio saturates rather than growing; it just saturates
+somewhat higher than `1/(1 - f_1)`.
 
 **Scope warning: every bound on this page is a bound on `1/Var` at a fixed `N`,
 not on the exponent.** The retrodiction table compares mechanisms at one sample
@@ -178,8 +182,9 @@ count. A mechanism that changed `p` would not be bounded by anything here, and
 the sentence "its asymptotic variance is `(1-f_1) sigma^2/N`" quietly assumed
 that the order-`>= 2` remainder converges at exactly the Monte Carlo rate — an
 assumption, not a theorem, and the one place this section could have failed
-badly. It happens to be nearly right: the measured `p` is 1.08, not 2. But the
-argument was not entitled to it.
+badly. It happens to be nearly right: the measured `p` is 1.043, not 2. But the
+argument was not entitled to it, and the number it *did* state as a bound — the
+1.38x constant — is the one the measurement broke.
 
 **Constructive content.** A surrogate that helps must itself carry ANOVA mass at
 order ~15. Exactly two objects do:

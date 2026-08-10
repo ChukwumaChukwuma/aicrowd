@@ -179,6 +179,13 @@ def mode_rate(suite, n_mlps, seed, arms, ngrid, out):
     print(f"# N grid {ngrid}")
     print(f"# reps    {[REPS[n] for n in ngrid]}")
     store: dict = {}
+    if Path(out).is_file():
+        # Resume.  The sweep at N = 131,071 x 8 randomisations x 6 MLPs x 2 arms
+        # is over an hour of arithmetic and this box has restarted mid-run once;
+        # every (arm, N, mlp) cell already on disk is reused verbatim.
+        with np.load(out) as d:
+            store = {k: d[k] for k in d.files}
+        print(f"# resumed {len(store)} cells from {out}")
     t0 = time.time()
     for n in ngrid:
         reps = REPS[n]
@@ -199,7 +206,7 @@ def mode_rate(suite, n_mlps, seed, arms, ngrid, out):
                     W, n, reps, "iid" if arm == "iid" else "lat", zz, sds)
             print(f"  N={n:<7} mlp {mi + 1}/{len(seeds)} "
                   f"[{time.time() - t0:.0f}s]", flush=True)
-        np.savez_compressed(out, **store)
+            np.savez_compressed(out, **store)   # checkpoint per MLP, not per N
     print(f"saved {out}")
     report_rate(out, arms, ngrid, len(seeds))
 

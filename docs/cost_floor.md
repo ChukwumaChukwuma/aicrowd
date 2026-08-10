@@ -16,13 +16,26 @@
 >
 > How much that matters is now measured rather than assumed. `docs/rqmc.md` §2
 > sweeps `N` over seven doublings on the official MLPs and fits
-> `p = 1.002 +- 0.065` for iid (the control) and `p = 1.078 +- 0.059` for a
-> randomly-shifted rank-1 lattice. So the exponent is 1.08, not 2: above the
-> clamp `adjusted ~ N^-0.08`, a few per cent over the usable range of `N`, and
-> the identity below survives as an excellent approximation with `v_eff` read
-> at the operating `N`. What the lattice does buy is a **constant** — 1.6-2.1x
-> on `v_eff` at matched `N` — and a constant on `v_eff` is exactly what this
-> page's product is made of. It is priced in `docs/rqmc.md` §6, not here.
+> `p = 0.974 +- 0.034` for iid (the control) and `p = 1.043 +- 0.023` for a
+> randomly-shifted rank-1 lattice. So the exponent is 1.04, not 2: above the
+> clamp `adjusted ~ N^-0.04`, 3% over a doubling of `N`, and the identity below
+> survives as an excellent approximation with `v_eff` read at the operating `N`.
+> `docs/rqmc.md` §7 re-optimises `N` from scratch on the official 100-MLP suite
+> and confirms the optimum does not move — and finds, separately, that
+> `N ~ 100,000` raises `BudgetExhaustedError` on 92 of 100 MLPs, so `N` is hard
+> capped near 85,000 whatever the exponent turns out to be.
+>
+> What the lattice does buy is a **constant** — 1.60-2.65x (mean 2.00x) on the
+> bare sampler's variance at matched `N`, and 1.448x on the shipped estimator's
+> raw MSE end to end — and a constant on `v_eff` is exactly what this page's
+> product is made of. It is priced in `docs/rqmc.md` §6, not here.
+>
+> One thing §7 found that this page's `N`-cancellation hides entirely: at the
+> larger `N` the lattice makes attractive, the binding term is not the sampler
+> at all. Solving `raw = b^2 + v/N` across the sweep gives an `N`-independent
+> floor of `b^2 = 3.23e-07`, which is 31% of raw at `N = 25,000` and **71% at
+> `N = 50,000`** — and it is the PILOT (`P = 225`), whose error scales as `1/P`.
+> Halving the sampling variance doubles the pilot's share of what is left.
 
 `docs/graded.md` reduced a sampler's score to one product,
 

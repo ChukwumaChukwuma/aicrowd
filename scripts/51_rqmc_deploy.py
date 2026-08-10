@@ -279,8 +279,17 @@ def mode_score(suite, n_mlps, grid, tau, n_pilot, seed):
            f"{'adj@1x':>11} {'adj@2x':>11} {'raise':>5} {'worst':>10}")
     print(hdr)
     print("-" * len(hdr))
-    res = {}
+    # Written after EVERY variant, not at the end: a 100-MLP pass is ~15 minutes
+    # and this box has restarted mid-run once, taking a finished variant with it.
+    outp = art() / "score.json"
+    res = json.loads(outp.read_text()) if outp.is_file() else {}
     for name, fn in _variants(grid, tau, n_pilot, beta):
+        if name in res:
+            v = res[name]
+            print(f"{name:<44} {v['raw']:11.4e} {v['F'] / FLOP_BUDGET:7.4f} "
+                  f"{v['CB']:7.4f} {v['adj']:11.4e} {v['adj2']:11.4e} "
+                  f"{v['nfail']:5d} {v['worst']:10.3e}   (cached)")
+            continue
         mses, fls, rss, nfail, worst = [], [], [], 0, 0.0
         for i in range(n_mlps):
             Wn = make_official_mlp(WIDTH, DEPTH, suite.mlp_seeds[i])
@@ -307,7 +316,7 @@ def mode_score(suite, n_mlps, grid, tau, n_pilot, seed):
               f"{nfail:5d} {worst:10.3e}", flush=True)
         res[name] = dict(raw=raw, F=F, R=Rr, CB=C1 / FLOP_BUDGET,
                          adj=adj[0], adj2=adj[1], nfail=nfail, worst=worst)
-    (art() / "score.json").write_text(json.dumps(res, indent=1))
+        outp.write_text(json.dumps(res, indent=1))
     return res
 
 
