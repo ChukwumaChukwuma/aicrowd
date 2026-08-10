@@ -29,3 +29,4 @@ __pycache__/
 # Scratch
 _scratch/
 nohup.out
+!submission/bigcorr_head.npz
