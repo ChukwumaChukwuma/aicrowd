@@ -47,22 +47,6 @@ class _MLP:
 class _Ctx:
     submission_dir = str(ROOT / "submission")
     seed = 0
-    width = 256
-
-
-def _x0_fn(est, sub, width):
-    """The kernel's ``x0_fn``, driven by the ESTIMATOR's OWN lattice base.
-
-    The point of these tests is that the shipped feature block and the research
-    one are the same program, not that two independently written lattice-base
-    builders agree in the last bit.  Handing the kernel the estimator's base
-    isolates the first question; the base builder itself is pinned by
-    ``tests/test_rqmc.py``.
-    """
-    from whestfloor import rqmc
-
-    base = est._lattice_base(sub.N_SAMPLES, sub.RQMC_Z[:width])
-    return rqmc.lattice_x0_fn(base)
 
 
 def test_submission_fallback_matches_research_kernel():
@@ -153,8 +137,7 @@ def test_submission_matches_research_kernel():
     with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c2:
         b = np.asarray(kernels.corrected_sparse_kernel(
             W, tau=sub.TAU, n_samples=sub.N_SAMPLES, n_pilot=sub.N_PILOT,
-            seed=7, beta=beta, beta2=beta2, damp=sub.DAMP, kmax=sub.CV_KMAX,
-            x0_fn=_x0_fn(est, sub, 64)))
+            seed=7, beta=beta, beta2=beta2, damp=sub.DAMP, kmax=sub.CV_KMAX))
 
     assert a.shape == b.shape == (6, 64)
     assert np.array_equal(a, b), (
@@ -165,12 +148,10 @@ def test_submission_matches_research_kernel():
 
 
 def test_corrector_damp_zero_is_exactly_uncorrected():
-    """`DAMP = 0` must reproduce the UNCORRECTED LATTICE pass, bit for bit.
+    """`DAMP = 0` must reproduce the previous ship bit for bit.
 
-    The correction has to be ablatable through the identical code path, not by
-    swapping in a different program -- and under a lattice the thing it ablates
-    to is the previous ship (lattice, head off, graded 2.6767e-07), not the iid
-    sparse pass.
+    Bar 3 of the corrector work: the correction has to be ablatable through
+    the identical code path, not by swapping in a different program.
     """
     import warnings
 
@@ -194,10 +175,9 @@ def test_corrector_damp_zero_is_exactly_uncorrected():
     finally:
         sub.DAMP = old
     with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c2:
-        b = np.asarray(kernels.corrected_sparse_kernel(
+        b = np.asarray(kernels.sparse_mc_kernel(
             W, tau=sub.TAU, n_samples=sub.N_SAMPLES, n_pilot=sub.N_PILOT,
-            seed=21, beta=None, beta2=None,
-            x0_fn=_x0_fn(est, sub, 64)))
+            seed=21))
     assert np.array_equal(a, b)
     assert c1.flops_used == c2.flops_used
 
@@ -226,17 +206,14 @@ def test_missing_coefficient_file_degrades_not_fails():
         seed = 0
 
     est.setup(Bad())
-    assert est._beta is None and est._beta2 is None
-    good = sub.Estimator()
-    good.setup(_Ctx())
+    assert est._beta is None
     W = [fnp.asarray(x) for x in make_mlp(64, 6, seed=23)]
     with flops.BudgetContext(flop_budget=int(1e12), quiet=True):
         a = np.asarray(est.predict(_MLP(W, 29), int(1e12)))
     with flops.BudgetContext(flop_budget=int(1e12), quiet=True):
-        b = np.asarray(kernels.corrected_sparse_kernel(
+        b = np.asarray(kernels.sparse_mc_kernel(
             W, tau=sub.TAU, n_samples=sub.N_SAMPLES, n_pilot=sub.N_PILOT,
-            seed=29, beta=None, beta2=None,
-            x0_fn=_x0_fn(good, sub, 64)))
+            seed=29))
     assert np.array_equal(a, b)
 
 
@@ -275,16 +252,13 @@ def test_numpy_feature_extractor_matches_the_shipped_kernel():
     assert np.abs(pred_np - np.asarray(out)[-1]).max() < 1e-6
 
 
-def test_scaled_head_absent_degrades_to_the_uncorrected_lattice_pass():
-    """A missing scaled head must NOT fall back to the 15-float one.
+def test_scaled_head_absent_degrades_to_the_fifteen_float_head():
+    """The ladder has THREE rungs and the middle one must be reachable.
 
-    The 15-float head is measured at **0.922x under a lattice** -- actively
-    harmful, because `cv1` is provably the optimal input-linear control variate
-    and a rank-1 lattice annihilates exactly those first-order ANOVA terms, so
-    its coefficients are fitted against a residual the lattice has already
-    removed.  The correct degradation is therefore the uncorrected lattice pass,
-    which is itself the previous ship.  This asserts the estimator does not
-    "helpfully" reach for the wrong head.
+    A corrupt or missing `bigcorr_head.npz` must leave the previously shipped
+    15-float head running, not no head at all -- and it must be the SAME
+    15-float estimator that every number in `docs/learned_corrector.md` was
+    measured with, bit for bit and FLOP for FLOP.
     """
     import warnings
 
@@ -298,7 +272,6 @@ def test_scaled_head_absent_degrades_to_the_uncorrected_lattice_pass():
     sub = _load_submission()
     est = sub.Estimator()
     est.setup(_Ctx())
-    assert est._beta is not None, "the 15-float vector is still shipped"
     est._beta2 = None                      # as if the file were unreadable
     W = [fnp.asarray(x) for x in make_mlp(64, 6, seed=3)]
     with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c1:
@@ -306,7 +279,8 @@ def test_scaled_head_absent_degrades_to_the_uncorrected_lattice_pass():
     with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c2:
         b = np.asarray(kernels.corrected_sparse_kernel(
             W, tau=sub.TAU, n_samples=sub.N_SAMPLES, n_pilot=sub.N_PILOT,
-            seed=7, beta=None, beta2=None, x0_fn=_x0_fn(est, sub, 64)))
+            seed=7, beta=np.asarray(est._beta), damp=sub.DAMP,
+            kmax=sub.CV_KMAX))
     assert np.array_equal(a, b)
     assert c1.flops_used == c2.flops_used
 
@@ -314,15 +288,16 @@ def test_scaled_head_absent_degrades_to_the_uncorrected_lattice_pass():
 def test_scaled_head_matches_the_numpy_generator():
     """The training features and the deployed features must be the same map.
 
-    `whestfloor.bigcorr.extract` built every row the 26 coefficients were fitted
-    on, ON LATTICE DRAWS; the flopscope path is what runs at grade time.  They
-    are not bitwise equal -- the generator accumulates in float64, the shipped
-    path stays in float32 outside the Gram solve -- so this pins the agreement at
+    `whestfloor.bigcorr.extract` built every row the 20 coefficients were
+    fitted on; the flopscope path is what runs at grade time.  They are not
+    bitwise equal -- the generator accumulates in float64, the shipped path
+    stays in float32 outside the Gram solve -- so this pins the agreement at
     1e-6 absolute, three orders below the ~1e-3 residual being predicted.
 
-    It also pins the COLUMN ORDER, which is the one thing a silent change would
-    make catastrophic rather than merely wrong: `beta` is indexed by position,
-    so a permuted design still runs and still returns finite numbers.
+    It also pins the COLUMN ORDER, which is the one thing a silent change
+    would make catastrophic rather than merely wrong: `beta` is indexed by
+    position and a permuted design would still run and still return finite
+    numbers.
     """
     import warnings
 
@@ -331,26 +306,21 @@ def test_scaled_head_matches_the_numpy_generator():
     import flopscope.numpy as fnp
 
     from whestfloor import bigcorr as BC
-    from whestfloor import kernels, rqmc
+    from whestfloor import kernels
     from whestfloor.mc import make_mlp
 
     sub = _load_submission()
-    channels = ("mfv2", "cv1mf", "cv1", "cv2", "mfv", "dpilot", "mfm")
+    channels = ("relu1", "mfv2", "mfm", "dpilot", "cv1")
     expect = ["one", "s", "Phi", "phi", "alpha"]
     for k in channels:
         expect += [k, f"{k}*Phi", f"{k}*alpha"]
     assert list(sub.FEATURES2) == expect
-    assert kernels.DESIGN2[len(expect)] == channels
 
-    n, d = 1201, 128
-    z = rqmc.get_z(n, d, kind="roberts")
-    base = rqmc.lattice_rows(0, n, n, z)
     rng = np.random.default_rng(0)
     beta2 = (rng.standard_normal(len(expect)) * 1e-3).astype(np.float32)
-    Wn = make_mlp(d, 8, 4242)
-    f = BC.extract(Wn, seed=4242, tau=2.5, n_samples=n, n_pilot=60, kmax=2,
-                   want_relu1=False, want_q2=False,
-                   x0_fn=BC.lattice_x0_fn(base))
+    Wn = make_mlp(128, 8, 4242)
+    f = BC.extract(Wn, seed=4242, tau=2.5, n_samples=1200, n_pilot=60,
+                   kmax=1, want_relu1=True, want_q2=False)
     cols = [np.ones_like(f["alpha"]), f["s"], f["Phi"], f["phi"], f["alpha"]]
     for k in channels:
         cols += [f[k], f[k] * f["Phi"], f[k] * f["alpha"]]
@@ -359,8 +329,8 @@ def test_scaled_head_matches_the_numpy_generator():
     W = [fnp.asarray(w) for w in Wn]
     with flops.BudgetContext(flop_budget=int(1e12), quiet=True):
         out = kernels.corrected_sparse_kernel(
-            W, tau=2.5, n_samples=n, n_pilot=60, seed=4242, beta2=beta2,
-            safe=False, x0_fn=rqmc.lattice_x0_fn(fnp.asarray(base)))
+            W, tau=2.5, n_samples=1200, n_pilot=60, seed=4242, beta2=beta2,
+            safe=False)
     assert np.abs(pred_np - np.asarray(out)[-1]).max() < 1e-6
 
 
@@ -386,14 +356,14 @@ def test_scaled_head_raise_still_falls_back_to_dense():
     est.setup(_Ctx())
     W = [fnp.asarray(x) for x in make_mlp(64, 6, seed=31)]
 
-    good = est._transport
-    est._transport = lambda *a, **k: (_ for _ in ()).throw(
+    good = est._transport_pair
+    est._transport_pair = lambda *a, **k: (_ for _ in ()).throw(
         RuntimeError("probe"))
     try:
         with flops.BudgetContext(flop_budget=int(1e12), quiet=True):
             out = np.asarray(est.predict(_MLP(W, 33), int(1e12)))
     finally:
-        est._transport = good
+        est._transport_pair = good
     assert out.shape == (6, 64)
     assert np.isfinite(out).all()
 
