@@ -117,6 +117,18 @@ that would separate them costs 44% of `N`. Same shape as `cva`, a different
 reason — hence the standing rule this round adds: **quote every new dictionary
 twice, jointly fitted and at deployable block weights on unbiased true MSE.**
 
+**The scaled offline corrector is SHIPPED** (`docs/big_corrector.md` §9).
+`submission/estimator.py` now computes three new exactly-mean-zero channels in
+flopscope-only form — `relu1`, the layer-1 covariance gap contracted through
+the exactly-known `Cov(z²)` (`mfv2`), and an exact-chain-rule transport from
+the layer-2 anchor (`mfm`, replacing `cv1mf`) — and the k=2 Hermite block is
+gone, because it is not selected once `mfv2` is present. **20 coefficients,
+342 bytes, +289 dispatches and +0.149% of `B` in FLOPs**, for **1.296×** on the
+held-out test split. `scripts/35_package.py` reports SHIPPABLE: setup 0.272 s
+against the 5 s cap with both npz files, `fnp.load` of both at 0 FLOPs,
+`(32, 256)` all-finite, no denied module on any path. On the official 100:
+raw **1.0722e-06**, `F/B` 0.2680, **0 raises**.
+
 **The offline-trained corrector has now been scaled, and it saturates**
 (`docs/big_corrector.md`). 475 freshly generated MLPs × 4 estimator seeds at
 the *deployed* `(τ, N, P) = (2.5, 25000, 225)`, split by MLP seed, gives

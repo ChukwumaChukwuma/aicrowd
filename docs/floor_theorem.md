@@ -1,5 +1,17 @@
 # The floor is a theorem, and it bounds everyone
 
+> **Scope.** The `vbar/N` floor in §1 binds *every* estimator, iid or not — it
+> is a statement about the reference's own noise and uses nothing about how the
+> estimator samples. Everything downstream of it that mentions a **rate** does
+> not. In particular the sentence "its asymptotic variance is
+> `(1 - f_1) sigma^2 / N`" in the low-order-barrier section assumes the
+> order-`>= 2` remainder converges at the **iid** Monte Carlo rate, and the
+> retrodiction table compares mechanisms at a fixed `N`. Measured
+> (`docs/rqmc.md`): a randomly-shifted rank-1 lattice runs at `p = 1.078` in
+> `v = v_0/N^p` against iid's `p = 1.002`, and beats iid by 1.6–2.1x at matched
+> `N` — i.e. the assumption is nearly right about the exponent and wrong about
+> the constant. See the amendment at the end of the barrier section.
+
 ## Statement
 
 Let `p` be any estimator measurable with respect to the information available at
@@ -137,13 +149,37 @@ control variate is at most `1 / (1 - sum_{d<=k} f_d)`. For `k = 1`:
 | optimal linear control variate | 1.33x | 1.38x |
 | MLMC over rank-truncated nets | 0.94x | 1.38x |
 | Rao-Blackwell on decided neurons | 1.001x | 1.38x |
-| RQMC (first-order accelerated, rest at MC rate) | pending | 1.38x |
+| RQMC (first-order accelerated, rest at MC rate) | **1.60–2.13x** | 1.38x, and it is **exceeded** |
 
 RQMC deserves a word because it is not a control variate: it integrates the
 first-order part at a much faster rate and leaves the remainder at the Monte
 Carlo rate, so its asymptotic variance is `(1 - f_1) sigma^2 / N` — the SAME
-1.38x ceiling, reached from a different direction. A 1.5x bar is therefore
-unreachable, and this is a prediction made before the measurement lands.
+1.38x ceiling, reached from a different direction.
+
+**That last row is now measured, and the prediction was wrong in the
+interesting direction.** `docs/rqmc.md` §2: a randomly-shifted rank-1 lattice,
+six official MLPs, `N` = the primes just under `2^10 … 2^17`, variance across
+independent randomisations, iid arm as the control. The gain over iid at
+matched `N` is 1.60x / 1.80x / 2.01x / 1.73x / 2.13x at
+`N = 1021 / 2039 / 4093 / 8191 / 16381` — **above** the 1.38x this table
+predicted, because the lattice also reaches part of the order-2 mass, not only
+`f_1`.
+
+What survived is the *shape* of the prediction, which is the part that matters:
+it is a **constant, not a rate**. Fitted exponents in `v = v_0/N^p` are
+`p = 1.002 ± 0.065` for iid — the control, and it lands on 1 — against
+`p = 1.078 ± 0.059` for the lattice. `1 - f_1` still governs the asymptotics,
+so the ratio saturates rather than growing; it just saturates somewhat higher
+than `1/(1 - f_1)`.
+
+**Scope warning: every bound on this page is a bound on `1/Var` at a fixed `N`,
+not on the exponent.** The retrodiction table compares mechanisms at one sample
+count. A mechanism that changed `p` would not be bounded by anything here, and
+the sentence "its asymptotic variance is `(1-f_1) sigma^2/N`" quietly assumed
+that the order-`>= 2` remainder converges at exactly the Monte Carlo rate — an
+assumption, not a theorem, and the one place this section could have failed
+badly. It happens to be nearly right: the measured `p` is 1.08, not 2. But the
+argument was not entitled to it.
 
 **Constructive content.** A surrogate that helps must itself carry ANOVA mass at
 order ~15. Exactly two objects do:

@@ -248,7 +248,7 @@ the same networks so the ratio is the only thing that has to transfer.
 | random features, 4,096 | 131,185 | 1.1457e-06 | 1.787 | 1.219 |
 | per-neuron MLP, 64 hidden (boosted) | 7,361 | 1.6512e-06 | 1.240 | 0.846 |
 | per-neuron MLP, 256-128 (boosted) | 62,209 | 1.6656e-06 | 1.229 | 0.838 |
-| **selected 32-column head (shipped artifact)** | **32** | **1.0857e-06** | **1.886** | **1.286** |
+| **selected 20-column head (SHIPPED)** | **20** | **1.0771e-06** | **1.901** | **1.296** |
 
 Refitting the shipped design at the deployed operating point is worth 1.049x —
 real but small, and *not* for the reason the module docstring first guessed:
@@ -442,51 +442,150 @@ depth ladder of that trade (`docs/integrable_cv.md` runs the analogous one for
 the mean) is the next thing to run, and it is the only remaining direction in
 which this family is not already at its ceiling.
 
-## 9. Handoff
+## 9. Shipped
 
-Artifact: **`submission/bigcorr_head.npz`, 390 bytes** — one float32 vector of
-32 coefficients and nothing else. Verified: `fnp.load` returns it at **0
-FLOPs in 1.0 ms**. It carries no strings, because `fnp.load` rejects any
-non-numeric dtype outright ("object dtype would require pickle"), so a column-
-name array in the shipped file is a hard failure at setup rather than a
-warning; the names live in the sidecar
-`_artifacts/bigcorr/bigcorr_head.npz.json`, which the submission never reads.
+`submission/estimator.py` now carries the scaled head. Three channels were
+ported into flopscope-only form -- `relu1` (exact-mean control variate on
+`relu(z^1)`, arc-cosine Gram, split-sample), `mfv2` (the layer-1 covariance gap
+contracted through the exactly-known `Cov(z^2)` and transported forward) and
+`mfm` (the same transport started from the exact layer-2 mean anchor, replacing
+`cv1mf`) -- and `cv2`, the k=2 Hermite block, is **gone**, because it is not
+selected once `mfv2` is present. That removes its Gram, its solve and its pass
+over the `(N, width)` array.
 
-Regenerable bit-identically by
+### 9.1 What it costs, measured
+
+Width 256, depth 32, `N = 25000`, real `BudgetContext`, same MLP both arms:
+
+| | dispatches | `F` | `F/B` |
+|---|---|---|---|
+| 15-float head | 563 | 70,897,895,720 | 0.26065 |
+| **scaled head** | **852** | **71,302,456,788** | **0.26214** |
+| delta | **+289** | **+404,561,068** | **+0.1487%** |
+
+At ~22 us a dispatch the 289 extra calls are 6.4 ms of billed residual, i.e.
+0.234% of `B` at `lambda = 1e11`. Total **0.38% of `B`**, which against
+`C/B ~ 0.28` is **+1.4% on the multiplier** for a 29.6% accuracy gain.
+
+248 of the 289 are the transport recursion, and they are already batched three
+ways: the two channels are the two columns of one `(width, 2)` array so one
+pair of matmuls serves both; the `1/(2s)` factor is folded into `phi` and into
+the variance gain once for all layers; and every per-layer coefficient is built
+in one dispatch on the stacked `(depth, width)` block. That is 8 dispatches a
+layer against the 14 two separate scalar recursions would need -- 248 rather
+than 868. A further 124 could go by fusing the two 2x2 mixes into one
+`einsum('nij,njc->nic')`, worth ~2.7 ms; it is not done, because it changes the
+summation order on the shipped path for 0.1% of `B` and this had to ship today.
+
+### 9.2 Packaging
+
+`scripts/35_package.py`: **SHIPPABLE**, 16,932 B tarball.
+
+| check | result |
+|---|---|
+| setup wall time, both npz loaded | **0.272 s** against the 5.0 s cap |
+| `fnp.load` of BOTH files together | **0 FLOPs**, 1.2 ms |
+| `predict` | `(32, 256)`, all 8192 finite |
+| `F` in the sandbox | 72,068,032,410 = 26.50% of `B` |
+| `C` in the sandbox | 8.156e10 = 29.99% of `B` (`R = 0.0949 s`) |
+| denied modules | none, on any code path; imports are `__future__`, `flopscope`, `flopscope.numpy`, `os`, `whestbench` |
+| archive contents | 2 plain `.npy` arrays, no pickle |
+
+`bigcorr_head.npz` is **342 bytes**. Both files are numeric-only: `fnp.load`
+refuses any other dtype outright ("object dtype would require pickle"), so a
+column-name array in either would be a hard failure at setup rather than a
+warning. The names live in a sidecar JSON the submission never reads.
+
+### 9.3 The degradation ladder, and one bug it caught
+
+Three rungs, each pinned by a test in `tests/test_submission_parity.py`:
+scaled head, then the 15-float head if `bigcorr_head.npz` will not load, then
+the uncorrected sparse pass if neither will. The two files are loaded in
+separate `try` blocks so a corrupt scaled head degrades to the previous ship
+rather than to no head. `DAMP = 0` still reproduces the uncorrected estimator
+bit for bit and FLOP for FLOP, and a forced raise *inside* the new block --
+not at the outer boundary -- still falls back to the dense pass.
+
+That last test exists because this session already lost a submission to a
+`SymmetryError` on official MLP 19 that eight local suites never produced. The
+new block adds an `eigh`, an `arcsin` and a boolean-masked scatter, so the
+guard is asserted against a failure inside it.
+
+**A bug the parity test caught, worth recording.** The first port hard-coded
+`1/2 - 1/(2 pi)` as `0.4204482076268573`; it is `0.3408450569081046`. The
+estimator still ran, still returned finite numbers and still passed the
+shape/finiteness/budget checks -- the only thing that caught it was the bitwise
+comparison against `whestfloor/kernels.py`, at `max |diff| = 1.77e-01`. That is
+exactly the failure mode the parity test exists for, and it is why the shipped
+head is written twice and asserted equal rather than written once.
+
+### 9.4 The coefficients are conditional on iid sampling at N = 25000
+
+Both things matter and neither is a free parameter of the head:
+
+- **iid.** The fitted coefficients absorb the `p/N` estimation noise of each
+  control variate, which is a property of the sampler. A randomised QMC lattice
+  changes the correlation structure of the scored draw and therefore changes
+  the optimal shrinkage -- the channels stay exactly mean zero (each lattice
+  point is marginally an exact standard Gaussian), so nothing becomes biased,
+  but the weights stop being optimal.
+- **`N = 25000`.** The correction columns scale as `N^-1/2` and so does the
+  target, but the noise-to-signal ratio inside each channel does not.
+
+If either changes, re-run `--mode data` (the generator takes `--n-samples` and
+an `x0_fn`-equivalent is a one-line change) and then `--mode export`. Selection
+is validation-driven and needs no hand-tuning; the whole refit is two commands.
+
+## 10. Reproducing the artifact
+
+`submission/bigcorr_head.npz` — **342 bytes**, one float32 vector of **20**
+coefficients and nothing else. Regenerable bit-identically by
 
 ```
-scripts/45_big_corrector.py --mode data   --sub bigcorr --n-mlps 6000 \
+scripts/45_big_corrector.py --mode data --sub bigcorr --n-mlps 6000 \
     --n-seeds 4 --n-gt 32768 --block 25 --shard {0,1,2} --n-shards 3
-scripts/45_big_corrector.py --mode export --out bigcorr_head.npz
+scripts/45_big_corrector.py --mode export --drop mfv2g --out bigcorr_head.npz
 ```
 
-Loader contract — `beta` is a plain float32 vector, `fnp.load` bills 0 FLOPs:
-
-```python
-beta = fnp.load(os.path.join(d, "bigcorr_head.npz"))["beta"]   # (32,)
-corr = fnp.stack(cols, axis=1) @ beta                          # (width,)
-return fnp.concatenate([mean_h[:-1], (mu + corr)[None, :]], axis=0)
-```
-
-`cols`, in this exact order (14 shape, then 6 channels x {1, `Phi`, `alpha`}):
+`--mode export` selects the channel set by greedy forward selection on the
+VALIDATION split, then ablates the optional blocks, then reads test once. The
+final selection was:
 
 ```
-one  s  Phi  phi  alpha  sd_mc  gam1  gam2  alpha_p  wn1  w43  vbar  arms  keep_frac
-relu1  relu1*Phi  relu1*alpha        mfv2   mfv2*Phi   mfv2*alpha
-mfm    mfm*Phi    mfm*alpha          dpilot dpilot*Phi dpilot*alpha
-mfv2g  mfv2g*Phi  mfv2g*alpha        cv1    cv1*Phi    cv1*alpha
++ relu1    val 1.4856e-06  1.554x        + pooled u1/u2 terms   rejected
++ mfv2     val 1.3861e-06  1.666x        - shape eigen          DROPPED
++ mfm      val 1.3050e-06  1.769x        - shape cumulants      DROPPED
++ dpilot   val 1.3005e-06  1.775x        - shape weightcols     DROPPED
++ cv1      val 1.3001e-06  1.776x        - shape suite          DROPPED
+                                         - shape pilot alpha    DROPPED
+                                         - shape sd_mc          DROPPED
 ```
 
-The three channels the shipped estimator does not yet compute are `relu1`
-(`corrector.relu1_cv`), `mfv2`/`mfv2g` (`bigcorr.transport` from layer 2 with
-`dvz2 = mean_s (z^2 - m2)^2 - diag(Cov(z^2))`) and `mfm` (`bigcorr.transport`
-with `dm2 = W^2' dmu1`, which replaces `cv1mf`). Billed cost of the whole new
-block, measured in a real `BudgetContext`: **2.35e8 FLOPs, 0.086% of `B`**, of
-which 1.01e8 is the scored-pass gates for `mfv2g` and 6.91e7 is the exact
-`diag Cov(z^2)`. `vbar`, `arms`, `keep_frac`, `gam1`, `gam2`, `sd_mc` and
-`alpha_p` are all already available or one reduction away.
+Every optional block was dropped, which is why the shipped design is 20 columns
+rather than 83 and why the power iteration for `u1`/`u2` is not in the shipped
+kernel at all. `mfv2g` — the same variance channel with gates re-estimated from
+4,096 scored rows — was force-dropped before selection: it was worth 0.0003x on
+validation and would have cost ~440 dispatches (32 layers of gate reductions
+plus a second transport).
 
-## 10. Honest caveats
+The column order is FROZEN and asserted against the generator by
+`tests/test_submission_parity.py::test_scaled_head_matches_the_numpy_generator`,
+which also pins the flopscope path to `bigcorr.extract` at 1e-6 absolute:
+
+```
+one  s  Phi  phi  alpha
+relu1   relu1*Phi   relu1*alpha
+mfv2    mfv2*Phi    mfv2*alpha
+mfm     mfm*Phi     mfm*alpha
+dpilot  dpilot*Phi  dpilot*alpha
+cv1     cv1*Phi     cv1*alpha
+```
+
+The shape columns are computed from `HEAD_ROWS = 4096` rows of the scored
+draw, not the full sample. That is part of the contract, not an optimisation
+detail: the coefficients were fitted against columns computed exactly that way.
+
+## 11. Honest caveats
 
 - **The graded number is a projection, not a measurement.** §5's model
   reproduces the shipped point to 0.2% and its argmin to 3%, but it has been

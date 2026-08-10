@@ -1,9 +1,33 @@
 # The cost lever is closed: 1.13x, not 6-9x, and here is the bound
 
+> **Scope: this page is about IID samplers.** The identity below is obtained by
+> substituting `raw = v_eff/N` into `adjusted = raw * max(0.1, C/B)`, at which
+> point `N` cancels. `raw = v_eff/N` is the `p = 1` case. For a sampler with
+> `raw = v/N^p`, above the clamp,
+>
+> ```
+> adjusted  =  v (F0 + lambda R) / (B N^p)   +   v c / (B N^(p-1))
+> ```
+>
+> which is flat in `N` only at `p = 1`; at `p > 1` it keeps falling and the
+> optimum runs to the largest affordable `N` rather than sitting anywhere
+> interior. Every "no sampler can reach it" conclusion on this page is
+> therefore a statement about **iid** samplers.
+>
+> How much that matters is now measured rather than assumed. `docs/rqmc.md` §2
+> sweeps `N` over seven doublings on the official MLPs and fits
+> `p = 1.002 +- 0.065` for iid (the control) and `p = 1.078 +- 0.059` for a
+> randomly-shifted rank-1 lattice. So the exponent is 1.08, not 2: above the
+> clamp `adjusted ~ N^-0.08`, a few per cent over the usable range of `N`, and
+> the identity below survives as an excellent approximation with `v_eff` read
+> at the operating `N`. What the lattice does buy is a **constant** — 1.6-2.1x
+> on `v_eff` at matched `N` — and a constant on `v_eff` is exactly what this
+> page's product is made of. It is priced in `docs/rqmc.md` §6, not here.
+
 `docs/graded.md` reduced a sampler's score to one product,
 
 ```
-adjusted  =  v_eff * c / B          (B = 2.72e11)
+adjusted  =  v_eff * c / B          (B = 2.72e11)     [p = 1 only]
 ```
 
 with `v_eff` the residual per-sample variance and `c` the **billed FLOPs per
@@ -302,3 +326,23 @@ refutes. What is left is `v_eff` — where the *Hermite* family is capped at
 1.76x but `docs/hermite_rank_ceiling.md` §5.3's dictionary-free bound is not
 (top-8 eigenfunctions of `Cov(y)` reach 90.1%, i.e. 10x) — and the
 deterministic arm, where the leader is.
+
+### 6.1 And the leader really is deterministic — measured, not inferred
+
+§3 argued from an irreducible-`b^2` table that submission 323861 "is not a
+cheap-per-sample sampler". The leaderboard telemetry now says it directly, for
+the whole top of the board (`scripts/52_leader_rate.py`, `docs/rqmc.md` §1).
+Four of dpskv5's graded submissions ran at `N_eq = F/4.198656e6 = 0.5` — half a
+dense forward pass of billed compute for the entire 100-MLP prediction — and
+scored raw `5.0e-8` to `7.9e-8`, where a sampler with `v = 0.045` scores 0.09.
+And regressing `ln raw` on `ln N_eq` *within* an entry, which eliminates `v`,
+gives `p = 0.310` (dpskv5, 4 submissions over `N_eq` 152 to 42,028),
+`p = 0.814` (huang_chung_yi) and `p = -0.151` (joe_wanza). The sharpest pair is
+dpskv5 cutting compute 7.26x in 3.5 hours and moving raw by +2.1%
+(`p = 0.010`), which took their adjusted score from 5.83e-9 to 3.63e-10 —
+16.1x, all of it from the multiplier reaching the clamp.
+
+`raw` flat in `N` is a bias floor. So the top of the board is spending its
+whole optimisation on `C`, exactly as this page says the endgame must be for
+anyone whose `raw` has stopped moving — and its `raw` is model error, which is
+the arm this page does not bound.

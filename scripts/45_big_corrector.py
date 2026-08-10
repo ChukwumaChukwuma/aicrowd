@@ -845,19 +845,37 @@ def mode_export(lams, out_name: str, pool=POOL, drop=()) -> None:
     sh, pool = SH, ()
     SH_NOEIG = tuple(k for k in SH
                      if k not in ("u1", "u2", "lam1", "lam2"))
+    # Shape BLOCKS, dropped one at a time.  These columns were carried into
+    # the design wholesale and never ablated individually; each one that
+    # survives costs dispatches in the shipped kernel, and dispatch time is
+    # billed at lambda, so the prior is to drop.
+    SH_BLOCKS = {"eigen": ("u1", "u2", "lam1", "lam2"),
+                 "cumulants": ("gam1", "gam2"),
+                 "weightcols": ("wn1", "w43"),
+                 "suite": ("vbar", "arms", "keep_frac"),
+                 "pilot alpha": ("alpha_p",),
+                 "sd_mc": ("sd_mc",)}
     # An ADDITION must beat the incumbent by 0.2%; a REMOVAL is taken unless
     # it loses by more than 0.2%.  Both thresholds point the same way -- toward
     # the cheaper design -- which is the right prior when the expensive block
     # (the power iteration) is 0.15% of the whole FLOP budget and the
     # difference it makes is 0.1% of a validation number.
-    for lbl, sh_, pl_, add in (("+ pooled u1/u2 terms", SH, POOL, True),
-                               ("- eigen shape cols", SH_NOEIG, (), False)):
-        v_ = try_set(cur, sh_, pl_)[0]
-        keep = (v_ < best_v * 0.998) if add else (v_ < best_v * 1.002)
-        print(f"  {lbl:<22} val {v_:11.4e}  {base_v / v_:6.3f}x   "
-              f"{'ADOPTED' if keep else 'rejected'}")
-        if keep:
-            best_v, sh, pool = v_, sh_, pl_
+    v_ = try_set(cur, SH, POOL)[0]
+    keep = v_ < best_v * 0.998
+    print(f"  {'+ pooled u1/u2 terms':<22} val {v_:11.4e}  "
+          f"{base_v / v_:6.3f}x   {'ADOPTED' if keep else 'rejected'}")
+    if keep:
+        best_v, pool = v_, POOL
+    for bname, bcols in SH_BLOCKS.items():
+        cand = tuple(k for k in sh if k not in bcols)
+        if cand == sh:
+            continue
+        v_ = try_set(cur, cand, pool)[0]
+        drop_it = v_ < best_v * 1.002
+        print(f"  - shape {bname:<14} val {v_:11.4e}  {base_v / v_:6.3f}x   "
+              f"{'DROPPED' if drop_it else 'kept'}")
+        if drop_it:
+            best_v, sh = v_, cand
     ch = cur
     vv, lam, beta, names = try_set(ch, sh, pool)
     Xx, _, _ = design(px, ch, sh, MOD, pool)
