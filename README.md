@@ -117,17 +117,40 @@ that would separate them costs 44% of `N`. Same shape as `cva`, a different
 reason — hence the standing rule this round adds: **quote every new dictionary
 twice, jointly fitted and at deployable block weights on unbiased true MSE.**
 
-**The scaled offline corrector is SHIPPED** (`docs/big_corrector.md` §9).
-`submission/estimator.py` now computes three new exactly-mean-zero channels in
+**The scaled offline corrector is NOT shipped, and the reason is a mechanism**
+(`docs/big_corrector.md` §11). A randomised rank-1 lattice beats it and the two
+do not compose: the `k=1` Hermite block is *provably* the optimal input-linear
+control variate, and a lattice equidistributed in every 1-D projection
+annihilates exactly those first-order ANOVA terms, so the head's coefficients
+were fitted against a residual whose first-order part the lattice has already
+removed. Measured here on 75 held-out networks, the iid-fitted head reads
+**0.921x** under a lattice — reproducing the sibling's 0.922x independently.
+Per channel, iid → lattice: `cv1` 1.321x → **0.374x**, `relu1` 1.556x →
+**0.541x**, `mfm` 1.529x → 0.989x, while the two *variance* channels survive
+untouched (`mfv` 1.100x → 1.091x, `mfv2` 1.146x → 1.055x) because they are
+degree-2 objects. `cv1` at 0.374x is the finding: a merely redundant channel
+would read 1.000x, and the cause is that the first `N/2` points of
+`frac(i z / N)` are a contiguous *arc*, so the split-sample `dbar` is noise
+while the full-sample mean it stands in for is nearly exact.
+
+**Refitted on lattice draws it clears its bar on the point estimate**:
+`1.1324x` against `damp = 0` under a lattice, paired on 75 held-out networks,
+95% bootstrap CI `[1.0688, 1.1978]` — so the interval does not exclude a miss,
+and 45 → 75 test MLPs did not tighten it. `heads/lattice_head.npz`, 342 bytes,
+20 coefficients, `submission/` untouched.
+
+**The scaled offline corrector, ported and measured** (`docs/big_corrector.md` §9).
+`whestfloor/kernels.py` computes three new exactly-mean-zero channels in
 flopscope-only form — `relu1`, the layer-1 covariance gap contracted through
 the exactly-known `Cov(z²)` (`mfv2`), and an exact-chain-rule transport from
 the layer-2 anchor (`mfm`, replacing `cv1mf`) — and the k=2 Hermite block is
 gone, because it is not selected once `mfv2` is present. **20 coefficients,
 342 bytes, +289 dispatches and +0.149% of `B` in FLOPs**, for **1.296×** on the
-held-out test split. `scripts/35_package.py` reports SHIPPABLE: setup 0.272 s
-against the 5 s cap with both npz files, `fnp.load` of both at 0 FLOPs,
-`(32, 256)` all-finite, no denied module on any path. On the official 100:
-raw **1.0722e-06**, `F/B` 0.2680, **0 raises**.
+held-out test split. It was ported into `submission/estimator.py` and
+`scripts/35_package.py` reported SHIPPABLE (setup 0.272 s of the 5 s cap with
+both npz files, `fnp.load` of both at 0 FLOPs, `(32, 256)` all-finite, no denied
+module, official 100: raw **1.0722e-06**, `F/B` 0.2680, **0 raises**) — and the
+port was then reverted, because the lattice above supersedes it.
 
 **The offline-trained corrector has now been scaled, and it saturates**
 (`docs/big_corrector.md`). 475 freshly generated MLPs × 4 estimator seeds at

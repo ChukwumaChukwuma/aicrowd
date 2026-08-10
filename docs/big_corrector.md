@@ -700,9 +700,88 @@ permutation of a table built once in `setup`, so it costs nothing at grade
 time, and it should restore `cv1`, `cv2` and `relu1` to informative — or, at
 worst, to a correct 1.000x instead of 0.374x.
 
-### 11.5 Result
+### 11.5 Result: the refit clears the bar on the point estimate, and the
+interval does not exclude a miss
 
-*(pending — the full 475-MLP lattice set is in flight)*
+375 MLPs of the lattice set x 4 Cranley-Patterson shifts, split by MLP seed,
+**75 held-out test networks**. Selection is validation-only (greedy forward over
+channels, then the optional blocks); the test split is read once.
+
+```
++ mfv2g    val 1.0547e-06  1.097x        + pooled u1/u2 terms   rejected
++ cv1mfg   val 1.0165e-06  1.138x        - every shape block    DROPPED
++ dpilot   val 1.0130e-06  1.142x
++ cv1      val 1.0106e-06  1.144x
++ mfv2     val 1.0097e-06  1.146x
+```
+
+> **held-out TEST against `damp = 0` under a lattice, paired on the same 75
+> networks: `1.1324x`, 95% bootstrap CI over MLPs `[1.0688, 1.1978]`.**
+
+**Verdict against the pre-registered `>= 1.10x`: PASS on the point estimate,
+and the interval does not exclude a miss.** The lower bound is 1.069. Going
+from 45 to 75 test MLPs moved the interval from `[1.0703, 1.1835]` to
+`[1.0688, 1.1978]` — it did not tighten, because the variance is dominated by
+MLP-to-MLP heterogeneity rather than by the count. Another 75 networks would
+buy little; what would settle it is the grader.
+
+For scale, on the same 75 networks the **iid-fitted** head reads 1.5858e-06
+against this one's 1.0909e-06, i.e. the refit is **1.454x** the shipped
+coefficients under a lattice — and 0.641x of raw, which is the same
+net-negative the sibling measured, seen from the other side.
+
+The selected channel set is *not* the iid one. `mfv2g`/`mfv2` — the exactly
+anchored layer-2 covariance gap — lead, as §11.3 predicted; `cv1mfg` and `cv1`
+survive with small coefficients; `relu1`, `cv2`, `cv3`, `mfm` and `mfv` are all
+dropped. Every shape block is dropped again, so the design is 20 columns.
+
+### 11.6 Deliverable
+
+`heads/lattice_head.npz` — 342 bytes, one float32 vector of 20 coefficients,
+nothing else, numeric-only. **It is not wired into `submission/`**, which is the
+integrator's; `submission/estimator.py` and `tests/test_submission_parity.py`
+are at `c1f8910` and all 8 original parity tests pass.
+
+Operating point it is fitted for: `tau = 2.5`, `N = 24989`, `P = 225`,
+`rqmc.ship_lattice_base()` with `lattice_x0_fn`, pilot iid. Column order, frozen:
+
+```
+one  s  Phi  phi  alpha
+mfv2g   mfv2g*Phi   mfv2g*alpha
+cv1mfg  cv1mfg*Phi  cv1mfg*alpha
+dpilot  dpilot*Phi  dpilot*alpha
+cv1     cv1*Phi     cv1*alpha
+mfv2    mfv2*Phi    mfv2*alpha
+```
+
+`s`, `Phi`, `phi`, `alpha` come from `HEAD_ROWS = 4096` rows of the scored draw
+(part of the contract, not an optimisation). The flopscope implementations of
+`mfv2`/`mfv2g`, `cv1mfg` and `mfm` are in `whestfloor/kernels.py`
+(`_layer12_exact`, `_relu1_cv`, `_transport_pair`, `_corrected_head2`), verified
+against the numpy generator at 1e-6 absolute and against the previous kernel
+bitwise and FLOP-for-FLOP with `beta2=None`. `cv1mfg` needs the scored-pass
+gates, which the shipped `_corrected_head2` does not currently build — it uses
+pilot gates for `mfm` — so wiring this vector needs the 4,096-row per-layer gate
+reduction (measured 1.01e8 FLOPs, 0.037% of `B`, ~160 dispatches) added.
+
+Regenerate with:
+
+```
+scripts/45_big_corrector.py --mode relattice --sub bigcorr_lat \
+    --from-sub bigcorr --shard {0,1,2} --n-shards 3
+scripts/45_big_corrector.py --mode export --sub bigcorr_lat --out lat_head.npz
+```
+
+### 11.7 The one thing not measured, and it is the next thing to run
+
+`--interleave` is implemented and **was not generated in time**. §11.4 argues it
+should recover `cv1`, `cv2` and `relu1` from actively harmful (0.374x, 0.821x,
+0.541x at unit coefficient) to at worst neutral, because it makes both
+split-sample halves genuine sublattices. Those three channels are the entire
+degree-1-and-2 estimated-coefficient family, so if the argument holds the
+selected set and the gain both change — and it costs nothing at grade time, being
+a row permutation of a table built once in `setup`. One `--mode relattice
+--interleave` run and one `--mode export` settles it.
 
 ## 12. Honest caveats
 

@@ -207,3 +207,53 @@ if want("bigcorr_label_precision"):
     )
 
 print("recorded")
+
+# ---------------------------------------------------------------------------
+# ROUND 15b: the head refitted for a randomised lattice scored draw.
+# ---------------------------------------------------------------------------
+LAT = dict(gt_samples=2 * 32_768, seed=400_000, n_mlps=375)
+
+if want("bigcorr_lattice_refit"):
+    Experiment(
+        name="bigcorr_lattice_refit",
+        script=SCRIPT,
+        hypothesis=(
+            "A sibling measured a randomised rank-1 lattice at 1.427x "
+            "projected graded, and the head at 0.922x UNDER that lattice -- net "
+            "negative.  The mechanism is not a tuning artefact: the k=1 Hermite "
+            "block is provably the optimal input-linear control variate and a "
+            "rank-1 lattice annihilates exactly those first-order ANOVA terms, "
+            "so the shipped coefficients are fitted against a residual whose "
+            "first-order part the lattice has already removed.  That makes the "
+            "head MIS-FITTED rather than intrinsically redundant.  Refit it on "
+            "lattice draws at (tau, N, P) = (2.5, 24989, 225) and score at "
+            "deployable weights on unbiased true MSE."),
+        acceptance_bar=1.10, bar_metric="test_x_over_damp0_under_lattice",
+        bar_direction="higher_is_better",
+    ).record(
+        **LAT,
+        estimator=("sparse MC on a shifted rank-1 lattice + mfv2g/cv1mfg/"
+                   "dpilot/cv1/mfv2 x {1, Phi, alpha} + 5 shape, 20-float head"),
+        test_x_over_damp0_under_lattice=1.1324,
+        raw_final_layer_mse=1.0909e-06,     # held-out TEST unbiased MSE
+        compute_ratio=0.2799,               # F/B of the lattice pass, sibling
+        adjusted_final_layer_score=None,
+        n_test_mlps=75, n_val_mlps=75, n_seeds_per_mlp=4, n_params=20,
+        artifact_bytes=342, n_samples=24989, n_pilot=225, tau=2.5,
+        ci95_low=1.0688, ci95_high=1.1978,
+        test_umse_damp0=1.2354e-06,
+        test_umse_iid_fitted_head=1.5858e-06,
+        x_over_iid_fitted_head=1.454,
+        iid_head_under_lattice=0.921,       # reproduces the sibling's 0.922
+        channel_unit_gain_iid={"cv1": 1.321, "relu1": 1.556, "cv2": 1.037,
+                               "mfm": 1.529, "mfv": 1.100, "mfv2": 1.146},
+        channel_unit_gain_lattice={"cv1": 0.374, "relu1": 0.541, "cv2": 0.821,
+                                   "mfm": 0.989, "mfv": 1.091, "mfv2": 1.055},
+        selected_channels=["mfv2g", "cv1mfg", "dpilot", "cv1", "mfv2"],
+        note=("PASS on the point estimate; the 95% bootstrap interval over MLPs "
+              "is [1.0688, 1.1978] and so does NOT exclude a miss.  45 -> 75 "
+              "test MLPs did not tighten it ([1.0703, 1.1835] -> "
+              "[1.0688, 1.1978]), because the variance is MLP heterogeneity "
+              "rather than count.  --interleave, which should recover cv1/cv2/"
+              "relu1 from actively harmful, is implemented and UNMEASURED."),
+    )
