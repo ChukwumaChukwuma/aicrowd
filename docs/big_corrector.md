@@ -585,7 +585,126 @@ The shape columns are computed from `HEAD_ROWS = 4096` rows of the scored
 draw, not the full sample. That is part of the contract, not an optimisation
 detail: the coefficients were fitted against columns computed exactly that way.
 
-## 11. Honest caveats
+## 11. Superseded as shipped, and refitted for the lattice
+
+**The head is not shipping in the form above, and the reason is a real
+mechanism rather than a measurement dispute.** A sibling agent measured a
+randomised rank-1 lattice at **1.427x** projected graded (raw 1.5250e-06 ->
+1.0530e-06, paired on the official 100) against this head's 1.254x — and the
+two do not compose. Measured redundancy **0.573**: the head is worth 1.609x on
+iid draws and **0.922x under a lattice**, i.e. net negative.
+
+Why, exactly. §4.1's `cv1` is *provably* the optimal input-linear control
+variate — `docs/learned_corrector.md` §3.2 shows `u_1 = rho^-1 d_1` unwinds to
+`W^{1,-1} xbar`, so the k=1 block IS the first-order ANOVA projection and not
+merely something resembling it. A rank-1 lattice is equidistributed in every
+one-dimensional projection, so it annihilates **exactly those** first-order
+terms before the head sees them. The coefficients above are therefore fitted
+against a residual whose first-order part the lattice has already removed:
+right mechanism, wrong residual.
+
+That is a statement about the FIT, not about the family, and the distinction is
+worth money — so the head is refitted on lattice draws.
+
+### 11.1 What the lattice does to each channel, measured
+
+One official-protocol MLP, `N = 24989`, `tau = 2.5`, `P = 225`, the same
+estimator seed, iid against lattice, rms of each channel:
+
+| channel | iid | lattice | ratio |
+|---|---|---|---|
+| `mfm` (first-order mean transport) | 3.618e-04 | 1.094e-04 | **0.302** |
+| `mfmg` | 3.403e-04 | 9.008e-05 | **0.265** |
+| `mfv` (variance transport, diagonal) | 5.512e-05 | 1.566e-05 | **0.284** |
+| `cv1` (Hermite k=1, split-sample) | 4.768e-04 | 5.841e-04 | 1.225 |
+| `relu1` | 3.654e-04 | 6.176e-04 | 1.690 |
+| `mfv2` (exact `Cov(z^2)` anchor) | 1.144e-04 | 3.457e-04 | **3.021** |
+| `dpilot` | 1.118e-02 | 1.092e-02 | 0.977 |
+
+The first-order channels collapse to 0.27-0.30x, which is the mechanism read
+directly off the features. `dpilot` is untouched because the pilot stays iid.
+`cv1` does *not* collapse, and that is the subtle part: the split-sample form
+correlates the target against **half-sample** means, and the two halves of a
+rank-1 lattice are strided subsets that are not themselves equidistributed. So
+`cv1` keeps its magnitude while losing its alignment with the full-sample error
+— it becomes noise the old coefficients still pay for. `mfv2` and `relu1` grow,
+because a lattice that is exact in 1-D projections is not exact in 2-D ones and
+the degree-2 content it leaves behind is larger.
+
+### 11.2 The bar, fixed before the refit
+
+> **`beta` refitted on lattice draws must beat `damp = 0` under a lattice by
+> `>= 1.10x` on the held-out TEST split, paired on the same MLPs.**
+
+Not the old iid ship: the incumbent is now the lattice with the head OFF.
+Reported with a 95% bootstrap interval over test MLPs, because the local
+harness carries ~9% single-seed noise and a 100-MLP local raw figure ~8% of
+realisation noise — a 1.02-1.04x point estimate is inside that and is not a
+result.
+
+Refit path: the references are functions of the weights alone, so not one label
+is invalidated by changing the scored draw. `--mode relattice` keeps them and
+recomputes only the features, which is 4x cheaper than regenerating and keeps
+the comparison paired on exactly the same 475 networks.
+
+### 11.3 The redundancy reproduces independently
+
+`--mode fit --sub bigcorr_lat`, 75 MLPs of the lattice set (15 held-out MLPs —
+underpowered, and quoted only for the sign and the mechanism):
+
+| | val | TEST |
+|---|---|---|
+| shipped 15-float head, coefficients as shipped | 0.760x | **0.921x** |
+| the same 15 columns refitted on lattice draws | 1.008x | 1.022x |
+| the rich 83-column design refitted | 1.072x | 1.074x |
+
+**0.921x reproduces the sibling's 0.922x on different networks, a different
+harness and an independently written feature block.** The redundancy is real.
+
+Per-channel at unit coefficient, and this is the mechanism in one column:
+
+| channel | iid | lattice |
+|---|---|---|
+| `cv1` (Hermite k=1) | 1.321x | **0.374x** |
+| `relu1` | 1.556x | **0.541x** |
+| `cv2` (Hermite k=2) | 1.037x | 0.821x |
+| `mfm` (first-order mean transport) | 1.529x | 0.989x |
+| **`mfv`/`mfvg` (variance transport)** | 1.100x | **1.091x** |
+| **`mfv2`/`mfv2g` (exact `Cov(z^2)` anchor)** | 1.146x | **1.055x** |
+
+Every first-order channel is destroyed and the two VARIANCE channels are the
+only survivors — they are degree-2 objects, which a lattice equidistributed in
+one-dimensional projections does not touch. Leave-one-group-out on validation
+agrees: dropping `mf_var_diag` or `mf_var_exact` costs 1.072x -> 1.048x, and
+dropping anything else costs `<= 0.005x`.
+
+`cv1` at **0.374x** is worth dwelling on, because it is not simply "the lattice
+already did that job". A channel that had become redundant would measure
+1.000x. 0.374x means it is now actively harmful, and §11.4 says why.
+
+### 11.4 The split-sample halves of a lattice are not samples
+
+Every estimated-coefficient channel here is split-sample: `dbar` from one half
+against the cross-moment of the other, which under iid draws is what removes
+the `Cov(g' G^-1 g, y)/N` self-term. Under a rank-1 lattice the first `N/2`
+points of `frac(i z / N)` are a contiguous arc, **not** an equidistributed set.
+So `dbar` is `O(N^-1/2)` noise while the full-sample mean it stands in for is
+nearly exact — the channel keeps its magnitude (`cv1` rms is 1.225x its iid
+value, not 0.3x) and loses its alignment with the error. That is the 0.374x.
+
+The fix is free and is implemented as `--interleave`: for prime `N` the
+even-index subset `{2 i z / N}` is itself a rank-1 lattice with generating
+vector `2 z` (`gcd(2, N) = 1`), and so is the odd one. Reordering the base as
+`[0, 2, 4, …, 1, 3, 5, …]` makes both split halves equidistributed. It is a row
+permutation of a table built once in `setup`, so it costs nothing at grade
+time, and it should restore `cv1`, `cv2` and `relu1` to informative — or, at
+worst, to a correct 1.000x instead of 0.374x.
+
+### 11.5 Result
+
+*(pending — the full 475-MLP lattice set is in flight)*
+
+## 12. Honest caveats
 
 - **The graded number is a projection, not a measurement.** §5's model
   reproduces the shipped point to 0.2% and its argmin to 3%, but it has been

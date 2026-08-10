@@ -232,10 +232,32 @@ def transport(weights, ms, ss, l0, dm, dvz, wsq=None):
 # ---------------------------------------------------------------------------
 # The instrumented scored pass
 # ---------------------------------------------------------------------------
+def lattice_x0_fn(base):
+    """Numpy twin of ``rqmc.lattice_x0_fn``, for the offline generator.
+
+    The deployed kernel draws the Cranley-Patterson shift from its OWN
+    generator, immediately after the pilot, so the shift is a function of
+    ``mlp.seed`` alone.  This mirrors that call exactly -- same rng, same
+    position in the stream, same ``rng.random(d, dtype=float32)`` -- and the
+    inverse CDF is the same ``flopscope.stats._ndtri`` the billed path uses.
+    Anything less and the head would be fitted on a different point set from
+    the one it is deployed on, which is the whole failure this refit exists to
+    undo.
+    """
+    from .rqmc import shifted_normals  # noqa: PLC0415
+
+    def fn(rng, n_samples, width):
+        if base.shape != (n_samples, width):
+            raise ValueError(f"lattice base {base.shape} != "
+                             f"({n_samples}, {width})")
+        return shifted_normals(base, rng.random(width, dtype=np.float32))
+    return fn
+
+
 def extract(weights, seed: int, *, tau: float | None = 2.5,
             n_samples: int = 25_000, n_pilot: int = 225,
             kmax: int = 4, want_relu1: bool = True, want_q2: bool = True,
-            gate_rows: int = GATE_ROWS) -> dict:
+            gate_rows: int = GATE_ROWS, x0_fn=None) -> dict:
     """Run the shipped sparse pass and return the full per-neuron feature set.
 
     Identical to ``submission/estimator.py::_sparse`` on the scored row -- same
@@ -281,7 +303,11 @@ def extract(weights, seed: int, *, tau: float | None = 2.5,
                                 for l in range(depth - 1)])))
 
     # ---- scored pass -----------------------------------------------------
-    x0 = rng.standard_normal((n_samples, n), dtype=np.float32)
+    # ``x0_fn`` is the ONLY hook, and it is the same hook the shipped kernel
+    # takes: the pilot above stays iid either way, so the mask and the frozen
+    # constants are unchanged and only the SCORED draw becomes a lattice.
+    x0 = (rng.standard_normal((n_samples, n), dtype=np.float32)
+          if x0_fn is None else x0_fn(rng, n_samples, n))
     x = x0
     z1 = h1 = None
     gm, gv = [], []      # per-layer (m, v) from the first ``gate_rows`` rows

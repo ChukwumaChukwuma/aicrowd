@@ -336,6 +336,31 @@ def umse(pred, a, b) -> float:
     return float(np.mean((pred - a) * (pred - b)))
 
 
+def umse_rows(pred, a, b) -> np.ndarray:
+    """The same estimator, per (MLP, seed) row rather than pooled."""
+    return np.mean((pred - a) * (pred - b), axis=1)
+
+
+def gain_ci(base_rows, head_rows, mlp_ids, reps: int = 4000, seed: int = 5):
+    """``(gain, lo, hi)`` -- bootstrap over MLPs on the RATIO of mean MSEs.
+
+    The local harness carries ~9% single-seed noise and a 100-MLP local raw
+    figure ~8% of realisation noise, so a bare point ratio near 1.05x is not a
+    result.  Resampling MLPs (not rows) keeps the numerator and denominator
+    PAIRED -- both are functions of the same draws on the same networks -- which
+    is why the ratio is far better determined than either figure alone, and the
+    interval says by how much rather than asserting it.
+    """
+    uniq, inv = np.unique(mlp_ids, return_inverse=True)
+    nb = np.bincount(inv, weights=base_rows) / np.bincount(inv)
+    nh = np.bincount(inv, weights=head_rows) / np.bincount(inv)
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(uniq), size=(reps, len(uniq)))
+    r = nb[idx].mean(axis=1) / nh[idx].mean(axis=1)
+    return (float(nb.mean() / nh.mean()),
+            float(np.quantile(r, 0.025)), float(np.quantile(r, 0.975)))
+
+
 def split_by_mlp(d: dict, seed: int = 20260808):
     uniq = np.unique(d["mlp_seeds"])
     rng = np.random.default_rng(seed)
@@ -783,6 +808,89 @@ BC_REF_CV_GAIN = 1.333
 
 
 # ---------------------------------------------------------------------------
+# mode: relattice -- refit the head for a RANDOMISED LATTICE scored draw
+# ---------------------------------------------------------------------------
+#: The shipped lattice (``docs/rqmc.md``): 24,989 points, the CBC generating
+#: vector, Cranley-Patterson shifted per MLP from ``mlp.seed``.
+LAT_N = 24_989
+
+
+def interleave_index(n: int) -> np.ndarray:
+    """Row order that makes the CONTIGUOUS split-sample halves sublattices.
+
+    Every estimated-coefficient control variate here is split-sample: ``dbar``
+    from one half against the cross-moment of the other.  Under iid draws each
+    contiguous half is itself a fair sample, so ``dbar`` is an unbiased estimate
+    of a quantity the full sample also nearly has, and the correction is
+    informative.  Under a rank-1 lattice it is NOT: the first ``N/2`` points of
+    ``frac(i z / N)`` are a contiguous arc, not an equidistributed set, so
+    ``dbar`` is ``O(N^-1/2)`` noise while the full-sample mean it is meant to
+    stand in for is nearly exact.  That is why ``cv1`` measures 0.374x at unit
+    coefficient under a lattice and ``relu1`` 0.541x -- they have become pure
+    noise the head then has to shrink.
+
+    For prime ``N`` the even-index subset ``{2 i z / N}`` is itself a rank-1
+    lattice with generating vector ``2 z`` (``gcd(2, N) = 1``), and so is the
+    odd one.  Reordering the base as ``[0, 2, 4, ..., 1, 3, 5, ...]`` therefore
+    makes both split halves equidistributed, at zero cost: it is a row
+    permutation of a table built once in ``setup``.
+    """
+    return np.concatenate([np.arange(0, n, 2), np.arange(1, n, 2)])
+
+
+def mode_relattice(from_sub: str, n_pilot: int, tau: float, shard: int,
+                   n_shards: int, interleave: bool = False) -> None:
+    """Recompute every feature on LATTICE draws, keeping the references.
+
+    The reference is a function of the WEIGHTS alone, so switching the scored
+    draw from iid to a randomised lattice does not invalidate a single label --
+    it costs 4x less than regenerating, and it keeps the comparison paired on
+    exactly the same networks, which is the only way a 1.1x claim survives a
+    9% single-seed noise floor.
+
+    The pilot stays iid, exactly as the deployed kernel's ``x0_fn`` hook leaves
+    it, so the mask and the frozen dead-neuron constants are unchanged and only
+    the scored draw becomes a lattice.
+    """
+    from whestfloor import rqmc as R  # noqa: PLC0415
+
+    src = artifacts() / from_sub
+    files = sorted(src.glob("blk_*.npz"))[shard::n_shards]
+    if not files:
+        raise SystemExit(f"no blocks in {src} for shard {shard}")
+    base = R.lattice_rows(0, LAT_N, LAT_N, np.asarray(R.RQMC_Z_SHIP))
+    if interleave:
+        base = base[interleave_index(LAT_N)]
+    x0_fn = BC.lattice_x0_fn(base)
+    t0 = time.time()
+    for fi, f in enumerate(files):
+        with np.load(f) as z:
+            d = {k: z[k] for k in z.files}
+        acc = {k: [] for k in BC.PER_SEED + BC.PER_MLP}
+        acc.update({k: [] for k in BC.PER_SEED_SCALAR})
+        W = None
+        last = None
+        for i, (ms, es) in enumerate(zip(d["mlp_seeds"], d["est_seeds"])):
+            if ms != last:
+                W = make_mlp(WIDTH, DEPTH, int(ms))
+                last = ms
+            g = BC.extract(W, int(es), tau=tau, n_samples=LAT_N,
+                           n_pilot=n_pilot, kmax=3, want_relu1=True,
+                           want_q2=False, x0_fn=x0_fn)
+            for k in acc:
+                acc[k].append(g[k])
+        out = data_dir() / f.name
+        np.savez(out, mlp_seeds=d["mlp_seeds"], est_seeds=d["est_seeds"],
+                 gt_a=d["gt_a"], gt_b=d["gt_b"], n_gt=d["n_gt"],
+                 n_samples=LAT_N, n_pilot=n_pilot, tau=tau,
+                 **{k: np.asarray(v, dtype=(np.float64 if k == "mu"
+                                            else np.float32))
+                    for k, v in acc.items()})
+        print(f"  {out.name}  ({len(d['mlp_seeds'])} rows, "
+              f"{fi + 1}/{len(files)}, {time.time() - t0:.0f}s)", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # mode: export -- the shippable artifact and its loader contract
 # ---------------------------------------------------------------------------
 def mode_export(lams, out_name: str, pool=POOL, drop=()) -> None:
@@ -910,6 +1018,15 @@ def mode_export(lams, out_name: str, pool=POOL, drop=()) -> None:
           f"+ {out_name}.json")
     print(f"  penalty {lam:.0e} selected on validation; TEST gain of the "
           f"train-only fit {base_x / xx:.3f}x")
+    # The BAR, and its uncertainty.  Paired on the same networks and the same
+    # draws: the denominator is damp=0 -- the identical scored pass with the
+    # head switched off -- so this is exactly the comparison the bar names.
+    g, lo, hi = gain_ci(umse_rows(MU[tst], A[tst], B[tst]),
+                        umse_rows(MU[tst] + Xx @ beta, A[tst], B[tst]),
+                        d["mlp_seeds"][tst])
+    print(f"  held-out TEST vs damp=0, paired: {g:.4f}x   "
+          f"95% bootstrap CI over {len(np.unique(d['mlp_seeds'][tst]))} MLPs "
+          f"[{lo:.4f}, {hi:.4f}]")
     sp = Path(__file__).resolve().parent.parent / "submission" / "corrector.npz"
     if sp.is_file():
         sb = np.load(sp)["beta"].astype(np.float64)
@@ -918,15 +1035,24 @@ def mode_export(lams, out_name: str, pool=POOL, drop=()) -> None:
             cols += [px[k], px[k] * px["Phi"], px[k] * px["alpha"]]
         cols += [px[k] for k in ("s", "Phi", "phi", "alpha")] + [px["dpilot"]]
         xs = umse(MU[tst] + np.stack(cols, axis=-1) @ sb, A[tst], B[tst])
-        dflop = (NEW_CHANNEL_FLOPS - 4.09e8) if not pool and sh is SH_NOEIG \
-            else NEW_CHANNEL_FLOPS
-        a0, _ = project(1.0)
-        a1, n1 = project(xs / xx, d_flops=dflop)
         print(f"  shipped head on the SAME test split {xs:.4e}; this head "
               f"{xx:.4e}  ->  {xs / xx:.3f}x")
-        print(f"  projected graded {a1:.4e} at N* = {n1:,.0f}  "
-              f"({a0 / a1:.3f}x over the shipped 2.4646e-07), "
-              f"new-channel cost {dflop:.2e} FLOPs")
+        lat = abs(float(d["meta"].get("n_samples", SHIP_N)) - LAT_N) < 1.0
+        if lat:
+            # SCORE_V is calibrated on the iid sampler's graded v_eff.  Under a
+            # lattice both v_eff and the per-sample cost move, and the sibling
+            # owns that calibration, so quoting a projected graded number here
+            # would be inventing one.  The bar is the paired ratio above.
+            print("  (no projected graded: the score model's SCORE_V is the "
+                  "IID sampler's v_eff and does not transfer to a lattice)")
+        else:
+            dflop = (NEW_CHANNEL_FLOPS - 4.09e8) if not pool \
+                and sh is SH_NOEIG else NEW_CHANNEL_FLOPS
+            a0, _ = project(1.0)
+            a1, n1 = project(xs / xx, d_flops=dflop)
+            print(f"  projected graded {a1:.4e} at N* = {n1:,.0f}  "
+                  f"({a0 / a1:.3f}x over the shipped 2.4646e-07), "
+                  f"new-channel cost {dflop:.2e} FLOPs")
     print(f"  shipped vector refitted on train+validation "
           f"({int(len(np.unique(d['mlp_seeds'][tv])))} MLPs)")
     print("\n--- loader contract -------------------------------------------")
@@ -1092,8 +1218,8 @@ def mode_cost(n_params: int) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", required=True,
-                    choices=("refcal", "data", "fit", "curve", "noise",
-                             "export", "cost"))
+                    choices=("refcal", "data", "relattice", "fit",
+                             "curve", "noise", "export", "cost"))
     ap.add_argument("--n-mlps", type=int, default=2000)
     ap.add_argument("--mlp-seed-base", type=int, default=400_000)
     ap.add_argument("--n-gt", type=int, default=65_536)
@@ -1125,6 +1251,10 @@ def main() -> int:
     ap.add_argument("--infl", type=str, default="1,2,4,8,16")
     ap.add_argument("--no-pool", action="store_true")
     ap.add_argument("--drop", type=str, default="")
+    ap.add_argument("--from-sub", type=str, default="bigcorr")
+    ap.add_argument("--interleave", action="store_true",
+                    help="reorder the lattice base so the split-sample halves "
+                         "are themselves sublattices")
     args = ap.parse_args()
 
     global SUBDIR
@@ -1137,6 +1267,9 @@ def main() -> int:
         mode_data(args.n_mlps, args.mlp_seed_base, args.n_gt, args.n_seeds,
                   args.shard, args.n_shards, args.block, args.n_samples,
                   args.n_pilot, args.tau, args.q2, not args.no_relu1)
+    elif args.mode == "relattice":
+        mode_relattice(args.from_sub, args.n_pilot, args.tau, args.shard,
+                       args.n_shards, args.interleave)
     elif args.mode == "fit":
         hid = tuple(tuple(int(x) for x in h.split(","))
                     for h in args.sgd_hidden.split(";") if h)
