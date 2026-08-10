@@ -700,69 +700,80 @@ permutation of a table built once in `setup`, so it costs nothing at grade
 time, and it should restore `cv1`, `cv2` and `relu1` to informative — or, at
 worst, to a correct 1.000x instead of 0.374x.
 
-### 11.5 Result: the refit clears the bar on the point estimate, and the
-interval does not exclude a miss
+### 11.5 Result: the refit clears the bar, interval and all
 
-375 MLPs of the lattice set x 4 Cranley-Patterson shifts, split by MLP seed,
-**75 held-out test networks**. Selection is validation-only (greedy forward over
-channels, then the optional blocks); the test split is read once.
+The full lattice set: **475 MLPs x 4 Cranley-Patterson shifts**, split by MLP
+seed, **95 held-out test networks**. Selection is validation-only (greedy
+forward over channels, then the optional blocks); the test split is read once.
 
 ```
-+ mfv2g    val 1.0547e-06  1.097x        + pooled u1/u2 terms   rejected
-+ cv1mfg   val 1.0165e-06  1.138x        - every shape block    DROPPED
-+ dpilot   val 1.0130e-06  1.142x
-+ cv1      val 1.0106e-06  1.144x
-+ mfv2     val 1.0097e-06  1.146x
++ mfv2     val 1.0526e-06  1.092x      + pooled u1/u2 terms  rejected
++ cv1mf    val 1.0160e-06  1.131x      - every shape block   DROPPED
++ cv1      val 1.0143e-06  1.133x
++ cv2      val 1.0128e-06  1.135x
++ mfv      val 1.0121e-06  1.135x
++ dpilot   val 1.0115e-06  1.136x
++ mfm      val 1.0113e-06  1.136x
++ mfvg     val 1.0113e-06  1.136x
 ```
 
-> **held-out TEST against `damp = 0` under a lattice, paired on the same 75
-> networks: `1.1324x`, 95% bootstrap CI over MLPs `[1.0688, 1.1978]`.**
+> **held-out TEST against `damp = 0` under a lattice, paired on the same 95
+> networks: `1.1762x`, 95% bootstrap CI over MLPs `[1.1126, 1.2421]`.**
 
-**Verdict against the pre-registered `>= 1.10x`: PASS on the point estimate,
-and the interval does not exclude a miss.** The lower bound is 1.069. Going
-from 45 to 75 test MLPs moved the interval from `[1.0703, 1.1835]` to
-`[1.0688, 1.1978]` — it did not tighten, because the variance is dominated by
-MLP-to-MLP heterogeneity rather than by the count. Another 75 networks would
-buy little; what would settle it is the grader.
+**Verdict against the pre-registered `>= 1.10x`: PASS, and the interval excludes
+a miss** — the lower bound is 1.1126.
 
-For scale, on the same 75 networks the **iid-fitted** head reads 1.5858e-06
-against this one's 1.0909e-06, i.e. the refit is **1.454x** the shipped
-coefficients under a lattice — and 0.641x of raw, which is the same
-net-negative the sibling measured, seen from the other side.
+**A correction to what §11.5 said at 375 MLPs.** That reading was 1.1324x with
+CI `[1.0688, 1.1978]`, and I wrote that the interval "did not tighten" between
+45 and 75 test MLPs and that "another 75 networks would buy little". The data
+refuted both. Going 375 -> 475 MLPs moved the point estimate **1.1324 ->
+1.1762** and tightened the interval from `[1.0688, 1.1978]` to
+`[1.1126, 1.2421]`. The 45 -> 75 plateau was noise in the interval estimate, not
+a variance floor, and I over-read two points.
 
-The selected channel set is *not* the iid one. `mfv2g`/`mfv2` — the exactly
-anchored layer-2 covariance gap — lead, as §11.3 predicted; `cv1mfg` and `cv1`
-survive with small coefficients; `relu1`, `cv2`, `cv3`, `mfm` and `mfv` are all
-dropped. Every shape block is dropped again, so the design is 20 columns.
+On the same 95 networks the **iid-fitted** head reads 1.4316e-06 against this
+one's 9.4400e-07 — the refit is **1.517x** the shipped coefficients under a
+lattice.
+
+**What is stable and what is not.** The *gain* is stable and now well
+determined. The *selected channel set* is not: 75 / 225 / 375 / 475 MLPs chose
+5 / 6 / 5 / 8 channels and never the same five. The channels are strongly
+collinear, so which representative of a redundant group gets picked is close to
+a coin flip while the span they collectively cover is not — that is exactly the
+pattern §6.2 measured for capacity, seen in the selection instead of the
+penalty. Read the set as "the degree-2 and pilot channels, plus low-weight
+first-order ones", not as a ranking. Consistent with §11.3, `mfv2` leads at
+every sample size and `relu1` — destroyed at 0.541x — is never selected.
 
 ### 11.6 Deliverable
 
-`heads/lattice_head.npz` — 342 bytes, one float32 vector of 20 coefficients,
-nothing else, numeric-only. **It is not wired into `submission/`**, which is the
-integrator's; `submission/estimator.py` and `tests/test_submission_parity.py`
-are at `c1f8910` and all 8 original parity tests pass.
+`heads/lattice_head.npz` — **378 bytes**, one float32 vector of **29**
+coefficients, nothing else, numeric-only. **It is not wired into `submission/`**,
+which is the integrator's.
 
 Operating point it is fitted for: `tau = 2.5`, `N = 24989`, `P = 225`,
-`rqmc.ship_lattice_base()` with `lattice_x0_fn`, pilot iid. Column order, frozen:
+`rqmc.ship_lattice_base()` with `lattice_x0_fn`, pilot iid. Column order, frozen
+— five shape columns, then eight channels each crossed with `{1, Phi, alpha}`:
 
 ```
 one  s  Phi  phi  alpha
-mfv2g   mfv2g*Phi   mfv2g*alpha
-cv1mfg  cv1mfg*Phi  cv1mfg*alpha
-dpilot  dpilot*Phi  dpilot*alpha
-cv1     cv1*Phi     cv1*alpha
-mfv2    mfv2*Phi    mfv2*alpha
+mfv2    mfv2*Phi    mfv2*alpha        cv1mf   cv1mf*Phi   cv1mf*alpha
+cv1     cv1*Phi     cv1*alpha         cv2     cv2*Phi     cv2*alpha
+mfv     mfv*Phi     mfv*alpha         dpilot  dpilot*Phi  dpilot*alpha
+mfm     mfm*Phi     mfm*alpha         mfvg    mfvg*Phi    mfvg*alpha
 ```
 
 `s`, `Phi`, `phi`, `alpha` come from `HEAD_ROWS = 4096` rows of the scored draw
-(part of the contract, not an optimisation). The flopscope implementations of
-`mfv2`/`mfv2g`, `cv1mfg` and `mfm` are in `whestfloor/kernels.py`
-(`_layer12_exact`, `_relu1_cv`, `_transport_pair`, `_corrected_head2`), verified
-against the numpy generator at 1e-6 absolute and against the previous kernel
-bitwise and FLOP-for-FLOP with `beta2=None`. `cv1mfg` needs the scored-pass
-gates, which the shipped `_corrected_head2` does not currently build — it uses
-pilot gates for `mfm` — so wiring this vector needs the 4,096-row per-layer gate
-reduction (measured 1.01e8 FLOPs, 0.037% of `B`, ~160 dispatches) added.
+(part of the contract, not an optimisation). The flopscope implementations are in
+`whestfloor/kernels.py` (`_layer12_exact`, `_relu1_cv`, `_transport_pair`,
+`_corrected_head2`), verified against the numpy generator at 1e-6 absolute and
+against the previous kernel bitwise and FLOP-for-FLOP with `beta2=None`.
+
+Wiring this vector needs two things the shipped `_corrected_head2` does not
+build: `mfvg`'s scored-pass gates (4,096-row per-layer reduction, measured
+1.01e8 FLOPs = 0.037% of `B`, ~160 dispatches) and the `cv2` block, which is
+`_hermite_cv(..., kmax=2)` rather than `kmax=1` — both already exist in
+`kernels.py`, they are simply not on the `beta2` path.
 
 Regenerate with:
 
@@ -786,7 +797,7 @@ Both heads are preserved so neither has to be regenerated:
 | file | 20 floats fitted for | held-out |
 |---|---|---|
 | `heads/iid_head.npz` | iid, `N = 25000` | **1.296x** over the shipped 15-float head |
-| `heads/lattice_head.npz` | lattice, `N = 24989` | 1.1324x over `damp = 0` under a lattice |
+| `heads/lattice_head.npz` | lattice, `N = 24989` | 1.1762x over `damp = 0` under a lattice, CI [1.1126, 1.2421] |
 
 **The iid port is fully recoverable and was verified SHIPPABLE.**
 `c828317:submission/estimator.py` is the complete flopscope port *with the

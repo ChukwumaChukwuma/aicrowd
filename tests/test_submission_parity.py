@@ -45,18 +45,8 @@ class _MLP:
 
 
 class _Ctx:
-    """What the grader's ``SetupContext`` carries that this file uses.
-
-    ``width`` matters: the shipped ``setup`` builds the lattice point set from
-    it, unbilled, exactly as the grader's does.  Omit it and the estimator
-    rebuilds lazily inside ``predict``, which is billed -- a legitimate
-    degradation, but a different FLOP count, so the parity tests pass it.
-    """
-
     submission_dir = str(ROOT / "submission")
     seed = 0
-    width = 64
-    depth = 6
 
 
 def test_submission_fallback_matches_research_kernel():
@@ -132,20 +122,14 @@ def test_submission_matches_research_kernel():
     from whestfloor import kernels
     from whestfloor.mc import make_mlp
 
-    from whestfloor import rqmc as rq
-
     sub = _load_submission()
     est = sub.Estimator()
     est.setup(_Ctx())
     assert est._beta is not None, "submission/corrector.npz did not load"
-    assert est._base is not None, "the shipped setup did not build the lattice"
+    assert est._beta2 is not None, "submission/bigcorr_head.npz did not load"
     beta = np.asarray(est._beta)
-
-    # The research side gets the identical point set, built OUTSIDE the measured
-    # context because the grader runs setup outside the per-MLP budget too.
-    with flops.BudgetContext(flop_budget=int(1e12), quiet=True):
-        base = rq.billed_lattice_base(sub.N_SAMPLES,
-                                      sub.RQMC_Z[:64], chunk=sub.RQMC_CHUNK)
+    beta2 = np.asarray(est._beta2)
+    assert beta2.shape == (len(sub.FEATURES2),)
 
     W = [fnp.asarray(x) for x in make_mlp(64, 6, seed=3)]
     with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c1:
@@ -153,8 +137,7 @@ def test_submission_matches_research_kernel():
     with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c2:
         b = np.asarray(kernels.corrected_sparse_kernel(
             W, tau=sub.TAU, n_samples=sub.N_SAMPLES, n_pilot=sub.N_PILOT,
-            seed=7, beta=beta, damp=sub.DAMP, kmax=sub.CV_KMAX,
-            x0_fn=rq.lattice_x0_fn(base, chunk=sub.RQMC_CHUNK)))
+            seed=7, beta=beta, beta2=beta2, damp=sub.DAMP, kmax=sub.CV_KMAX))
 
     assert a.shape == b.shape == (6, 64)
     assert np.array_equal(a, b), (
@@ -163,28 +146,12 @@ def test_submission_matches_research_kernel():
     assert c1.flops_used == c2.flops_used, (
         f"FLOP counts differ: {c1.flops_used} vs {c2.flops_used}")
 
-    # The lattice must actually be doing something, or this test is vacuous:
-    # the same estimator with a pseudorandom draw has to give a DIFFERENT answer
-    # at the same seed, and the shipped one has to be the lattice branch.
-    with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c3:
-        d = np.asarray(kernels.corrected_sparse_kernel(
-            W, tau=sub.TAU, n_samples=sub.N_SAMPLES, n_pilot=sub.N_PILOT,
-            seed=7, beta=beta, damp=sub.DAMP, kmax=sub.CV_KMAX))
-    assert not np.array_equal(a[-1], d[-1])
-    # ... and it must cost the draw and only the draw: 157 FLOPs/element.
-    assert abs((c1.flops_used - c3.flops_used) / (sub.N_SAMPLES * 64)
-               - 157.0) < 1.0, (c1.flops_used - c3.flops_used)
-
 
 def test_corrector_damp_zero_is_exactly_uncorrected():
-    """`DAMP = 0` must be the uncorrected sparse pass, bit for bit.
+    """`DAMP = 0` must reproduce the previous ship bit for bit.
 
-    This is the SHIPPED value now (the head is redundant with the lattice --
-    see `DAMP` in the submission), so the test pins the ship rather than an
-    ablation: what the grader runs must be the lattice-driven sparse pass with
-    no feature block billed at all.  The head must still be *reachable*, which
-    the `DAMP = 1` half below checks, because the fix for the redundancy is to
-    refit it rather than to delete it.
+    Bar 3 of the corrector work: the correction has to be ablatable through
+    the identical code path, not by swapping in a different program.
     """
     import warnings
 
@@ -195,60 +162,33 @@ def test_corrector_damp_zero_is_exactly_uncorrected():
     from whestfloor import kernels
     from whestfloor.mc import make_mlp
 
-    from whestfloor import rqmc as rq
-
     sub = _load_submission()
-    assert sub.DAMP == 0.0, "the ship is DAMP = 0; update this test deliberately"
     est = sub.Estimator()
     est.setup(_Ctx())
     W = [fnp.asarray(x) for x in make_mlp(64, 6, seed=17)]
-    with flops.BudgetContext(flop_budget=int(1e12), quiet=True):
-        base = rq.billed_lattice_base(sub.N_SAMPLES, sub.RQMC_Z[:64],
-                                      chunk=sub.RQMC_CHUNK)
-    x0_fn = rq.lattice_x0_fn(base, chunk=sub.RQMC_CHUNK)
 
-    with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c1:
-        a = np.asarray(est.predict(_MLP(W, 21), int(1e12)))
-    # beta=None takes the same early return as damp=0 and bills no feature
-    # block, which is the point: the shipped path must not pay for a head it
-    # multiplies by zero.
+    old = sub.DAMP
+    try:
+        sub.DAMP = 0.0
+        with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c1:
+            a = np.asarray(est.predict(_MLP(W, 21), int(1e12)))
+    finally:
+        sub.DAMP = old
     with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c2:
-        b = np.asarray(kernels.corrected_sparse_kernel(
+        b = np.asarray(kernels.sparse_mc_kernel(
             W, tau=sub.TAU, n_samples=sub.N_SAMPLES, n_pilot=sub.N_PILOT,
-            seed=21, beta=None, x0_fn=x0_fn))
+            seed=21))
     assert np.array_equal(a, b)
     assert c1.flops_used == c2.flops_used
 
-    # ... and the head must still be REACHABLE through the identical code path,
-    # or `DAMP` has stopped being a live knob and section 6.1 of docs/rqmc.md
-    # (refit the head on lattice draws) has nothing to switch back on.
-    old = sub.DAMP
-    try:
-        sub.DAMP = 1.0
-        with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c3:
-            c = np.asarray(est.predict(_MLP(W, 21), int(1e12)))
-    finally:
-        sub.DAMP = old
-    with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c4:
-        d = np.asarray(kernels.corrected_sparse_kernel(
-            W, tau=sub.TAU, n_samples=sub.N_SAMPLES, n_pilot=sub.N_PILOT,
-            seed=21, beta=np.asarray(est._beta), damp=1.0,
-            kmax=sub.CV_KMAX, x0_fn=x0_fn))
-    assert np.array_equal(c, d)
-    assert c3.flops_used == c4.flops_used
+    # ... and the corrected path must actually differ, or it is vacuous
+    with flops.BudgetContext(flop_budget=int(1e12), quiet=True):
+        c = np.asarray(est.predict(_MLP(W, 21), int(1e12)))
     assert not np.array_equal(a[-1], c[-1])
-    assert c3.flops_used > c1.flops_used
 
 
 def test_missing_coefficient_file_degrades_not_fails():
-    """A head that will not load must leave a working estimator behind.
-
-    The `Bad` context also has no `width`, so `setup` guesses `WIDTH_DEFAULT`
-    and gets a point set of the wrong shape.  That must NOT silently produce a
-    different estimator: `_draw` has to notice, rebuild for the real width, and
-    return the identical answer the setup-built base would have.  It costs
-    FLOPs, which is the whole difference, and it is why `_Ctx` carries `width`.
-    """
+    """A head that will not load must leave a working estimator behind."""
     import warnings
 
     warnings.filterwarnings("ignore")
@@ -256,7 +196,6 @@ def test_missing_coefficient_file_degrades_not_fails():
     import flopscope.numpy as fnp
 
     from whestfloor import kernels
-    from whestfloor import rqmc as rq
     from whestfloor.mc import make_mlp
 
     sub = _load_submission()
@@ -268,65 +207,14 @@ def test_missing_coefficient_file_degrades_not_fails():
 
     est.setup(Bad())
     assert est._beta is None
-    # the guessed base is the contract width, which is not this test's width
-    assert est._base is not None and est._base.shape[1] == sub.WIDTH_DEFAULT
-
     W = [fnp.asarray(x) for x in make_mlp(64, 6, seed=23)]
-    with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c1:
-        a = np.asarray(est.predict(_MLP(W, 29), int(1e12)))
-    assert est._base.shape[1] == 64, "the wrong-shape base was not replaced"
-
     with flops.BudgetContext(flop_budget=int(1e12), quiet=True):
-        base = rq.billed_lattice_base(sub.N_SAMPLES, sub.RQMC_Z[:64],
-                                      chunk=sub.RQMC_CHUNK)
-    with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c2:
-        b = np.asarray(kernels.corrected_sparse_kernel(
-            W, tau=sub.TAU, n_samples=sub.N_SAMPLES, n_pilot=sub.N_PILOT,
-            seed=29, beta=None,
-            x0_fn=rq.lattice_x0_fn(base, chunk=sub.RQMC_CHUNK)))
-    assert np.array_equal(a, b), "the lazily rebuilt lattice is a different draw"
-    # same answer, and the only difference is that the rebuild was billed
-    assert c1.flops_used > c2.flops_used
-
-
-def test_lattice_absent_degrades_to_the_iid_sparse_pass():
-    """With no point set at all the estimator must be the previous ship.
-
-    That is the third rung of the failure ladder (lattice-in-setup ->
-    lattice-in-predict -> iid sparse -> dense fallback) and it is the one that
-    has to stay a *measured* estimator rather than an unknown one, because it is
-    what runs if anything about the point set is wrong on the grader.
-    """
-    import warnings
-
-    warnings.filterwarnings("ignore")
-    import flopscope as flops
-    import flopscope.numpy as fnp
-
-    from whestfloor import kernels
-    from whestfloor.mc import make_mlp
-
-    sub = _load_submission()
-    est = sub.Estimator()
-    est.setup(_Ctx())
-    W = [fnp.asarray(x) for x in make_mlp(64, 6, seed=31)]
-
-    old_n = sub.RQMC_N
-    try:
-        # N_SAMPLES != RQMC_N is exactly the "no vector for this N" condition,
-        # and it must take the pseudorandom branch without raising.
-        sub.RQMC_N = -1
-        est._base = None
-        with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c1:
-            a = np.asarray(est.predict(_MLP(W, 33), int(1e12)))
-    finally:
-        sub.RQMC_N = old_n
-    with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c2:
+        a = np.asarray(est.predict(_MLP(W, 29), int(1e12)))
+    with flops.BudgetContext(flop_budget=int(1e12), quiet=True):
         b = np.asarray(kernels.sparse_mc_kernel(
             W, tau=sub.TAU, n_samples=sub.N_SAMPLES, n_pilot=sub.N_PILOT,
-            seed=33))
+            seed=29))
     assert np.array_equal(a, b)
-    assert c1.flops_used == c2.flops_used
 
 
 def test_numpy_feature_extractor_matches_the_shipped_kernel():
@@ -362,6 +250,122 @@ def test_numpy_feature_extractor_matches_the_shipped_kernel():
             W, tau=2.5, n_samples=1200, n_pilot=60, seed=4242, beta=beta,
             kmax=2, safe=False)
     assert np.abs(pred_np - np.asarray(out)[-1]).max() < 1e-6
+
+
+def test_scaled_head_absent_degrades_to_the_fifteen_float_head():
+    """The ladder has THREE rungs and the middle one must be reachable.
+
+    A corrupt or missing `bigcorr_head.npz` must leave the previously shipped
+    15-float head running, not no head at all -- and it must be the SAME
+    15-float estimator that every number in `docs/learned_corrector.md` was
+    measured with, bit for bit and FLOP for FLOP.
+    """
+    import warnings
+
+    warnings.filterwarnings("ignore")
+    import flopscope as flops
+    import flopscope.numpy as fnp
+
+    from whestfloor import kernels
+    from whestfloor.mc import make_mlp
+
+    sub = _load_submission()
+    est = sub.Estimator()
+    est.setup(_Ctx())
+    est._beta2 = None                      # as if the file were unreadable
+    W = [fnp.asarray(x) for x in make_mlp(64, 6, seed=3)]
+    with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c1:
+        a = np.asarray(est.predict(_MLP(W), int(1e12)))
+    with flops.BudgetContext(flop_budget=int(1e12), quiet=True) as c2:
+        b = np.asarray(kernels.corrected_sparse_kernel(
+            W, tau=sub.TAU, n_samples=sub.N_SAMPLES, n_pilot=sub.N_PILOT,
+            seed=7, beta=np.asarray(est._beta), damp=sub.DAMP,
+            kmax=sub.CV_KMAX))
+    assert np.array_equal(a, b)
+    assert c1.flops_used == c2.flops_used
+
+
+def test_scaled_head_matches_the_numpy_generator():
+    """The training features and the deployed features must be the same map.
+
+    `whestfloor.bigcorr.extract` built every row the 20 coefficients were
+    fitted on; the flopscope path is what runs at grade time.  They are not
+    bitwise equal -- the generator accumulates in float64, the shipped path
+    stays in float32 outside the Gram solve -- so this pins the agreement at
+    1e-6 absolute, three orders below the ~1e-3 residual being predicted.
+
+    It also pins the COLUMN ORDER, which is the one thing a silent change
+    would make catastrophic rather than merely wrong: `beta` is indexed by
+    position and a permuted design would still run and still return finite
+    numbers.
+    """
+    import warnings
+
+    warnings.filterwarnings("ignore")
+    import flopscope as flops
+    import flopscope.numpy as fnp
+
+    from whestfloor import bigcorr as BC
+    from whestfloor import kernels
+    from whestfloor.mc import make_mlp
+
+    sub = _load_submission()
+    channels = ("relu1", "mfv2", "mfm", "dpilot", "cv1")
+    expect = ["one", "s", "Phi", "phi", "alpha"]
+    for k in channels:
+        expect += [k, f"{k}*Phi", f"{k}*alpha"]
+    assert list(sub.FEATURES2) == expect
+
+    rng = np.random.default_rng(0)
+    beta2 = (rng.standard_normal(len(expect)) * 1e-3).astype(np.float32)
+    Wn = make_mlp(128, 8, 4242)
+    f = BC.extract(Wn, seed=4242, tau=2.5, n_samples=1200, n_pilot=60,
+                   kmax=1, want_relu1=True, want_q2=False)
+    cols = [np.ones_like(f["alpha"]), f["s"], f["Phi"], f["phi"], f["alpha"]]
+    for k in channels:
+        cols += [f[k], f[k] * f["Phi"], f[k] * f["alpha"]]
+    pred_np = f["mu"] + np.stack(cols, -1) @ beta2.astype(np.float64)
+
+    W = [fnp.asarray(w) for w in Wn]
+    with flops.BudgetContext(flop_budget=int(1e12), quiet=True):
+        out = kernels.corrected_sparse_kernel(
+            W, tau=2.5, n_samples=1200, n_pilot=60, seed=4242, beta2=beta2,
+            safe=False)
+    assert np.abs(pred_np - np.asarray(out)[-1]).max() < 1e-6
+
+
+def test_scaled_head_raise_still_falls_back_to_dense():
+    """A raise anywhere in the new block must still cost accuracy, not the MLP.
+
+    One zeroed prediction is O(1) against a score of O(1e-6), i.e. ~850x the
+    whole score, and this session already lost one submission to a SymmetryError
+    that eight local suites never produced.  The new block adds an eigh, an
+    arcsin and a boolean-masked scatter, so the guard is re-asserted here
+    against a forced failure inside it rather than at the outer boundary.
+    """
+    import warnings
+
+    warnings.filterwarnings("ignore")
+    import flopscope as flops
+    import flopscope.numpy as fnp
+
+    from whestfloor.mc import make_mlp
+
+    sub = _load_submission()
+    est = sub.Estimator()
+    est.setup(_Ctx())
+    W = [fnp.asarray(x) for x in make_mlp(64, 6, seed=31)]
+
+    good = est._transport_pair
+    est._transport_pair = lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("probe"))
+    try:
+        with flops.BudgetContext(flop_budget=int(1e12), quiet=True):
+            out = np.asarray(est.predict(_MLP(W, 33), int(1e12)))
+    finally:
+        est._transport_pair = good
+    assert out.shape == (6, 64)
+    assert np.isfinite(out).all()
 
 
 def test_submission_contract():

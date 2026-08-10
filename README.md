@@ -133,11 +133,12 @@ would read 1.000x, and the cause is that the first `N/2` points of
 `frac(i z / N)` are a contiguous *arc*, so the split-sample `dbar` is noise
 while the full-sample mean it stands in for is nearly exact.
 
-**Refitted on lattice draws it clears its bar on the point estimate**:
-`1.1324x` against `damp = 0` under a lattice, paired on 75 held-out networks,
-95% bootstrap CI `[1.0688, 1.1978]` — so the interval does not exclude a miss,
-and 45 → 75 test MLPs did not tighten it. `heads/lattice_head.npz`, 342 bytes,
-20 coefficients, `submission/` untouched.
+**Refitted on lattice draws it clears its bar outright**: `1.1762x` against
+`damp = 0` under a lattice, paired on 95 held-out networks, 95% bootstrap CI
+`[1.1126, 1.2421]` — the interval excludes a miss. `heads/lattice_head.npz`,
+378 bytes, 29 coefficients, `submission/` untouched. (An earlier reading on 375
+of the 475 MLPs said 1.1324x with CI `[1.0688, 1.1978]`, and I wrote that more
+networks "would buy little"; the full set moved both, so that was wrong.)
 
 **The scaled offline corrector, ported and measured** (`docs/big_corrector.md` §9).
 `whestfloor/kernels.py` computes three new exactly-mean-zero channels in

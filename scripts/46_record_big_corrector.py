@@ -257,3 +257,56 @@ if want("bigcorr_lattice_refit"):
               "rather than count.  --interleave, which should recover cv1/cv2/"
               "relu1 from actively harmful, is implemented and UNMEASURED."),
     )
+
+# ---------------------------------------------------------------------------
+# ROUND 15c: the same refit on the COMPLETE lattice set.  Records are immutable
+# and append-only, so this is a new row rather than an edit of the 375-MLP one
+# above -- and the delta between them is itself the result (my claim that
+# another 75 networks "would buy little" was wrong).
+# ---------------------------------------------------------------------------
+if want("bigcorr_lattice_refit_full"):
+    Experiment(
+        name="bigcorr_lattice_refit_full",
+        script=SCRIPT,
+        hypothesis=(
+            "bigcorr_lattice_refit read 1.1324x with a 95% bootstrap CI of "
+            "[1.0688, 1.1978] on 375 of the 475 generated MLPs, and I claimed "
+            "the interval had stopped tightening because 45 -> 75 test MLPs had "
+            "not moved it.  Re-run on the complete set: if that claim was right "
+            "the point estimate and the interval both stay put, and if it was "
+            "wrong they move.  Same pre-registered bar, not re-rolled: beta "
+            "refitted on lattice draws must beat damp=0 under a lattice by "
+            ">= 1.10x on held-out TEST, paired on the same MLPs."),
+        acceptance_bar=1.10, bar_metric="test_x_over_damp0_under_lattice",
+        bar_direction="higher_is_better",
+    ).record(
+        gt_samples=2 * 32_768, seed=400_000, n_mlps=475,
+        estimator=("sparse MC on a shifted rank-1 lattice + mfv2/cv1mf/cv1/cv2/"
+                   "mfv/dpilot/mfm/mfvg x {1, Phi, alpha} + 5 shape, 29 floats"),
+        test_x_over_damp0_under_lattice=1.1762,
+        raw_final_layer_mse=9.4400e-07,      # held-out TEST unbiased MSE
+        compute_ratio=0.2799,                # F/B of the lattice pass, sibling
+        adjusted_final_layer_score=None,
+        n_test_mlps=95, n_val_mlps=95, n_seeds_per_mlp=4, n_params=29,
+        artifact_bytes=378, n_samples=24989, n_pilot=225, tau=2.5,
+        ci95_low=1.1126, ci95_high=1.2421,
+        test_umse_damp0=1.1103e-06,
+        test_umse_iid_fitted_head=1.4316e-06,
+        x_over_iid_fitted_head=1.517,
+        selected_channels=["mfv2", "cv1mf", "cv1", "cv2", "mfv", "dpilot",
+                           "mfm", "mfvg"],
+        n_channels_by_train_size={"75": 5, "225": 6, "375": 5, "475": 8},
+        superseded_by_grader=True,
+        note=("PASS and the interval now EXCLUDES a miss (lower bound 1.1126). "
+              "375 -> 475 MLPs moved the point estimate 1.1324 -> 1.1762 and "
+              "tightened the CI from [1.0688, 1.1978] to [1.1126, 1.2421], so "
+              "the earlier 'another 75 networks would buy little' was wrong -- "
+              "the 45 -> 75 plateau was noise in the interval estimate, not a "
+              "variance floor.  The GAIN is stable; the selected channel SET is "
+              "not (5/6/5/8 channels at 75/225/375/475 MLPs, never the same "
+              "five) because the channels are collinear -- read it as a span, "
+              "not a ranking.  mfv2 leads at every size; relu1 is never "
+              "selected.  NOTE: 01b2a80 measured the lattice at 0.932x on the "
+              "grader, so this head is fitted for a sampler that is not "
+              "currently shipping; heads/iid_head.npz is the live candidate."),
+    )
