@@ -1527,68 +1527,68 @@ def _relu1_cv(h1, y, mh1, Ch1, jitter: float = 1e-6):
     return 0.5 * ((y[:hlf].T @ wa) / hlf + (y[hlf:].T @ wb) / (n - hlf))
 
 
-def _transport_pair(weights, wsq, alpha, s_p, gates, dm2, dvz2):
-    """First-order transport of the layer-2 mean and variance gaps.
+def _transport(weights, wsq, alpha, s_p, gates, DM, DVZ):
+    """First-order transport of layer-2 mean/variance gaps, batched over columns.
 
-    Returns ``(mfm, mfv2)``: the perturbation of ``E[relu(z^32)]`` produced by
-    the observed layer-2 MEAN gap alone and by the observed layer-2 VARIANCE
-    gap alone.  Both inputs are exactly mean zero, so both outputs are, and
-    they are returned separately because the head weights them differently.
+    ``DM``/``DVZ`` are ``(width, k)``: column ``c`` is one channel's starting
+    pre-activation mean gap and variance gap at layer 2.  Returns the induced
+    ``(width, k)`` perturbation of the final ``E[relu(z^32)]``.
 
     The recursion is the exact chain rule of the Gaussian rectifier moments,
     using ``dE[relu^2]/dm = 2 E[relu]`` and ``dE[relu^2]/ds = 2 s Phi``:
 
-        dmu_l     = Phi dm + phi ds ,  ds = dvz / (2 s)
+        dmu_l     = Phi dm + phi ds ,   ds = dvz / (2 s)
         dvh_l     = 2 mu0 (1 - Phi) dm + 2 (s Phi - mu0 phi) ds
-        dm_{l+1}  = W' dmu_l                (exact)
-        dvz_{l+1} = (W .^ 2)' dvh_l         (diagonal only)
+        dm_{l+1}  = W' dmu_l                 (exact)
+        dvz_{l+1} = (W .^ 2)' dvh_l          (diagonal only)
 
     Only the last line approximates, and it costs efficiency and NEVER bias:
     the output is a linear functional of exactly-mean-zero inputs whatever the
-    coefficients are.
+    coefficients are.  That is the whole reason to route everything through
+    exactly-known moments.
 
-    COST.  The two channels are carried as the two COLUMNS of one
-    ``(width, 2)`` array, so one pair of matmuls serves both; the ``1/(2s)``
-    factor is folded into ``phi`` and into the variance gain once for all
-    layers rather than applied per layer; and every per-layer coefficient is
-    built in ONE dispatch on the stacked ``(depth, width)`` block, exactly as
-    :func:`_pilot_stats` does.  That is 8 dispatches a layer instead of 14 for
-    two separate scalar recursions -- 248 against 868.
+    COST.  All ``k`` channels ride one pair of matmuls; the ``1/(2s)`` factor is
+    folded into ``phi`` and into the variance gain ONCE for every layer instead
+    of per layer; and each per-layer coefficient is built in one dispatch on the
+    stacked ``(depth, width)`` block, as :func:`_pilot_stats` does.  Eight
+    dispatches a layer for any ``k``, against 14 per channel for separate scalar
+    recursions -- 248 rather than 868 at ``k = 3``.
     """
     depth = len(weights)
     ms = alpha * s_p
     ph_t = flops.stats.norm.pdf(alpha).astype(alpha.dtype)
     mu0 = ms * gates + s_p * ph_t
     inv2s = 0.5 / s_p
-    A = gates.reshape(depth, -1, 1)                    # Phi
-    Bc = (ph_t * inv2s).reshape(depth, -1, 1)          # phi / (2s)
+    A = gates.reshape(depth, -1, 1)
+    Bc = (ph_t * inv2s).reshape(depth, -1, 1)
     Cc = (2.0 * mu0 * (1.0 - gates)).reshape(depth, -1, 1)
     Dc = (2.0 * (s_p * gates - mu0 * ph_t) * inv2s).reshape(depth, -1, 1)
-
-    zero = fnp.zeros_like(dm2)
-    DM = fnp.stack([dm2, zero], axis=1)
-    DVZ = fnp.stack([zero, dvz2], axis=1)
     for l in range(1, depth):
         DMU = A[l] * DM + Bc[l] * DVZ
         if l == depth - 1:
-            return DMU[:, 0], DMU[:, 1]
+            return DMU
         DVH = Cc[l] * DM + Dc[l] * DVZ
         DM = weights[l + 1].T @ DMU
         DVZ = wsq[l + 1].T @ DVH
     raise AssertionError("unreachable")
 
 
-def corrector2_design(prim):
-    """``(width, 20)`` design of the SCALED head; see docs/big_corrector.md s.9.
+#: The two SCALED designs, keyed by coefficient count.  Both are five shape
+#: columns -- ``one, s, Phi, phi, alpha`` -- then the channels crossed with
+#: ``{1, Phi, alpha}``, so ``n = 5 + 3 k``.  Order is FROZEN: the shipped npz
+#: indexes it by position and a permuted design would still run and still
+#: return finite numbers.  ``tests/test_submission_parity.py`` pins both against
+#: the numpy generator.
+DESIGN2 = {
+    20: ("relu1", "mfv2", "mfm", "dpilot", "cv1"),
+    26: ("mfv2", "cv1mf", "cv1", "cv2", "mfv", "dpilot", "mfm"),
+}
 
-    Five shape columns and five channels crossed with ``{1, Phi, alpha}``.
-    The order is FROZEN -- ``submission/bigcorr_head.npz``'s ``beta`` indexes
-    it -- and is asserted against the generator's by
-    ``tests/test_submission_parity.py``.
-    """
+
+def corrector2_design(prim, chans):
     a, Ph = prim["alpha"], prim["Phi"]
     cols = [fnp.ones_like(a), prim["s"], Ph, prim["phi"], a]
-    for k in ("relu1", "mfv2", "mfm", "dpilot", "cv1"):
+    for k in chans:
         c = prim[k]
         cols += [c, c * Ph, c * a]
     return fnp.stack(cols, axis=1)
@@ -1735,30 +1735,27 @@ def _corrected_sparse(weights, tau, n_samples, n_pilot, seed, beta, damp,
 
 def _corrected_head2(weights, alpha, s_p, mean_h, kept, x0, x, z1, h1, z2, z,
                      mu, beta2, damp):
-    """The SCALED head: five channels, twenty coefficients.
+    """The SCALED head.  ``docs/big_corrector.md`` sections 9 and 11.
 
-    ``docs/big_corrector.md``.  Held out on 95 freshly generated networks it is
-    **1.296x** the 15-float head, which projects to a graded 1.9693e-07 against
-    2.4646e-07.  What replaces what:
+    Two designs ship, chosen by ``len(beta2)`` (see :data:`DESIGN2`), because
+    the right channel set depends on the SAMPLER: a rank-1 lattice annihilates
+    the first-order ANOVA terms that ``cv1`` and ``relu1`` project onto, so a
+    head fitted on iid draws is fitted against a different residual.
 
-      * ``relu1``   NEW -- exact-mean control variate on ``relu(z^1)`` itself
-      * ``mfv2``    NEW -- the layer-1 COVARIANCE gap, contracted through the
-                    exactly-known ``Cov(z^2)`` and transported forward
-      * ``mfm``     replaces ``cv1mf`` -- the same mean channel, but through
-                    the exact rectifier chain rule rather than a frozen
-                    ``Phi(alpha)`` Jacobian, and started from the exact
-                    layer-2 anchor
-      * ``cv2``     GONE -- the k=2 Hermite block is not selected once
-                    ``mfv2`` is present, which removes its Gram, its solve and
-                    its pass over the (N, width) array
+      * 20 floats -- fitted on IID draws at ``N = 25000``.  Held out 1.296x over
+        the 15-float head; GRADED 2.3563e-07 against 2.4646e-07.
+      * 26 floats -- fitted on LATTICE draws at ``N = 24989``.  Held out
+        1.1776x over ``damp = 0`` under a lattice, 95% CI [1.1142, 1.2434].
 
-    The five shape columns are taken from ``HEAD_ROWS`` rows, which is what the
-    head was fitted against and four passes cheaper than the full sample.
+    Only the channels the selected design names are computed, so neither
+    variant pays for the other's features.
     """
     n = weights[0].shape[0]
+    chans = DESIGN2[int(beta2.shape[0])]
+    want = set(chans)
     w1 = weights[0]
     sig1 = fnp.sqrt(fnp.maximum(fnp.sum(w1 * w1, axis=0), 1e-12))
-    cv1 = _hermite_cv(x0, z1, x, w1, sig1, kmax=1)[0]
+    cvs = _hermite_cv(x0, z1, x, w1, sig1, kmax=2 if "cv2" in want else 1)
 
     # ---- final-layer shape, from HEAD_ROWS rows -------------------------
     zg = z[:HEAD_ROWS]
@@ -1767,36 +1764,64 @@ def _corrected_head2(weights, alpha, s_p, mean_h, kept, x0, x, z1, h1, z2, z,
     s32 = fnp.sqrt(fnp.maximum(fnp.mean(d32 * d32, axis=0), 1e-12))
     a32 = m32 / s32
     Ph, ph = _norm01(a32)
-
-    # ---- the exact layer-1/2 moments, and the two channels they anchor --
-    mh1, Ch1, m2, c2d = _layer12_exact(w1, weights[1])
-    relu1 = _relu1_cv(h1, x, mh1, Ch1)
-
-    dmu1 = fnp.mean(h1, axis=0) - mh1.astype(h1.dtype)
-    dm2 = (weights[1].T @ dmu1)
-    m2f = m2.astype(x.dtype)
-    c2df = c2d.astype(x.dtype)
-    k1 = kept[1] if kept is not None else None
-    if k1 is not None:
-        m2f, c2df = m2f[k1], c2df[k1]
-    z2m = fnp.mean(z2, axis=0)
-    dvz2 = fnp.mean(z2 * z2, axis=0) - 2.0 * m2f * z2m + m2f * m2f - c2df
-    if k1 is not None:
-        # Scatter back to full width with EXACT zeros on the pruned columns --
-        # which is what the generator does, so the fitted coefficient is the
-        # coefficient of this object.  A one-hot row slice of the identity
-        # costs 1 dispatch and n|keep| FLOPs; item assignment is not available
-        # on a flopscope array and would not be cheaper if it were.
-        dvz2 = dvz2 @ fnp.eye(n, dtype=x.dtype)[k1]
+    prim = {"alpha": a32, "Phi": Ph, "phi": ph, "s": s32,
+            "cv1": cvs[0], "cv2": cvs[1], "dpilot": mu - mean_h[-1]}
 
     gates = flops.stats.norm.cdf(alpha).astype(alpha.dtype)
-    wsq = [None, None] + [w * w for w in weights[2:]]
-    mfm, mfv2 = _transport_pair(weights, wsq, alpha, s_p, gates, dm2, dvz2)
+    h1m = fnp.mean(h1, axis=0)
+    if "cv1mf" in want:
+        prim["cv1mf"] = _meanfield_cv(h1m, sig1, weights, gates, Ph)
 
-    prim = {"alpha": a32, "Phi": Ph, "phi": ph, "s": s32,
-            "relu1": relu1, "mfv2": mfv2, "mfm": mfm,
-            "dpilot": mu - mean_h[-1], "cv1": cv1}
-    corr = corrector2_design(prim) @ beta2
+    if want & {"relu1", "mfm", "mfv", "mfv2"}:
+        mh1, Ch1, m2, c2d = _layer12_exact(w1, weights[1])
+        if "relu1" in want:
+            prim["relu1"] = _relu1_cv(h1, x, mh1, Ch1)
+        dmu1 = h1m - mh1.astype(h1.dtype)
+        cols, names = [], []
+        if "mfm" in want:
+            cols.append((weights[1].T @ dmu1, None))
+            names.append("mfm")
+        if "mfv" in want:
+            # The layer-1 post-ReLU VARIANCE gap.  ``E[relu(z^1)^2] =
+            # sigma^2/2`` exactly, so this is exactly mean zero too; it reaches
+            # layer 2 through the diagonal-only ``(W .^ 2)'`` step.
+            mu0_1 = sig1 * INV_SQRT_2PI
+            dvh1 = (fnp.mean(h1 * h1, axis=0) - 0.5 * sig1 * sig1) \
+                - 2.0 * mu0_1 * dmu1
+            cols.append((None, (weights[1] * weights[1]).T @ dvh1))
+            names.append("mfv")
+        if "mfv2" in want:
+            # The FULL layer-1 covariance gap, already contracted onto the
+            # direction that needs it: ``Cov(z^2)`` is exact, so
+            # ``mean_s (z^2 - m2)^2 - diag Cov(z^2)`` is exactly mean zero for
+            # one elementwise square of an array the pass already made.
+            m2f, c2df = m2.astype(x.dtype), c2d.astype(x.dtype)
+            k1 = kept[1] if kept is not None else None
+            if k1 is not None:
+                m2f, c2df = m2f[k1], c2df[k1]
+            z2m = fnp.mean(z2, axis=0)
+            dvz2 = fnp.mean(z2 * z2, axis=0) - 2.0 * m2f * z2m \
+                + m2f * m2f - c2df
+            if k1 is not None:
+                # Scatter to full width with EXACT zeros on the pruned columns,
+                # which is what the generator does.  A one-hot row slice of the
+                # identity is one dispatch; item assignment is not available on
+                # a flopscope array.
+                dvz2 = dvz2 @ fnp.eye(n, dtype=x.dtype)[k1]
+            cols.append((None, dvz2))
+            names.append("mfv2")
+        if cols:
+            zero = fnp.zeros_like(sig1)
+            DM = fnp.stack([c[0] if c[0] is not None else zero for c in cols],
+                           axis=1)
+            DVZ = fnp.stack([c[1] if c[1] is not None else zero for c in cols],
+                            axis=1)
+            wsq = [None, None] + [w * w for w in weights[2:]]
+            OUT = _transport(weights, wsq, alpha, s_p, gates, DM, DVZ)
+            for i, nm in enumerate(names):
+                prim[nm] = OUT[:, i]
+
+    corr = corrector2_design(prim, chans) @ beta2
     if damp != 1.0:
         corr = corr * damp
     return fnp.concatenate([mean_h[:-1], (mu + corr)[None, :]], axis=0)
