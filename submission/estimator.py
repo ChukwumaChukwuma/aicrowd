@@ -789,7 +789,7 @@ class Estimator(BaseEstimator):
         return prop * Ph
 
     # ------------------------------------------------------------------
-    def _pilot(self, weights, rng, n_pilot, n):
+    def _pilot(self, weights, rng, n_pilot, n, want_s=False):
         """Short dense pass -> ``(alpha, mean_h)``, both ``(depth, width)``.
 
         One pass does three jobs: ``alpha`` for the threshold, the frozen
@@ -813,10 +813,15 @@ class Estimator(BaseEstimator):
             mhs.append(fnp.mean(x, axis=0))
         m = fnp.stack(ms, axis=0)
         v = fnp.maximum(fnp.stack(e2s, axis=0) - m * m, VAR_FLOOR)
-        return m / fnp.sqrt(v), fnp.stack(mhs, axis=0)
+        sd = fnp.sqrt(v)
+        mh = fnp.stack(mhs, axis=0)
+        # ``want_s`` costs nothing -- ``sd`` was computed either way -- so the
+        # two forms are dispatch- and FLOP-identical.  The scaled head's
+        # transport linearises at the pilot state and needs it.
+        return (m / sd, mh, sd) if want_s else (m / sd, mh)
 
     # ------------------------------------------------------------------
-    def _plan(self, weights, alpha, mean_h, tau):
+    def _plan(self, weights, alpha, mean_h, tau, want_keep=False):
         """Masks, pre-sliced weights and frozen biases; billed once.
 
         The last layer keeps all n output columns.  Pruning them would save
@@ -836,7 +841,7 @@ class Estimator(BaseEstimator):
         """
         depth = len(weights)
         keeps = None if tau is None else (alpha > -tau)
-        subs, biases = [], []
+        subs, biases, kept = [], [], []
         keep_prev = None
         for l, w in enumerate(weights):
             keep = None if (keeps is None or l == depth - 1) else keeps[l]
@@ -847,7 +852,157 @@ class Estimator(BaseEstimator):
             else:
                 biases.append(fnp.where(keep_prev, 0.0, mean_h[l - 1]) @ wc)
             keep_prev = keep
-        return subs, biases
+            kept.append(keep)
+        return (subs, biases, kept) if want_keep else (subs, biases)
+
+
+    # ------------------------------------------------------------------
+    # The SCALED head, refitted on lattice draws.  docs/big_corrector.md s.11.
+    # ------------------------------------------------------------------
+    def _layer12_exact(self, w1, w2):
+        """``(mh1, m2, c2d)`` -- the last exactly-known moments in the network.
+
+        ``z^1 = x W^1`` is *exactly* Gaussian with mean zero, so
+
+            E[relu(z^1_i)]                = sigma_i / sqrt(2 pi)      exact
+            Cov(relu(z^1_i), relu(z^1_j)) = arc-cosine kernel of rho  exact
+            E[z^2] = W^2' E[relu z^1],  Cov(z^2) = W^2' Cov(relu z^1) W^2
+
+        and layer 3 is measurably NOT exact.  These are the last two layers from
+        which an exactly-mean-zero statistic can be built, which is why every
+        channel of the scaled head is a functional of them.
+
+        float64: ``W^1' W^1`` has condition ~1e8 at this shape.  Only the
+        DIAGONAL of ``Cov(z^2)`` is formed -- ``sum((Ch1 W^2) * W^2)`` rather
+        than the full triple product.  1.5e8 FLOPs, 0.055% of the budget.
+        """
+        W1 = w1.astype(fnp.float64)
+        S = W1.T @ W1
+        sig = fnp.sqrt(fnp.maximum(fnp.diagonal(S), VAR_FLOOR))
+        ss = fnp.outer(sig, sig)
+        rho = fnp.clip(S / ss, -1.0, 1.0)
+        second = (ss / (2.0 * PI)) * (
+            fnp.sqrt(fnp.maximum(1.0 - rho * rho, 0.0))
+            + rho * (HALF_PI + fnp.arcsin(rho)))
+        mh1 = sig * INV_SQRT_2PI
+        Ch1 = second - fnp.outer(mh1, mh1)
+        # rho = 1 gives s^2 (1/2 - 1/(2 pi)) analytically; the fill removes the
+        # sqrt(1 - rho^2) rounding on the diagonal and matches the generator.
+        fnp.fill_diagonal(Ch1, (sig * sig) * RELU_VAR_C)
+        W2 = w2.astype(fnp.float64)
+        return mh1, W2.T @ mh1, fnp.sum((Ch1 @ W2) * W2, axis=0)
+
+    # ------------------------------------------------------------------
+    def _transport(self, weights, wsq, alpha, s_p, gates, DM, DVZ):
+        """Transport layer-2 mean/variance gaps forward, batched over columns.
+
+        ``DM``/``DVZ`` are ``(width, k)``: column ``c`` is one channel's starting
+        pre-activation mean gap and variance gap at layer 2.  Returns the induced
+        ``(width, k)`` perturbation of the final ``E[relu(z^32)]``.
+
+        The recursion is the exact chain rule of the Gaussian rectifier moments,
+        using ``dE[relu^2]/dm = 2 E[relu]`` and ``dE[relu^2]/ds = 2 s Phi``:
+
+            dmu_l     = Phi dm + phi ds ,   ds = dvz / (2 s)
+            dvh_l     = 2 mu0 (1 - Phi) dm + 2 (s Phi - mu0 phi) ds
+            dm_{l+1}  = W' dmu_l                 (exact)
+            dvz_{l+1} = (W .^ 2)' dvh_l          (diagonal only)
+
+        Only the last line approximates, and it costs efficiency and NEVER
+        bias: the output is a linear functional of exactly-mean-zero inputs
+        whatever the coefficients are.  That is the whole reason to route
+        everything through exactly-known moments.
+
+        COST.  All ``k`` channels ride one pair of matmuls; the ``1/(2s)``
+        factor is folded into ``phi`` and into the variance gain ONCE for every
+        layer instead of per layer; and each per-layer coefficient is built in
+        one dispatch on the stacked ``(depth, width)`` block, exactly as
+        :meth:`_pilot` does.  Eight dispatches a layer for any ``k``, against 14
+        per channel for separate scalar recursions -- 248 rather than 744 at
+        ``k = 3``, i.e. 11 ms of billed residual saved at ~22 us a dispatch.
+        """
+        depth = len(weights)
+        ms = alpha * s_p
+        ph_t = flops.stats.norm.pdf(alpha).astype(alpha.dtype)
+        mu0 = ms * gates + s_p * ph_t
+        inv2s = 0.5 / s_p
+        A = gates.reshape(depth, -1, 1)
+        B = (ph_t * inv2s).reshape(depth, -1, 1)
+        C = (2.0 * mu0 * (1.0 - gates)).reshape(depth, -1, 1)
+        D = (2.0 * (s_p * gates - mu0 * ph_t) * inv2s).reshape(depth, -1, 1)
+        for l in range(1, depth):
+            DMU = A[l] * DM + B[l] * DVZ
+            if l == depth - 1:
+                return DMU
+            DVH = C[l] * DM + D[l] * DVZ
+            DM = weights[l + 1].T @ DMU
+            DVZ = wsq[l + 1].T @ DVH
+        raise AssertionError("unreachable")
+
+    # ------------------------------------------------------------------
+    def _head2(self, weights, alpha, s_p, mean_h, kept, x0, x, z1, h1, z2, z,
+               mu):
+        """Twenty-six columns, seven channels.  See FEATURES2."""
+        n = weights[0].shape[0]
+        w1 = weights[0]
+        sig1 = fnp.sqrt(fnp.maximum(fnp.sum(w1 * w1, axis=0), VAR_FLOOR))
+        cv1, cv2 = self._hermite_cv(x0, z1, x, w1, sig1, 2)
+
+        zg = z[:HEAD_ROWS]
+        m32 = fnp.mean(zg, axis=0)
+        d32 = zg - m32
+        s32 = fnp.sqrt(fnp.maximum(fnp.mean(d32 * d32, axis=0), VAR_FLOOR))
+        a32 = m32 / s32
+        Ph = flops.stats.norm.cdf(a32).astype(a32.dtype)
+        ph = flops.stats.norm.pdf(a32).astype(a32.dtype)
+
+        gates = flops.stats.norm.cdf(alpha).astype(alpha.dtype)
+        h1m = fnp.mean(h1, axis=0)
+        cv1mf = self._meanfield_cv(h1m, sig1, weights, gates, Ph)
+
+        mh1, m2, c2d = self._layer12_exact(w1, weights[1])
+        dmu1 = h1m - mh1.astype(h1.dtype)
+        # mfm: the exact transport of the layer-2 MEAN gap.
+        dm2 = weights[1].T @ dmu1
+        # mfv: the layer-1 post-ReLU VARIANCE gap.  E[relu(z^1)^2] = sigma^2/2
+        # exactly, so this is exactly mean zero too; it reaches layer 2 through
+        # the diagonal-only (W .^ 2)' step.
+        mu0_1 = sig1 * INV_SQRT_2PI
+        dvh1 = (fnp.mean(h1 * h1, axis=0) - 0.5 * sig1 * sig1) \
+            - 2.0 * mu0_1 * dmu1
+        dvz2d = (weights[1] * weights[1]).T @ dvh1
+        # mfv2: the FULL layer-1 covariance gap, already contracted onto the
+        # direction that needs it.  Cov(z^2) is exact, so this is exactly mean
+        # zero for one elementwise square of an array the pass already made.
+        m2f = m2.astype(x.dtype)
+        c2df = c2d.astype(x.dtype)
+        k1 = kept[1]
+        if k1 is not None:
+            m2f, c2df = m2f[k1], c2df[k1]
+        z2m = fnp.mean(z2, axis=0)
+        dvz2 = fnp.mean(z2 * z2, axis=0) - 2.0 * m2f * z2m + m2f * m2f - c2df
+        if k1 is not None:
+            # Scatter to full width with EXACT zeros on the pruned columns,
+            # which is what the generator does, so the fitted coefficient is
+            # the coefficient of this object.  A one-hot row slice of the
+            # identity is one dispatch; item assignment is not available on a
+            # flopscope array.
+            dvz2 = dvz2 @ fnp.eye(n, dtype=x.dtype)[k1]
+
+        zero = fnp.zeros_like(sig1)
+        DM = fnp.stack([zero, zero, dm2], axis=1)
+        DVZ = fnp.stack([dvz2, dvz2d, zero], axis=1)
+        wsq = [None, None] + [w * w for w in weights[2:]]
+        OUT = self._transport(weights, wsq, alpha, s_p, gates, DM, DVZ)
+
+        cols = [fnp.ones_like(a32), s32, Ph, ph, a32]
+        for c in (OUT[:, 0], cv1mf, cv1, cv2, OUT[:, 1],
+                  mu - mean_h[-1], OUT[:, 2]):
+            cols += [c, c * Ph, c * a32]
+        corr = fnp.stack(cols, axis=1) @ self._beta2
+        if DAMP != 1.0:
+            corr = corr * DAMP
+        return fnp.concatenate([mean_h[:-1], (mu + corr)[None, :]], axis=0)
 
     # ------------------------------------------------------------------
     def _sparse(self, mlp, tau, n_samples, n_pilot, seed):
@@ -855,8 +1010,22 @@ class Estimator(BaseEstimator):
         depth = len(mlp.weights)
         rng = fnp.random.default_rng(seed)
 
-        alpha, mean_h = self._pilot(mlp.weights, rng, n_pilot, n)
-        subs, biases = self._plan(mlp.weights, alpha, mean_h, tau)
+        # The scaled head needs two things the 15-float head does not: the
+        # pilot's own per-layer sd, which its transport linearises at, and the
+        # layer-2 mask, because the layer-2 variance gap is observed only on the
+        # kept columns.  Both are free, and both are asked for only when the
+        # head is live, so the DAMP=0 ablation stays dispatch-identical to the
+        # uncorrected lattice pass.
+        big = self._beta2 is not None and DAMP != 0.0
+        if big:
+            alpha, mean_h, s_p = self._pilot(mlp.weights, rng, n_pilot, n,
+                                             want_s=True)
+            subs, biases, kept = self._plan(mlp.weights, alpha, mean_h, tau,
+                                            want_keep=True)
+        else:
+            s_p = kept = None
+            alpha, mean_h = self._pilot(mlp.weights, rng, n_pilot, n)
+            subs, biases = self._plan(mlp.weights, alpha, mean_h, tau)
 
         # ---- scored pass ---------------------------------------------
         # Optionally chunked.  It changes no FLOP and (measured) no bit, but
@@ -876,7 +1045,7 @@ class Estimator(BaseEstimator):
         # (1.315e-05 -> 4.163e-06), which matters because the score is a mean
         # over MLPs and ours is worst-MLP dominated.
         x0 = self._draw(rng, n_samples, n)
-        z1p, zp, xp, h1p = [], [], [], []
+        z1p, zp, xp, h1p, z2p = [], [], [], [], []
         for lo in range(0, n_samples, CHUNK or n_samples):
             x = x0[lo:lo + (CHUNK or n_samples)]
             for l in range(depth):
@@ -885,6 +1054,8 @@ class Estimator(BaseEstimator):
                     z = z + biases[l]
                 if l == 0:
                     z1p.append(z)
+                elif l == 1 and big:
+                    z2p.append(z)   # the deepest EXACTLY-known pre-activation
                 x = fnp.maximum(z, 0.0)
                 if l == 0:
                     h1p.append(x)   # kept, not reduced: a reduction here
@@ -901,15 +1072,33 @@ class Estimator(BaseEstimator):
         # Only the final row is scored.  The others come free from the pilot;
         # they are not blended with the scored pass, which would correlate the
         # estimate with the mask that was derived from the same samples.
-        if self._beta is None or DAMP == 0.0:
+        # NOTE the condition: the 15-float head in COEF_FILE is NOT a fallback
+        # under a lattice.  It is measured at 0.922x there -- actively harmful,
+        # for the reason COEF2_FILE documents -- so if the scaled head will not
+        # load, the right degradation is the UNCORRECTED lattice pass, which is
+        # itself the previous ship.  Three rungs: scaled head, uncorrected
+        # lattice, dense fallback.
+        if not big:
             return fnp.concatenate([mean_h[:-1], mu[None, :]], axis=0)
 
         if len(xp) == 1:
             z1, z, h1 = z1p[0], zp[0], h1p[0]
+            z2 = z2p[0]
         else:
             z1 = fnp.concatenate(z1p, axis=0)
             z = fnp.concatenate(zp, axis=0)
             h1 = fnp.concatenate(h1p, axis=0)
+            z2 = fnp.concatenate(z2p, axis=0)
+        return self._head2(mlp.weights, alpha, s_p, mean_h, kept, x0, x, z1,
+                           h1, z2, z, mu)
+
+    def _head_legacy_unused(self, mlp, alpha, mean_h, x0, x, z1, h1, z, mu):
+        """The 15-float head, retained for audit and never called.
+
+        Kept verbatim so ``FEATURES`` and the code that indexes it stay
+        readable next to the vector still shipped in ``corrector.npz``, and so
+        the diff against the iid ship is a diff and not a deletion.
+        """
 
         # ---- features and the offline head ---------------------------
         # FIFTEEN columns.  Thirteen more were fitted, measured at exactly
