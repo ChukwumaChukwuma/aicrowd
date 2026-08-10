@@ -506,68 +506,114 @@ real (`redundancy = 0.573`, so much less than the naive 1.76 × 2.0).
 
 ---
 
-## 9. What to hand over
+## 9. Shipped
 
-**Kernel.** `whestfloor/rqmc.py` — the offline lattice machinery (`get_z` with
-its disk cache, `cbc_order2`, `roberts_z`, `lattice_quality`) and the deployable
-draw (`billed_lattice_base`, `billed_lattice_normals`, `lattice_x0_fn`).
-`whestfloor/kernels.py::corrected_sparse_kernel` gained **one** optional
-argument, `x0_fn`; `x0_fn=None` is bitwise and FLOP-for-FLOP the previous
-program, asserted in `tests/test_rqmc.py`.
-
-**Shipping configuration**, as measured:
+`submission/estimator.py` was restored to `c1f8910` — the configuration that
+graded **2.4646e-07** — and the lattice applied on top of it, so the diff is the
+draw and nothing else. `git show c1f8910:submission/estimator.py` is the paired
+baseline for every number here.
 
 ```python
-# in setup(), where it is free (it bills 76,866,676 FLOPs = 0.00028 of B)
-base = whestfloor.rqmc.ship_lattice_base()          # N = RQMC_N_SHIP = 24989
-
-# in predict()
-pred = corrected_sparse_kernel(W, tau=2.5, n_samples=24989, n_pilot=225,
-                               beta=None, damp=0.0,
-                               x0_fn=lattice_x0_fn(base))
+N_SAMPLES = 24989      # prime; RQMC_N must equal it or the draw degrades to iid
+N_PILOT   = 225        # unchanged
+TAU       = 2.5        # unchanged
+DAMP      = 0.0        # the head is loaded and multiplied by zero -- see section 6
 ```
 
-Verified on an official-protocol MLP disjoint from the suite: `F/B = 0.2799`,
-scored row finite, no fallback, `budget_exhausted = False`.
+The whole change inside `_sparse` is one line: `x0 = self._draw(rng, n_samples, n)`
+in place of `rng.standard_normal(...)`. The point set is built in `setup()` from
+`ctx.width`, where it is free.
 
-`N = 24,989` is the prime just under the shipped 25,000. **CBC needs a prime
-`N`**, and prime `N` is also what makes every `z_j` automatically coprime to `N`
-and therefore every one-dimensional projection an exact `N`-point grid — the
-property the whole method rests on.
+**Verified with the shipped file itself** (not the research kernel), official
+100-MLP suite, 1e9 reference, `mlp.seed` per MLP:
 
-The generating vector must travel **as source**, because the grader sandbox has
-no numpy and `cbc_order2` cannot run at predict time. Both operating points are
-literals in `whestfloor/rqmc.py`: `RQMC_Z_SHIP` (= `RQMC_Z_24989`) and
-`RQMC_Z_11987`, 256 integers each, 2 KiB, data-independent — nothing in them is
-fitted to any MLP. `tests/test_rqmc.py::test_shipping_literals_match_the_search`
-asserts each literal is bit-identical to what `cbc_order2` produces, because a
-transcription slip would *not* raise: it would leave the one-dimensional
-projections exact and silently discard most of the pair quality, so the method
-would keep working and quietly lose its gain. Measured quality against the
-search-free Roberts/Kronecker vector evaaaz used (the 1-D term is identical by
-construction — that part needs no search — and the search buys the pairs):
+```
+raw_final_layer_mse   1.0072e-06        (research kernel, seed 0: 1.0530e-06)
+F                     73,195,175,035    F/B 0.2691
+C/B                   0.2891            R = 54.4 ms
+adjusted (this box)   2.9119e-07
+worst MLP             5.4595e-06
+fallbacks / raises    0 / 100
+predict wall          median 3.40 s, max 6.05 s   against the 30 s cap
+```
 
-| `N` | 1-D term | `1/(6N²)` | order-2 `Σ_{j<k}T` | Roberts' | worst pair | Roberts' |
-|---|---|---|---|---|---|---|
-| 24,989 | 2.6690e-10 | 2.6690e-10 | 1.0132e-03 | 2.1273e-02 (**21.0x**) | 4.288e-06 | 1.389e-03 |
+The two independent seeds landing at 1.0072e-06 and 1.0530e-06 straddle the
+9.0% noise floor of §7.1 and tighten the estimate rather than conflicting.
+Fallbacks are detected by FLOP signature, not by trusting that nothing raised:
+the dense fallback bills 2.5e10 against the sparse pass's 7.3e10, so a swallowed
+exception cannot hide.
 
-**Do not ship**: the `W¹`-row permutation, the active-subspace rotation (§5, both
-lose), antithetic pairing (radiant-allomancer A7, and `scripts/27_rqmc.py`
-measures 1.284x against the lattice's 1.910x), or the offline head at `damp = 1`
-(§6, it is net negative under a lattice).
+`scripts/35_package.py` — **SHIPPABLE**, both tarballs:
 
-**Next, in value order.**
+| | primary | variant |
+|---|---|---|
+| `N` | **24,989** | 11,987 |
+| tarball | 19,118 B | 19,505 B |
+| `F/B` (sandbox, one MLP) | 0.2665 | 0.1297 |
+| `C/B` | 0.2864 | 0.1447 |
+| setup wall vs 5 s cap | 0.391 s (7.8%) | 0.275 s (5.5%) |
+| predict wall vs 60 s cap | 3.57 s | 1.74 s |
+| shape / finite | (32, 256), all 8192 finite | same |
+| imports at runtime | `__future__`, `flopscope`, `flopscope.numpy`, `os`, `whestbench` | same |
 
-1. **Refit the head on lattice draws** (§6.1). It is the only lever this document
-   found that is both large and untested: the head is worth 1.609x on iid draws
-   and −0.078x on lattice draws, and the reason is that its coefficients were
-   fitted against a residual whose first-order part is still present. Refitting
-   is an offline job on generated MLPs and costs nothing at grade time.
-2. **Submit.** §7.1 measures ~8% of realisation noise on a single-seed 100-MLP
-   local raw, so nothing between 25,000 and 50,000 samples, or between `P = 225`
-   and `P = 2,400`, is decidable here. There are 50 graded submissions a day and
-   they are the only real measurement; the flat region is where to spend them.
-3. **Do not spend more effort on the point set.** §2.1 is a mechanism argument,
-   not a tuning result: `f_1 = 27.6%` with the remainder at mean ANOVA order 15.5
-   caps the exponent at ~1 for *any* 256-dimensional point set, and §5 shows the
-   basis is already the right one. The rate is not here.
+Setup is measured *with the base built*, which is the point: the 5 s window also
+covers interpreter start and the flopscope import, and it is the one hard failure
+mode invisible in ordinary local runs. Broken out on this box: flopscope import
+185.8 ms, module exec 0.3 ms, `setup()` 160–172 ms over five runs, worst-case
+total **358 ms**. The base is 25.6 MB of float32.
+
+**Both tarballs are submitted.** They score the same at 1x residual (2.9633e-07
+at 11,987 against 2.9686e-07 at 24,989 — 0.2% apart against 9.0% noise) but
+11,987 spends half the billed compute and sits at `C/B = 0.139` instead of 0.282,
+much nearer the `max(0.1, C/B)` clamp. If the grader's residual is worse than this
+box's, that margin is what protects the score; if it is better, 24,989 wins by
+~1.0x. The grader settles it, which is what 50 submissions a day are for.
+
+### 9.1 The failure ladder, and why it has four rungs
+
+A single raising MLP costs ~850x the score, and that has actually happened once
+this session (a `SymmetryError` on official MLP 19, invisible on eight local
+suites). The lattice adds `norm.ppf` and — at larger `N` than shipped — a
+`concatenate` to the hot path, so:
+
+```
+lattice built in setup()      free, from ctx.width
+  -> lattice rebuilt in _draw  billed once per run, if the shape was wrong
+    -> iid sparse pass         the previous ship, bit for bit
+      -> dense fallback        6000 samples, the only real loss
+```
+
+Only the last rung loses anything. `setup()` wraps the base build because a
+raise *there* loses all 100 MLPs rather than one. Every rung is pinned by a test:
+`test_lattice_absent_degrades_to_the_iid_sparse_pass` asserts rung 3 is bitwise
+`sparse_mc_kernel`, and `test_missing_coefficient_file_degrades_not_fails` asserts
+rung 2 returns the *identical answer* to rung 1 and differs only in FLOPs.
+
+### 9.2 Parity
+
+`tests/test_submission_parity.py` — 9 tests, all green — asserts the shipped file
+and `kernels.corrected_sparse_kernel` are **bitwise identical with identical FLOP
+counts** under the lattice `x0_fn`, at `DAMP = 0` (the ship) and at `DAMP = 1`
+(so the head stays a live knob for §6.1). It also asserts the lattice is not
+vacuous: the same estimator with a pseudorandom draw gives a different answer at
+the same seed, and the difference in FLOPs is **157.0 per element of the draw**,
+to within 1 — the draw and only the draw.
+
+`tests/test_rqmc.py::test_shipping_literals_match_the_search` asserts each
+256-integer literal is bit-identical to what `cbc_order2` produces. That test
+exists because a transcription slip would *not* raise: prime `N` keeps every
+`z_j` coprime, so the projections stay exact and the estimator stays unbiased
+while silently discarding the pair quality.
+
+### 9.3 Not shipped, and why
+
+The `W¹`-row permutation and the active-subspace rotation (§5, both lose);
+antithetic pairing (radiant-allomancer A7, and `scripts/27_rqmc.py` measures
+1.284x against the lattice's 1.910x); the offline head at `DAMP = 1` (§6, net
+negative under a lattice); `N = 49,999` (§7, the local argmin, rejected on
+residual risk); `N ≈ 100,000` (illegal — `F/B = 0.997`, 92/100 raise
+`BudgetExhaustedError`).
+
+**Next.** Refit the head on lattice draws (§6.1) — offline, free at grade time,
+and the only large untested lever left. Do not spend more effort on the point
+set: §2.1 is a mechanism argument, not a tuning result.
