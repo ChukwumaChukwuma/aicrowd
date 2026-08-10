@@ -897,16 +897,61 @@ held for the next lattice attempt; the fix is
 `git checkout c1f8910 -- tests/test_submission_parity.py` (which is exactly what
 `e548198` did), after which all 8 original tests pass.
 
-### 11.9 `--interleave`, the next thing to measure
+### 11.9 `--interleave`: the mechanism is real, and it is worth nothing
 
-`--interleave` is implemented and **was not generated in time**. §11.4 argues it
-should recover `cv1`, `cv2` and `relu1` from actively harmful (0.374x, 0.821x,
-0.541x at unit coefficient) to at worst neutral, because it makes both
-split-sample halves genuine sublattices. Those three channels are the entire
-degree-1-and-2 estimated-coefficient family, so if the argument holds the
-selected set and the gain both change — and it costs nothing at grade time, being
-a row permutation of a table built once in `setup`. One `--mode relattice
---interleave` run and one `--mode export` settles it.
+The prediction was that making both split-sample halves genuine sublattices
+would recover `cv1`, `cv2` and `relu1` "from actively harmful to useful". It is
+**half right, and the half that fails is the half that mattered.**
+
+Generated on the same 475 networks with the base reordered
+`[0, 2, 4, …, 1, 3, 5, …]` — `damp = 0` is *bitwise the same estimator* either
+way, because reordering rows does not change a mean, so the comparison is
+exactly paired on the same denominator.
+
+**At unit coefficient the fix works, decisively:**
+
+| channel | contiguous split | interleaved |
+|---|---|---|
+| `cv1` | **0.374x** | **0.994x** |
+| `relu1` | **0.541x** | 0.915x |
+| `cv2` | 0.821x | 0.868x |
+| `mfv` | 1.091x | 1.091x |
+| `mfv2` | 1.041x | 1.041x |
+
+`cv1` goes from actively harmful to exactly neutral, which is the predicted
+behaviour and confirms the diagnosis in §11.4: with equidistributed halves
+`dbar` is nearly exact, the correction is nearly zero, and the channel correctly
+reports *nothing to correct*. The variance channels are untouched, as they must
+be — they carry no estimated coefficients and no split.
+
+**End to end it changes nothing.** Refitted on interleaved draws, held out on the
+same 95 test networks:
+
+| | held-out TEST over `damp = 0` | 95% CI |
+|---|---|---|
+| contiguous split (SHIPPED) | **1.1776x** | [1.1142, 1.2434] |
+| interleaved split | 1.1741x | [1.1114, 1.2396] |
+
+0.3% apart, deep inside either interval, and the interleaved arm is if anything
+the *worse* of the two. At 225 MLPs the same pair read 1.1219x and 1.1237x — the
+comparison is stable at both sample sizes.
+
+**Why, and it generalises.** A *fitted* head was already neutralising the harm by
+shrinking the coefficient. The 0.374x is what `cv1` costs at a coefficient of
+**1**; the head never used a coefficient of 1. So `--interleave` removes a
+problem the fit had already solved, and the honest reading of §11.1 and §11.3 is
+that **unit-coefficient tables show a mechanism, not a loss** — the repository's
+own standing rule, "quote every new dictionary at deployable block weights and
+not at unit coefficient", applied to my own diagnostic.
+
+Consistent with all of it, the interleaved fit drops `cv1` and `cv2` from the
+selected set entirely (`mfv2, cv1mf, mfv, dpilot, mfm`): once they are neutral
+rather than harmful, they are also uninformative.
+
+**Not shipped, and deliberately no tarball**, because it is a strictly worse
+variant and would spend a graded submission to learn nothing. The flag stays in
+`scripts/45` (`--mode relattice --interleave`) and the reorder is 5 dispatches
+and 949,582 FLOPs in `setup`, i.e. free, if a future sampler ever needs it.
 
 ## 12. Honest caveats
 

@@ -310,3 +310,59 @@ if want("bigcorr_lattice_refit_full"):
               "grader, so this head is fitted for a sampler that is not "
               "currently shipping; heads/iid_head.npz is the live candidate."),
     )
+
+# ---------------------------------------------------------------------------
+# ROUND 15d: --interleave.  The BAR is the same pre-registered one as
+# bigcorr_lattice_refit (>= 1.10x over damp=0 under a lattice); the
+# interleaved-vs-contiguous comparison is reported as DATA, not as a bar,
+# because no numeric threshold for it was pinned before the run.
+# ---------------------------------------------------------------------------
+if want("bigcorr_lattice_interleaved"):
+    Experiment(
+        name="bigcorr_lattice_interleaved",
+        script=SCRIPT,
+        hypothesis=(
+            "Under a rank-1 lattice every estimated-coefficient channel is "
+            "split-sample, and the first N/2 points of frac(i z / N) are a "
+            "contiguous ARC rather than an equidistributed set -- so dbar is "
+            "O(N^-1/2) noise while the full-sample mean it stands in for is "
+            "nearly exact, which is why cv1 measures 0.374x at unit "
+            "coefficient.  For prime N the even-index subset {2 i z / N} is "
+            "itself a rank-1 lattice (gcd(2,N)=1), so reordering the base as "
+            "[0,2,4,...,1,3,5,...] makes both halves sublattices and should "
+            "recover cv1, cv2 and relu1 from actively harmful to useful."),
+        acceptance_bar=1.10, bar_metric="test_x_over_damp0_under_lattice",
+        bar_direction="higher_is_better",
+    ).record(
+        gt_samples=2 * 32_768, seed=400_000, n_mlps=475,
+        estimator=("sparse MC on an INTERLEAVED shifted rank-1 lattice + "
+                   "mfv2/cv1mf/mfv/dpilot/mfm x {1, Phi, alpha} + 5 shape"),
+        test_x_over_damp0_under_lattice=1.1741,
+        raw_final_layer_mse=9.4571e-07,
+        compute_ratio=0.2842,
+        adjusted_final_layer_score=None,
+        n_test_mlps=95, n_val_mlps=95, n_seeds_per_mlp=4, n_params=20,
+        artifact_bytes=342, n_samples=24989, n_pilot=225, tau=2.5,
+        ci95_low=1.1114, ci95_high=1.2396,
+        contiguous_x_same_split=1.1776,
+        interleaved_over_contiguous=0.9970,
+        unit_coeff_contiguous={"cv1": 0.374, "relu1": 0.541, "cv2": 0.821,
+                               "mfv": 1.091, "mfv2": 1.041},
+        unit_coeff_interleaved={"cv1": 0.994, "relu1": 0.915, "cv2": 0.868,
+                                "mfv": 1.091, "mfv2": 1.041},
+        selected_channels=["mfv2", "cv1mf", "mfv", "dpilot", "mfm"],
+        shipped=False,
+        note=("The MECHANISM is confirmed and the PAYOFF is zero.  At unit "
+              "coefficient cv1 goes 0.374x -> 0.994x, exactly as predicted.  "
+              "End to end, refitted, it is 1.1741x against the contiguous "
+              "arm's 1.1776x on the same 95 test networks -- 0.3% apart, deep "
+              "inside either CI, and if anything worse.  The reason "
+              "generalises: a FITTED head was already neutralising the harm by "
+              "shrinking the coefficient, so 0.374x was never being paid.  "
+              "Unit-coefficient tables show a mechanism, not a loss -- this "
+              "repository's own rule about deployable block weights, applied "
+              "to my own diagnostic.  The interleaved fit drops cv1 and cv2 "
+              "from the selected set entirely: neutral is also uninformative.  "
+              "NOT shipped; a tarball would spend a graded submission to learn "
+              "nothing."),
+    )

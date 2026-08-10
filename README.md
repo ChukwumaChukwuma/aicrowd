@@ -133,6 +133,23 @@ would read 1.000x, and the cause is that the first `N/2` points of
 `frac(i z / N)` are a contiguous *arc*, so the split-sample `dbar` is noise
 while the full-sample mean it stands in for is nearly exact.
 
+**Wired and shipped**: `submission/estimator.py` is the lattice port plus a
+26-coefficient head refitted on lattice draws. On the official 100 through the
+real shipped file: raw **8.5086e-07** against the iid-head arm's 1.0722e-06
+(**1.26x**), worst MLP 3.5972e-06 against 6.0559e-06 (**1.68x**, and the score is
+worst-MLP dominated), **0 raises**, `F/B` 0.2707. `scripts/35_package.py`
+SHIPPABLE at setup 0.334 s of the 5 s cap. All 11 parity tests pass with the
+estimator and the test file changed as a pair.
+
+**`--interleave` is measured and worth nothing.** Making both split-sample halves
+genuine sublattices does exactly what the mechanism predicts at unit
+coefficient — `cv1` 0.374x → **0.994x**, `relu1` 0.541x → 0.915x — and changes
+the fitted result not at all: **1.1741x** against the contiguous arm's 1.1776x on
+the same 95 test networks. A *fitted* head was already neutralising the harm by
+shrinking the coefficient, so 0.374x was never being paid. Unit-coefficient
+tables show a mechanism, not a loss — this repository's own rule about deployable
+block weights, turned on my own diagnostic. Not shipped.
+
 **Refitted on lattice draws it clears its bar outright**: `1.1762x` against
 `damp = 0` under a lattice, paired on 95 held-out networks, 95% bootstrap CI
 `[1.1126, 1.2421]` — the interval excludes a miss. `heads/lattice_head.npz`,
