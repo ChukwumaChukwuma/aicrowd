@@ -772,7 +772,51 @@ scripts/45_big_corrector.py --mode relattice --sub bigcorr_lat \
 scripts/45_big_corrector.py --mode export --sub bigcorr_lat --out lat_head.npz
 ```
 
-### 11.7 The one thing not measured, and it is the next thing to run
+### 11.7 POSTSCRIPT: the lattice lost on the grader, so this reverses again
+
+`01b2a80` — **"The lattice is 0.932x on the grader"**. The sibling's 1.427x was
+a local projection; graded, the lattice is *worse* than the iid ship, and
+`submission/estimator.py` has been reverted to `c1f8910` (N=25000, DAMP=1.0,
+the 15-float iid head). So the incumbent is the iid ship at **2.4646e-07**
+again, the §11 refit above is fitted for a sampler that is not shipping, and
+**§6's iid head at 1.296x / projected 1.9707e-07 is the live candidate.**
+
+Both heads are preserved so neither has to be regenerated:
+
+| file | 20 floats fitted for | held-out |
+|---|---|---|
+| `heads/iid_head.npz` | iid, `N = 25000` | **1.296x** over the shipped 15-float head |
+| `heads/lattice_head.npz` | lattice, `N = 24989` | 1.1324x over `damp = 0` under a lattice |
+
+**The iid port is fully recoverable and was verified SHIPPABLE.**
+`c828317:submission/estimator.py` is the complete flopscope port *with the
+corrected constant* (`RELU_VAR_C = 0.3408450569081046` at line 343 — the buggy
+0.4204… never reached a commit). Restoring it is:
+
+```
+git checkout c828317 -- submission/estimator.py
+cp heads/iid_head.npz submission/bigcorr_head.npz     # matches FEATURES2 exactly
+```
+
+`c828317`'s `FEATURES2` is the 20-column order `heads/iid_head.npz` indexes,
+verified. When that pair was in place `scripts/35_package.py` reported
+**SHIPPABLE**: setup 0.272 s of the 5 s cap with both npz files, `fnp.load` of
+both at **0 FLOPs**, `(32, 256)` all-finite, no denied module on any path,
+official 100 raw **1.0722e-06** at `F/B` 0.2680 with **0 raises**, and the
+parity suite bitwise and FLOP-identical against `whestfloor/kernels.py` — which
+still carries the reference implementation at HEAD.
+
+**One thing at HEAD is stale and will block a submission check.**
+`01b2a80` reverted `submission/estimator.py` but *not*
+`tests/test_submission_parity.py`, which is still `a480c1f`'s lattice version.
+It references `sub.RQMC_N` and `est._base` and asserts the ship is `DAMP = 0`,
+so **4 of 9 parity tests fail at HEAD** against the reverted estimator. Left
+untouched here because that file is the integrator's and may be deliberately
+held for the next lattice attempt; the fix is
+`git checkout c1f8910 -- tests/test_submission_parity.py` (which is exactly what
+`e548198` did), after which all 8 original tests pass.
+
+### 11.8 The one thing not measured, and it is the next thing to run
 
 `--interleave` is implemented and **was not generated in time**. §11.4 argues it
 should recover `cv1`, `cv2` and `relu1` from actively harmful (0.374x, 0.821x,
