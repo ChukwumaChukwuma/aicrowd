@@ -30,12 +30,14 @@
 > raw MSE end to end — and a constant on `v_eff` is exactly what this page's
 > product is made of. It is priced in `docs/rqmc.md` §6, not here.
 >
-> One thing §7 found that this page's `N`-cancellation hides entirely: at the
-> larger `N` the lattice makes attractive, the binding term is not the sampler
-> at all. Solving `raw = b^2 + v/N` across the sweep gives an `N`-independent
-> floor of `b^2 = 3.23e-07`, which is 31% of raw at `N = 25,000` and **71% at
-> `N = 50,000`** — and it is the PILOT (`P = 225`), whose error scales as `1/P`.
-> Halving the sampling variance doubles the pilot's share of what is left.
+> And one calibration from that sweep which bears on every A/B on this page:
+> three runs of the identical estimator at identical `N`, differing only in pilot
+> size, spread over raw MSE with **CV 8.8%**, and the `raw·N` scatter across the
+> whole `N` sweep is 7.7% — the same number independently. **A single-seed
+> 100-MLP local raw carries ~8% of realisation noise.** So the 1.02-1.04x of §4.1
+> and the 1.0121x of §5.1 are inside it and are correctly described here as
+> unshippable; a `b^2` fitted from two points of an `N` sweep is inside it too
+> (`docs/rqmc.md` §7.1 retracts one).
 
 `docs/graded.md` reduced a sampler's score to one product,
 

@@ -385,64 +385,95 @@ carry signal under a lattice; `cv1` almost certainly does not, and `cv2` (order-
 along `W^1`) probably does. That is a training job, not a kernel job, and it is
 the single highest-value thing left on this line.
 
-## 7. `N` re-optimised from scratch — and it does not move, because `p = 1.04`
+## 7. `N` re-optimised from scratch — it does not move, and the local harness cannot resolve the fine tuning
 
 The brief expected the `N` argument to invert: with `p > 1`,
 `adjusted = raw · max(0.1, C/B)` keeps falling with `N` above the clamp instead
 of being flat in it, so the optimum should run to the full budget. At the
-**measured** `p = 1.043` that effect is `adjusted ∝ N^{-0.043}` — 3% over a
-factor of two in `N` — and it is swamped by two things that both push the other
-way.
+**measured** `p = 1.04` that effect is `adjusted ∝ N^{-0.04}` — 3% over a factor
+of two in `N` — and it is swamped.
 
 `scripts/51_rqmc_deploy.py --mode score`, official 100-MLP suite, 1e9 reference
-so `raw_mse` is leaderboard-comparable, lattice at `damp = 0`, `P = 225`:
+so `raw_mse` is leaderboard-comparable, lattice at `damp = 0`, `P = 225`, one
+seed per point:
 
-| `N` | raw MSE | `F/B` | `C/B` | adj@1x | adj@2x | worst MLP |
-|---|---|---|---|---|---|---|
-| 8,467 | 3.3203e-06 | 0.0938 | 0.0999 | 3.3203e-07 | 3.5239e-07 | 2.833e-05 |
-| 16,993 | 1.5778e-06 | 0.1846 | 0.1931 | 3.0468e-07 | 3.1809e-07 | 1.668e-05 |
-| **24,989** | 1.0530e-06 | 0.2698 | 0.2819 | **2.9686e-07** | **3.0964e-07** | 4.163e-06 |
-| 34,981 | 7.4561e-07 | 0.3763 | 0.4033 | 3.0071e-07 | 3.2085e-07 | 4.380e-06 |
-| **49,999** | 4.5715e-07 | 0.5363 | 0.6151 | **2.8121e-07** | 3.1725e-07 | 1.216e-06 |
-| 69,997 | 4.1895e-07 | 0.7494 | 0.8659 | 3.6277e-07 | 4.1160e-07 | 2.565e-06 |
-| 99,991 | — | 0.9974 | 1.0093 | **INFEASIBLE** | | 92/100 raised |
-
-Three things to read off, and the third was not anticipated.
+| `N` | raw MSE | `raw·N` | `F/B` | `C/B` | adj@1x | adj@2x | worst MLP |
+|---|---|---|---|---|---|---|---|
+| 8,467 | 3.3203e-06 | 0.02811 | 0.0938 | 0.0999 | 3.3203e-07 | 3.5239e-07 | 2.833e-05 |
+| **11,987** | 2.1271e-06 | 0.02550 | 0.1313 | 0.1393 | **2.9633e-07** | 3.1344e-07 | 7.666e-06 |
+| **24,989** | 1.0530e-06 | 0.02631 | 0.2698 | 0.2819 | **2.9686e-07** | **3.0964e-07** | 4.163e-06 |
+| 34,981 | 7.4561e-07 | 0.02608 | 0.3763 | 0.4033 | 3.0071e-07 | 3.2085e-07 | 4.380e-06 |
+| **49,999** | 4.5715e-07 | 0.02286 | 0.5363 | 0.6151 | **2.8121e-07** | 3.1725e-07 | 1.216e-06 |
+| 69,997 | 4.1895e-07 | 0.02933 | 0.7494 | 0.8659 | 3.6277e-07 | 4.1160e-07 | 2.565e-06 |
+| 99,991 | — | — | 0.9974 | 1.0093 | **INFEASIBLE** | | 92/100 raised |
 
 **1. `N ≈ 100,000` is not merely expensive, it is illegal.** `F/B = 0.997` before
 the feature block, and 92 of 100 MLPs raise `BudgetExhaustedError` — *"matmul
 would cost 784,896,000 FLOPs but only 424,119,825 remain"*. `F` is
-machine-independent, so this is a hard cap on the grader too, not a property of
-this box. The usable range ends around `N = 85,000`.
+machine-independent, so this is a hard cap on the grader too. The usable range
+ends near `N = 85,000`. (The iid arm fails identically at 90/100, so it is the
+pass and not the lattice.)
 
-**2. The optimum is flat and it has not moved.** `2.97e-07` at 24,989 against
-`2.81e-07` at 49,999 at 1x residual — 1.06x — and the ordering **reverses** at 2x
-residual (`3.10e-07` vs `3.17e-07`). `C/B = 0.615` at `N = 49,999` is far off the
-clamp, so any residual surprise on an unknown box is amplified there, and
-`docs/cost_floor.md` §5 measured a 3x residual cliff past `N ~ 35,000` on this
-shape when the sample array leaves cache. **Keep `N ≈ 25,000.** The 1.06x at
-50,000 is real but it is bought with the risk the clamp exists to remove.
+**2. `raw · N` is flat, so the deployed estimator's exponent is 1 as well.** Fitted
+over the whole sweep, `p = 1.013 ± 0.046` — consistent with the bare sampler's
+1.043 and with 1. There is no `N` at which the lattice starts winning by a rate.
 
-**3. The binding constraint at large `N` is the PILOT, not the sampler.** Raw
-stops falling: 4.5715e-07 at `N = 49,999` to 4.1895e-07 at 69,997 is 1.09x for
-1.4x the samples, a local exponent of 0.24. Solving `raw = b² + v/N` on that pair
-gives
+**3. The optimum is flat over a 4x range of `N` and 4.4x of `C/B`.** `2.963e-07`
+at 11,987 · `2.969e-07` at 24,989 · `3.007e-07` at 34,981 · `2.812e-07` at
+49,999. Which of those is "best" is **not resolvable on this harness**, which is
+the subject of §7.1. Two things do argue: at 2x residual the ordering reverses
+(49,999 becomes the worst of the four), and `docs/cost_floor.md` §5 measured a 3x
+residual cliff past `N ~ 35,000` when the sample array leaves cache. **Keep
+`N ≈ 25,000`** — and note that `N = 11,987` scores the same at *half* the billed
+compute and much closer to the clamp, which is the safer point if the grader's
+residual turns out worse than this box's.
+
+### 7.1 A retraction, and the calibration behind it
+
+An earlier revision of this section solved `raw = b² + v/N` on the
+`(49,999, 69,997)` pair, got `b² = 3.23e-07`, concluded that an `N`-independent
+pilot floor was 31–71% of raw, and called re-optimising `P` the biggest lever
+left. **That was over-fitting two noisy points and it is withdrawn.** Solving the
+same equation on other pairs from the same sweep:
 
 ```
-b^2  =  3.23e-07        v = 6.7e-03
+pair (49,999, 69,997)   v = 0.0067   b^2 = +3.234e-07
+pair (24,989, 49,999)   v = 0.0298   b^2 = -1.382e-07
+pair ( 8,467, 69,997)   v = 0.0279   b^2 = +1.970e-08
 ```
 
-so at `N = 49,999` the `N`-independent floor is **71% of raw**, and even at
-`N = 24,989` it is 31%. The worst MLP going *up* from 1.216e-06 to 2.565e-06 as
-`N` rises is the same signature. That floor is `P = 225` — the pilot sets the
-mask and the frozen constants and its error scales as `1/P`, not with `N`
-(`submission/estimator.py`, `N_PILOT`). **The lattice makes this worse, not
-better**, because halving the sampling variance doubles the pilot's share of what
-is left. `P = 600` costs 2.5e9 FLOPs = 0.9% of `B`; on this evidence it is the
-next thing to re-optimise, jointly with `N`, and it is worth up to 1.4x at the
-shipped `N` — more than the entire remaining `N` lever.
+`b²` is unidentifiable and consistent with zero, and `raw · N` above has no trend
+— mean 0.02643, **sd 0.00205, CV 7.7%.**
 
----
+The direct test confirms it. Sweeping `P` at fixed `N`, which changes only the
+pilot:
+
+| `N = 24,989`, lattice, `damp = 0` | `P = 225` | 600 | 1,200 | 2,400 |
+|---|---|---|---|---|
+| raw MSE | 1.0530e-06 | 1.1544e-06 | 9.6872e-07 | 9.5166e-07 |
+| `F/B` | 0.2698 | 0.2758 | 0.2852 | 0.3038 |
+| adj@1x | **2.9686e-07** | 3.3296e-07 | 2.8864e-07 | 3.0125e-07 |
+
+| `N = 25,000`, iid, `damp = 1` | `P = 225` | 600 | 1,200 |
+|---|---|---|---|
+| raw MSE | 1.5250e-06 | 1.4851e-06 | 1.5001e-06 |
+| adj@1x | 4.2358e-07 | 4.2261e-07 | 4.4019e-07 |
+
+`P = 600` is *worse* than `P = 225` and `P = 2400` is worse than `P = 1200`;
+there is no monotone signal. **`P` is not a lever.** A 10.7x increase in the
+pilot moves raw by at most 1.11x and costs 3.4% of `F`, netting nothing.
+
+**The calibration this leaves is worth more than the retracted claim.** Three
+runs of the identical estimator at the identical `N`, differing only in pilot
+size, spread over raw MSE with **CV 8.8%** — and the `raw · N` scatter across the
+`N` sweep is 7.7%, the same number arriving independently. So **a single-seed
+100-MLP local raw carries ~8% of realisation noise**, and no local A/B below
+about 10% is real. That is the quantitative form of "only the grader ranks", and
+it explains how two changes could measure better locally and grade worse.
+
+Against that floor: the lattice's **44.8% on raw and 42.7% on adjusted** is 5x
+the noise, and it is the only result in this document that clears it by that
+margin. The `N` and `P` fine-tuning does not, and is not claimed.
 
 ## 8. What this changes in the rest of the repository
 
@@ -503,7 +534,18 @@ lose), antithetic pairing (radiant-allomancer A7, and `scripts/27_rqmc.py`
 measures 1.284x against the lattice's 1.910x), or the offline head at `damp = 1`
 (§6, it is net negative under a lattice).
 
-**Next, in value order.** (1) Re-optimise `P` jointly with `N` — §7 finds an
-`N`-independent floor that is 31% of raw at the shipped `N` and 71% at 50,000,
-and it is the pilot. (2) Refit the head on lattice draws (§6.1). Neither is a
-kernel change.
+**Next, in value order.**
+
+1. **Refit the head on lattice draws** (§6.1). It is the only lever this document
+   found that is both large and untested: the head is worth 1.609x on iid draws
+   and −0.078x on lattice draws, and the reason is that its coefficients were
+   fitted against a residual whose first-order part is still present. Refitting
+   is an offline job on generated MLPs and costs nothing at grade time.
+2. **Submit.** §7.1 measures ~8% of realisation noise on a single-seed 100-MLP
+   local raw, so nothing between 25,000 and 50,000 samples, or between `P = 225`
+   and `P = 2,400`, is decidable here. There are 50 graded submissions a day and
+   they are the only real measurement; the flat region is where to spend them.
+3. **Do not spend more effort on the point set.** §2.1 is a mechanism argument,
+   not a tuning result: `f_1 = 27.6%` with the remainder at mean ANOVA order 15.5
+   caps the exponent at ~1 for *any* 256-dimensional point set, and §5 shows the
+   basis is already the right one. The rate is not here.
