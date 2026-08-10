@@ -517,17 +517,39 @@ program, asserted in `tests/test_rqmc.py`.
 
 **Shipping configuration**, as measured:
 
-```
-base  = billed_lattice_base(24989, get_z(24989, 256, "cbc"))   # in setup, free
-pred  = corrected_sparse_kernel(W, tau=2.5, n_samples=24989, n_pilot=225,
-                                beta=None, damp=0.0,
-                                x0_fn=lattice_x0_fn(base))
+```python
+# in setup(), where it is free (it bills 76,866,676 FLOPs = 0.00028 of B)
+base = whestfloor.rqmc.ship_lattice_base()          # N = RQMC_N_SHIP = 24989
+
+# in predict()
+pred = corrected_sparse_kernel(W, tau=2.5, n_samples=24989, n_pilot=225,
+                               beta=None, damp=0.0,
+                               x0_fn=lattice_x0_fn(base))
 ```
 
-`N = 24,989` is the prime just under the shipped 25,000 — CBC needs a prime `N`,
-and every `z_j` is then automatically coprime to `N`, which is what makes the
-one-dimensional projections exact. The generating vector is 256 integers, data
-independent, and belongs in the submission as a literal (it is `2 KiB`).
+Verified on an official-protocol MLP disjoint from the suite: `F/B = 0.2799`,
+scored row finite, no fallback, `budget_exhausted = False`.
+
+`N = 24,989` is the prime just under the shipped 25,000. **CBC needs a prime
+`N`**, and prime `N` is also what makes every `z_j` automatically coprime to `N`
+and therefore every one-dimensional projection an exact `N`-point grid — the
+property the whole method rests on.
+
+The generating vector must travel **as source**, because the grader sandbox has
+no numpy and `cbc_order2` cannot run at predict time. Both operating points are
+literals in `whestfloor/rqmc.py`: `RQMC_Z_SHIP` (= `RQMC_Z_24989`) and
+`RQMC_Z_11987`, 256 integers each, 2 KiB, data-independent — nothing in them is
+fitted to any MLP. `tests/test_rqmc.py::test_shipping_literals_match_the_search`
+asserts each literal is bit-identical to what `cbc_order2` produces, because a
+transcription slip would *not* raise: it would leave the one-dimensional
+projections exact and silently discard most of the pair quality, so the method
+would keep working and quietly lose its gain. Measured quality against the
+search-free Roberts/Kronecker vector evaaaz used (the 1-D term is identical by
+construction — that part needs no search — and the search buys the pairs):
+
+| `N` | 1-D term | `1/(6N²)` | order-2 `Σ_{j<k}T` | Roberts' | worst pair | Roberts' |
+|---|---|---|---|---|---|---|
+| 24,989 | 2.6690e-10 | 2.6690e-10 | 1.0132e-03 | 2.1273e-02 (**21.0x**) | 4.288e-06 | 1.389e-03 |
 
 **Do not ship**: the `W¹`-row permutation, the active-subspace rotation (§5, both
 lose), antithetic pairing (radiant-allomancer A7, and `scripts/27_rqmc.py`

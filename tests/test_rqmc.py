@@ -245,3 +245,32 @@ def test_cranley_patterson_marginal_is_exactly_uniform():
     a = np.sort(np.array(rows).ravel())
     ks = np.abs(a - (np.arange(1, a.size + 1) / a.size)).max()
     assert ks < 1.36 / math.sqrt(a.size) * 1.6, ks
+
+
+def test_shipping_literals_match_the_search():
+    """The submission carries the generating vector as source, so the literal
+    must be the vector the CBC search actually produced.
+
+    A transcription slip here would not raise anywhere -- it would silently
+    degrade the pair quality while leaving the one-dimensional projections
+    exact, so the method would keep working and quietly lose most of its gain.
+    That is exactly the failure mode a test has to catch.
+    """
+    import math
+
+    from whestfloor import rqmc as RQ
+
+    for n, z in ((RQ.RQMC_N_SHIP, RQ.RQMC_Z_SHIP), (11987, RQ.RQMC_Z_11987)):
+        assert RQ.is_prime(n), n
+        assert len(z) == 256, len(z)
+        assert all(math.gcd(int(v), n) == 1 for v in z)
+        assert np.array_equal(np.asarray(z), RQ.get_z(n, 256, "cbc")), (
+            f"the N={n} literal is not the vector cbc_order2 produces")
+        # and the search really did buy something over the search-free vector
+        q = RQ.lattice_quality(n, np.asarray(z))
+        qr = RQ.lattice_quality(n, RQ.roberts_z(n, 256))
+        # 1e-6, not 1e-9: the reference is the closed form 1/(6N^2) and the
+        # measured side is a mean of N Bernoulli-polynomial values, so float64
+        # summation over 24,989 terms is the whole discrepancy (3.4e-8 here).
+        assert abs(q["t1_mean"] / q["t1_ref"] - 1.0) < 1e-6, q
+        assert q["s2"] < 0.2 * qr["s2"], (q["s2"], qr["s2"])

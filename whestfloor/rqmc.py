@@ -372,3 +372,106 @@ def rotate_first_layer(weights, Q):
 
     return [fnp.asarray(np.asarray(Q, dtype=np.float32)) @ weights[0]] + \
         list(weights[1:])
+
+
+# ---------------------------------------------------------------------------
+# The shipping vectors, as literals
+#
+# The grader sandbox has no numpy, so ``cbc_order2`` cannot run at predict time
+# and the generating vector has to travel as source.  These are the two operating
+# points ``docs/rqmc.md`` section 7 leaves standing.  Both are PRIME, which is
+# what makes every ``z_j`` automatically coprime to ``N`` and therefore makes
+# every one-dimensional projection the exact ``N``-point grid -- the property the
+# whole method rests on.
+#
+# ``N = 24989`` is the recommended ship (the prime just under the shipped 25,000).
+# ``N = 11987`` scores the same on the official suite at HALF the billed compute
+# and ``C/B = 0.139`` instead of 0.282, i.e. much closer to the ``max(0.1, C/B)``
+# clamp; it is the safer choice if the grader's residual is worse than the box
+# these were measured on.
+#
+# Quality of the CBC search against the search-free Roberts/Kronecker vector
+# evaaaz used -- the 1-D term is identical by construction (that part needs no
+# search), and the search buys the pairs:
+
+#: N = 24989: 1-D term 2.6690e-10 == 1/(6N^2) 2.6690e-10;
+#: order-2 sum_{j<k}T = 1.0132e-03 against Roberts' 2.1273e-02 (21.0x better), worst pair 4.288e-06 vs 1.389e-03.
+RQMC_Z_24989 = (
+    1, 9664, 10561, 11442, 15862, 17147, 14783, 13957, 17740, 19081, 5340,
+    16980, 3155, 10906, 16095, 2239, 6896, 4887, 1705, 7057, 5689, 13463,
+    7926, 2875, 8874, 21826, 16579, 24378, 16121, 1053, 18422, 17677,
+    5656, 19427, 7710, 20103, 19243, 20052, 2729, 16889, 20720, 14881,
+    5224, 15059, 17349, 14869, 15055, 14405, 18953, 14449, 17454, 5132,
+    3546, 15501, 14300, 8375, 4173, 7884, 7080, 4973, 3469, 24279, 22138,
+    23523, 14828, 3773, 16389, 1179, 19050, 9713, 13980, 716, 1624, 4913,
+    5972, 16813, 17104, 1246, 18837, 7948, 8714, 1631, 9405, 18004, 1181,
+    23313, 14635, 20644, 17798, 10402, 6697, 4392, 16344, 13222, 902,
+    18682, 19932, 8772, 13267, 12227, 6014, 3404, 8573, 2984, 22511, 581,
+    23746, 17799, 20415, 16636, 1128, 15391, 21472, 3724, 8918, 891,
+    12331, 2504, 15379, 15746, 1230, 20991, 16702, 19539, 3870, 17207,
+    11865, 21353, 3747, 11789, 10105, 24253, 24070, 10868, 8716, 1917,
+    15479, 19780, 12896, 18737, 24209, 9794, 23203, 3465, 23586, 13294,
+    7987, 14911, 19792, 19208, 23561, 614, 22520, 19232, 915, 10417, 4014,
+    15882, 21249, 13117, 22757, 11549, 14668, 14036, 7098, 1000, 954,
+    8670, 20655, 13259, 21069, 633, 577, 7109, 8396, 23045, 15665, 11546,
+    8265, 21213, 9627, 6451, 16145, 4384, 23183, 7538, 16809, 15744, 5181,
+    10571, 14584, 3369, 4535, 6071, 7316, 7985, 24609, 7234, 13133, 18673,
+    8955, 5099, 728, 3514, 1610, 11321, 7787, 4951, 20972, 20397, 8792,
+    19551, 21018, 4330, 16463, 13907, 11209, 24673, 12451, 12965, 4289,
+    20935, 23932, 2015, 12822, 9312, 4355, 20378, 6362, 17611, 7531,
+    21894, 21125, 658, 4482, 16112, 6417, 2900, 1926, 10274, 17704, 17459,
+    22287, 2277, 8293, 7838, 15232, 23418, 11112, 6795, 23385, 17384,
+    4081, 16673, 22022, 10361
+)
+
+#: N = 11987: 1-D term 1.1599e-09 == 1/(6N^2) 1.1599e-09;
+#: order-2 sum_{j<k}T = 4.3148e-03 against Roberts' 3.7514e-02 (8.7x better), worst pair 1.716e-05 vs 1.389e-03.
+RQMC_Z_11987 = (
+    1, 4964, 7437, 6948, 6800, 5478, 9400, 3373, 10870, 8122, 6267, 9493,
+    5099, 3333, 5529, 3394, 4599, 10865, 9334, 652, 2645, 5644, 1979,
+    5486, 8224, 9755, 2729, 642, 6926, 6271, 1675, 6599, 8582, 2613, 7333,
+    2478, 2574, 6755, 7592, 3013, 10184, 563, 2910, 11300, 11281, 7161,
+    8034, 5699, 9462, 6665, 1827, 4653, 9261, 5566, 1098, 7431, 7662,
+    9434, 697, 2272, 5167, 590, 9495, 9778, 636, 10206, 11882, 7063, 7735,
+    3847, 5744, 10352, 6329, 5089, 11723, 2109, 11319, 7037, 5028, 11759,
+    6143, 8675, 10450, 3022, 809, 2099, 11717, 7154, 4901, 7631, 2638,
+    2791, 7461, 10795, 369, 7007, 11729, 2780, 4424, 9533, 2632, 1622,
+    1021, 4396, 1096, 7167, 4771, 3365, 5911, 11817, 11338, 9483, 11748,
+    4144, 6338, 2414, 1859, 6792, 1011, 459, 10054, 7940, 6423, 5518, 787,
+    4098, 1468, 11836, 1910, 11895, 10815, 10691, 6524, 8855, 4068, 11947,
+    5248, 7074, 5969, 9183, 1795, 4288, 4020, 7495, 9367, 6892, 5354,
+    9176, 1839, 7123, 2877, 10646, 6428, 8794, 11444, 9049, 11854, 7584,
+    5935, 3146, 4608, 5057, 2866, 1186, 3283, 10223, 4268, 5029, 9883,
+    8920, 10205, 5933, 11533, 311, 3573, 2513, 3553, 1185, 9704, 7948,
+    503, 5659, 10456, 465, 4726, 2496, 11862, 10567, 8285, 8501, 2828,
+    11552, 1693, 5939, 11111, 11175, 4274, 8553, 4680, 9063, 5526, 10758,
+    3424, 1481, 9580, 11846, 8762, 5506, 8789, 9253, 2701, 8537, 9060,
+    2292, 3850, 4338, 8351, 2886, 4030, 7474, 1563, 8323, 11797, 11875,
+    6088, 5048, 9270, 3228, 1504, 1230, 9405, 11099, 1601, 6120, 11040,
+    7971, 1798, 1447, 10336, 4142, 4034, 3729, 4097, 7698, 3052, 11225,
+    7090, 2467, 3882, 2864, 10866, 10462, 3536, 3099, 1306, 10426
+)
+
+#: What to use.  ``get_z`` is for research; these two are for the submission.
+RQMC_Z_SHIP = RQMC_Z_24989
+RQMC_N_SHIP = 24989
+
+
+def ship_lattice_base(n_points: int = RQMC_N_SHIP, chunk: int = 32768):
+    """The recommended point set, billed, as ``setup`` would build it.
+
+    ``docs/rqmc.md`` section 9 is the whole handover; this is its one line.
+    Measured on an official-protocol MLP disjoint from the suite: setup bills
+    76,866,676 FLOPs (0.00028 of B, and free in ``setup``), and
+
+        corrected_sparse_kernel(W, tau=2.5, n_samples=24989, n_pilot=225,
+                                beta=None, damp=0.0,
+                                x0_fn=lattice_x0_fn(base))
+
+    bills ``F/B = 0.2799`` with the scored row finite on every MLP.
+    """
+    z = RQMC_Z_SHIP if n_points == RQMC_N_SHIP else RQMC_Z_11987
+    if n_points not in (RQMC_N_SHIP, 11987):
+        raise ValueError(f"no literal generating vector for N={n_points}; "
+                         "use get_z() offline and add it here")
+    return billed_lattice_base(n_points, z, chunk)
